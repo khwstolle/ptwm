@@ -1,0 +1,64 @@
+name: Lint and format
+
+on:
+  pull_request:
+  # No push trigger: the PR already gates merges into master, so re-running
+  # lint/format on the merge commit just doubles the Actions spend.
+
+permissions:
+  contents: read
+
+# Cancel superseded in-progress runs on the same PR branch (pushes to
+# master always run to completion).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rust-lint:
+    # Direct toolchain: cargo fmt + clippy on the workspace.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust (stable, rustfmt + clippy components)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-features -- -D warnings
+
+  lint:
+    # Project-level ruff check on tracked sources.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Ruff lint
+        # `uv run` resolves the project's pinned ruff (the dev
+        # dependency group declares ruff>=0.15.4 in pyproject.toml), so
+        # CI sees the same version contributors run locally.
+        run: uv run ruff check python/ tests/

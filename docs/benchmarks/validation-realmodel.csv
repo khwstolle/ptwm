@@ -1,0 +1,5 @@
+model,dtype,size_gb,ratio,encode_mbs,decode_mbs,lossless
+Mistral-7B-v0.1,bf16,4.5,0.6609,45,1111,true
+gpt-oss-20b,mxfp4,4.8,0.8932,77,1635,true
+Nemotron-Super-120B-FP8,fp8_e4m3,5.0,0.7165,26,627,true
+Qwen2.5-72B-Instruct,bf16,3.8,0.6604,24,793,true

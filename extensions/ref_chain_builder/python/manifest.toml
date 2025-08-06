@@ -1,0 +1,14 @@
+[bundle]
+name = "ref-chain-builder"
+version = "0.1.0"
+author_pubkey = "ed25519:0000000000000000000000000000000000000000000000000000000000000000"
+description = "PTWM v1 reference contribution for the chain_builder kind."
+
+[[contributions]]
+id = "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+label = "io.ptwm.ref.chain_builder"
+kind = "chain_builder"
+abi_version = 1
+lifecycle = "thread"
+flavors = ["host"]
+capabilities = { determinism = true, hardware_class = "cpu" }

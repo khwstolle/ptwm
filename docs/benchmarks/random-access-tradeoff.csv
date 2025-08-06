@@ -1,0 +1,7 @@
+category,model,dtype,total_bytes,n_tensors,coder,strategy,compressed_bytes,ratio,compress_mb_s
+nlp,distilbert/distilbert-base-uncased,float32,267687144,40,huffman,per_tensor,257921169,1.0379,336.2
+nlp,distilbert/distilbert-base-uncased,float32,267687144,40,huffman,monolithic,267687148,1.0000,260.5
+nlp,distilbert/distilbert-base-uncased,float32,267687144,40,rans,per_tensor,257426023,1.0399,276.4
+nlp,distilbert/distilbert-base-uncased,float32,267687144,40,rans,monolithic,267687148,1.0000,203.9
+nlp,distilbert/distilbert-base-uncased,float32,267687144,40,zstd,per_tensor,226638984,1.1811,278.2
+nlp,distilbert/distilbert-base-uncased,float32,267687144,40,zstd,monolithic,226799862,1.1803,209.3

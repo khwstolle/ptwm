@@ -1,0 +1,81 @@
+name: Python tests
+
+on:
+  pull_request:
+  # No push trigger: the PR already gates merges into master, so re-running
+  # the full suite on the merge commit just doubles the Actions spend.
+
+permissions:
+  contents: read
+
+# Cancel superseded in-progress runs on the same PR branch (pushes to
+# master always run to completion).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Setup Rust (stable, for maturin native extension)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Run unit tests with coverage
+        run: |
+          uv run pytest tests/ \
+            -m "not integration and not gpu and not slow" \
+            --cov=python/ptwm \
+            --cov-report=xml \
+            --cov-report=term \
+            --cov-fail-under=75
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-python
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Setup Rust (stable, for maturin native extension)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Run integration tests
+        run: |
+          uv run pytest tests/ \
+            -m "integration" \
+            --override-ini="addopts=--benchmark-disable"

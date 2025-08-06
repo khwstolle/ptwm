@@ -1,0 +1,81 @@
+name: Fuzz
+
+# Fuzz is non-blocking (continue-on-error below) and the per-job setup
+# dominates the 30-second fuzz budget, so running on every PR is wasteful.
+# Trigger only when the fuzz harness or the crates the targets exercise
+# actually change, plus a weekly sweep so PRs that touch other areas still
+# get periodic coverage.
+on:
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - "crates/ptwm-core/**"
+      - "crates/ptwm-py/**"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    - cron: "0 5 * * 1"  # Mondays 05:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel superseded in-progress runs on the same PR branch. Scheduled and
+# dispatch runs are left alone so the weekly sweep always completes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Non-blocking: fuzz findings are informational until a specific
+    # target is flagged as release-gating.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        # PRs run a 3-target smoke set (both entropy decoders + the wire
+        # parser); the full 11-target sweep runs on the weekly cron and on
+        # manual dispatch. Per-job whole-minute round-up × 11 targets on
+        # every core PR dominated this repo's Actions spend — the smoke set
+        # keeps fast regression signal without paying for the full matrix on
+        # every push. Edit both lists together when adding/removing targets.
+        target: ${{ github.event_name == 'pull_request' && fromJSON('["huffman_decode","rans_decode","parse_wire"]') || fromJSON('["huffman_decode","rans_decode","parse_header","parse_wire","container_open","order1_scale_ac_decode","order1_scale_ac_state_parse","extension_table","ptwx_wasm_extract","policy_resolve","raw_binary_schema"]') }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust nightly (libfuzzer-sys requires nightly)
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup component add --toolchain nightly llvm-tools-preview
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Run fuzz target (${{ matrix.target }}) for 30 seconds
+        working-directory: fuzz
+        run: |
+          # cargo-fuzz defaults to x86_64-unknown-linux-musl, which has
+          # mandatory crt-static and is incompatible with libfuzzer's ASan.
+          # Use the gnu target explicitly.
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            --target x86_64-unknown-linux-gnu \
+            -- -max_total_time=30
+
+      - name: Upload any failing corpus entries
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

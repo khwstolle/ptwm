@@ -1,0 +1,16 @@
+category,model,dtype,ablation,variant,total_bytes,n_tensors,huf_ratio,plane_entropies
+audio,facebook/encodec_24khz,fp32,A1,fp32_reorder_on,92815360,98,1.0701,8.00  8.00  7.97  3.25
+audio,facebook/encodec_24khz,fp32,A1,fp32_reorder_off,92815360,98,1.0690,8.00  8.00  7.97  3.30
+vision,microsoft/resnet-50,fp32,A1,fp32_reorder_on,102011648,54,1.0588,8.00  8.00  7.97  2.68
+vision,microsoft/resnet-50,fp32,A1,fp32_reorder_off,102011648,54,1.0579,8.00  8.00  7.97  2.75
+nlp,distilbert/distilbert-base-uncased,fp32,A1,fp32_reorder_on,267687144,40,1.0379,8.00  8.00  7.93  2.59
+nlp,distilbert/distilbert-base-uncased,fp32,A1,fp32_reorder_off,267687144,40,1.0372,8.00  8.00  7.97  2.61
+nlp,HuggingFaceTB/SmolLM2-135M,bf16,A1,bf16_reorder_on,268959744,211,1.0665,7.97  2.66
+nlp,HuggingFaceTB/SmolLM2-135M,bf16,A1,bf16_reorder_off,268959744,211,1.0652,7.97  2.74
+quantised,RedHatAI/Qwen2-1.5B-Instruct-FP8,bf16,A1,bf16_reorder_on,466747392,1,1.0000,7.97  2.59
+quantised,RedHatAI/Qwen2-1.5B-Instruct-FP8,bf16,A1,bf16_reorder_off,466747392,1,1.0000,7.97  2.67
+quantised,RedHatAI/Qwen2-1.5B-Instruct-FP8,fp8-e4m3fn,A3,e4m3_passthrough,1310195712,196,1.0000,6.64
+quantised,RedHatAI/Qwen2-1.5B-Instruct-FP8,fp8-e4m3fn,A3,e4m3_reorder_only,1310195712,196,1.0000,6.64
+quantised,RedHatAI/Qwen2-1.5B-Instruct-FP8,fp8-e4m3fn,A3,e4m3_nibble_split,1310195712,196,0.5048,2.70  3.98
+quantised,RedHatAI/Qwen2-1.5B-Instruct-quantized.w8a8,bf16,A1,bf16_reorder_on,934498304,58,1.0006,7.97  2.60
+quantised,RedHatAI/Qwen2-1.5B-Instruct-quantized.w8a8,bf16,A1,bf16_reorder_off,934498304,58,1.0005,7.97  2.68

@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a defect in the PTWM library or CLI.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One or two sentences. What broke?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: |
+        Minimal steps that trigger the issue. Include the input data shape /
+        dtype if relevant, and the exact `ptwm` command or Python API call.
+      placeholder: |
+        ```python
+        from ptwm import Compressor, CompressionConfig, Format
+        ...
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-vs-actual
+    attributes:
+      label: Expected vs. actual
+      description: What did you expect to happen, and what actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        - PTWM version (`python -c "import ptwm; print(ptwm.__version__)"`)
+        - Python version
+        - OS and architecture
+        - PyTorch version (`python -c "import torch; print(torch.__version__)"`)
+        - GPU / CPU
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Traceback or error output
+      description: |
+        Full stack trace or error message. Wrap in a code block.
+      render: text
+    validations:
+      required: false

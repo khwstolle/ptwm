@@ -1,0 +1,11 @@
+[package]
+name = "{{ name }}"
+version = "{{ version }}"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Add what your contribution needs. PTWM provides no host-side helpers
+# for WASM extensions; you write the byte-buffer ABI exports directly.

@@ -1,0 +1,50 @@
+//! PPG op catalogue. The trait surface and per-op modules live here.
+
+pub mod alpha_stable_normalize;
+pub mod bit_reorder_fp8;
+pub mod bit_reorder_ieee;
+pub mod block_microscaling_repack;
+pub mod burrows_wheeler;
+pub mod byte_passthrough;
+pub mod byte_split;
+pub mod concat;
+pub mod delta;
+pub mod entropy;
+pub mod fusion;
+pub mod index_pack;
+pub mod int_delta;
+pub mod mantissa_zero;
+pub mod move_to_front;
+pub mod mxfp4_deinterleave;
+pub mod nibble_split;
+pub mod op;
+pub mod predictor_xor;
+pub mod reshape;
+pub mod source;
+pub mod spherical_normalize;
+pub mod terminal;
+
+pub use alpha_stable_normalize::AlphaStableNormalize;
+pub use bit_reorder_fp8::{BitReorderFp8E4M3, BitReorderFp8E5M2};
+pub use bit_reorder_ieee::{BitReorderIeee16, BitReorderIeee32};
+pub use block_microscaling_repack::BlockMicroscalingRepack;
+pub use burrows_wheeler::BurrowsWheeler;
+pub use byte_passthrough::BytePassthrough;
+pub use byte_split::ByteSplit;
+pub use concat::Concat;
+pub use delta::XorDelta;
+#[cfg(feature = "lossy")]
+pub use delta::{DTYPE_CODE_F32, FloatDelta};
+pub use entropy::EntropyEstimate;
+pub use index_pack::IndexBitwidthPack;
+pub use int_delta::IntDelta;
+pub use mantissa_zero::MantissaZeroStrip;
+pub use move_to_front::MoveToFront;
+pub use mxfp4_deinterleave::MxFp4Deinterleave;
+pub use nibble_split::NibbleSplit;
+pub use op::{Op, OpId, Plane};
+pub use predictor_xor::PredictorXor;
+pub use reshape::Reshape;
+pub use source::Source;
+pub use spherical_normalize::SphericalNormalize;
+pub use terminal::Terminal;

@@ -1,0 +1,13 @@
+category,model,dtype,total_bytes,n_tensors,codec,codec_label,compressed_bytes,ratio,compress_mb_s,decompress_mb_s
+audio,facebook/encodec_24khz,fp32,92815360,98,huf_reorder,Huffman  (reorder+split),86736647,1.0701,205.3,1375.9
+audio,facebook/encodec_24khz,fp32,92815360,98,rans_reorder,rANS     (reorder+split),86451110,1.0736,119.5,928.8
+audio,facebook/encodec_24khz,fp32,92815360,98,zstd_reorder,ZSTD     (reorder+split),79498276,1.1675,158.1,1276.6
+audio,facebook/encodec_24khz,fp32,92815360,98,zstd_shuffle,ZSTD     (shuffle),79409482,1.1688,67.5,541.2
+audio,facebook/encodec_24khz,fp32,92815360,98,zstd_bitshuffle,ZSTD     (bitshuffle),80272706,1.1563,204.7,562.6
+audio,facebook/encodec_24khz,fp32,92815360,98,zstd_bytedelta,ZSTD     (bytedelta),92818496,1.0000,420.9,699.9
+vision,microsoft/resnet-50,fp32,102011648,54,huf_reorder,Huffman  (reorder+split),96346850,1.0588,168.1,1282.5
+vision,microsoft/resnet-50,fp32,102011648,54,rans_reorder,rANS     (reorder+split),96062980,1.0619,131.9,938.8
+vision,microsoft/resnet-50,fp32,102011648,54,zstd_reorder,ZSTD     (reorder+split),86884859,1.1741,148.4,1133.0
+vision,microsoft/resnet-50,fp32,102011648,54,zstd_shuffle,ZSTD     (shuffle),86536651,1.1788,59.7,707.5
+vision,microsoft/resnet-50,fp32,102011648,54,zstd_bitshuffle,ZSTD     (bitshuffle),87549748,1.1652,222.4,804.0
+vision,microsoft/resnet-50,fp32,102011648,54,zstd_bytedelta,ZSTD     (bytedelta),102013376,1.0000,559.2,1094.1

@@ -1,0 +1,310 @@
+[project]
+name = "ptwm"
+requires-python = ">=3.12, <3.14"
+description = "PTWM: lossless compression for PyTorch model weights."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+
+authors = [{ "name" = "Kurt H. W. Stolle", "email" = "kurt@computer.org" }]
+version = "1.0.0"
+keywords = [
+  "ptwm",
+  "compression",
+  "lossless",
+  "pytorch",
+  "weights",
+  "neural-network",
+  "quantization",
+  "huffman",
+  "mxfp4",
+  "nvfp4",
+  "safetensors",
+]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Rust",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: System :: Archiving :: Compression",
+]
+dependencies = [
+    "accelerate>=1.4.0",
+    "cbor2>=5.6.5",
+    "torch>=2.6.0",
+    "xxhash>=3.5.0",
+]
+
+[project.optional-dependencies]
+lmdb = ["lmdb>=1.4"]
+webdataset = ["webdataset>=0.2"]
+ext-dev = ["blake3>=0.4", "tomli-w>=1.0.0", "wasmtime>=26", "zstandard>=0.22"]
+
+[project.urls]
+Homepage = "https://github.com/khwstolle/ptwm"
+Repository = "https://github.com/khwstolle/ptwm"
+Issues = "https://github.com/khwstolle/ptwm/issues"
+
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+python-source = "python"
+module-name = "ptwm._core"
+manifest-path = "crates/ptwm-py/Cargo.toml"
+features = ["pyo3/extension-module"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux'"]
+
+[dependency-groups]
+dev = [
+  "blake3>=0.4",
+  "hypothesis>=6.127.6",
+  "pandas>=2.2.3",
+  "pytest>=8.3.5",
+  "pytest-benchmark>=5.1.0",
+  "pytest-cov>=6.0.0",
+  "pytest-github-actions-annotate-failures>=0.3.0",
+  "pytest-mock>=3.14.0",
+  "pytest-sugar>=1.0.0",
+  "pytest-xdist>=3.6.1",
+  "ruff>=0.9.9",
+  "pyright>=1.1.396",
+  "setuptools",
+  "safetensors>=0.6.1",
+  "psutil",
+  "maturin>=1.7,<2.0",
+  "tomli-w>=1.0.0",
+  "zstandard>=0.22",
+  "lmdb>=1.4",
+]
+integration = [
+  "transformers>=4.45.2",
+]
+ext-dev = [
+  "blake3>=0.4",
+  "tomli-w>=1.0.0",
+  "wasmtime>=26",
+  "zstandard>=0.22",
+]
+docs = [
+  "griffe>=1.6.0",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["python/ptwm"]
+omit = [
+  "*/utils/_patch.py",
+  "*/cli/compress.py",
+  "*/cli/decompress.py",
+  "*/cli/utils.py",
+]
+
+[tool.coverage.report]
+fail_under = 75
+exclude_lines = [
+  "pragma: no cover",
+  "if __name__ == .__main__.:",
+  "def main",
+  "def _missing_",
+  "raise NotImplementedError",
+  "\\.\\.\\.",
+]
+
+[tool.pyright]
+include = ["python"]
+stubPath = "typings"
+typeCheckingMode = "strict"
+reportMissingImports = false
+reportPrivateImportUsage = false
+reportMissingTypeStubs = true
+strictListInference = true
+strictSetInference = true
+reportImportCycles = true
+reportMatchNotExhaustive = true
+reportShadowedImports = true
+reportImplicitOverride = "warning"
+reportUnknownMemberType = false
+reportUninitializedInstanceVariable = false
+reportUnknownVariableType = false
+reportUnusedCallResult = false
+reportAny = false
+pythonVersion = "3.13"
+pythonPlatform = "Linux"
+executionEnvironments = [{ root = "python" }]
+
+[tool.pytest.ini_options]
+addopts = "--doctest-modules -m 'not integration' -m 'not gpu' --benchmark-disable"
+pythonpath = ["python", "."]
+testpaths = "tests"
+junit_family = "xunit2"
+junit_suite_name = "tests"
+markers = [
+  "integration: marks as integration test",
+  "interop: marks as interop / equivalence test",
+  "notebooks: marks as notebook test",
+  "gpu: marks as gpu test",
+  "slow: marks tests as slow",
+  "unit: fast offline tests",
+]
+[tool.ruff]
+target-version = 'py312'
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+  "F",    # flake8
+  "E",    # pycodestyle
+  "B",    # flake8-bugbear
+  "C",    # mccabe
+  "I",    # isort
+  "D",    # pydocstyle
+  "ANN",  # flake8-annotations
+  "ARG",  # flake8-unused-arguments
+  "C4",   # flake8-comprehensions
+  "EM",   # flake8-errmsg
+  "ICN",  # flake8-import-conventions
+  "G",    # flake8-logging-format
+  "PGH",  # pygrep-hooks
+  "PIE",  # flake8-pie
+  "PL",   # pylint
+  "PT",   # flake8-pytest-style
+  "PTH",  # flake8-use-pathlib
+  "RET",  # flake8-return
+  "SIM",  # flake8-simplify
+  "T20",  # flake8-print
+  "UP",   # pyupgrade
+  "NPY",  # NumPy specific rules
+  "FURB", # refurb
+  "PYI",  # flake8-pyi
+]
+ignore = [
+  "ANN401",
+  "PLR2004", # no magic numbers
+  "D100",    # Missing docstring in public module
+  "D103",    # Missing docstring in public function
+  "D104",    # Missing docstring in public package
+  "ANN101",  # Missing type annotation for self in public method
+  "ANN102",  # Missing type annotation for cls in public classmethod
+  "ANN001",  # Missing type annotation for function argument
+  "ANN002",  # Missing type annotation for *args
+  "ANN003",  # Missing type annotation for **kwargs
+  "ANN201",  # Missing return type annotation for public function
+  "ANN202",  # Missing return type annotation for private function
+  "ANN206",  # Missing return type annotation for classmethod
+  "PLR0912", # Too many branches
+  "PLR0913", # Too many arguments in function definition
+  "PLR0915", # Too many statements
+  "C901",    # function is too complex
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+"extensions/**" = [
+  "D",
+  "ANN",
+  "ARG",     # stub impls intentionally leave args unused
+  "PLC0415", # deferred import inside register() is intentional
+]
+"tests/**" = [
+  "T201",
+  "D",
+  "ANN",
+  "ARG",     # pytest fixture params are unused-args by design
+  "PLR2004",
+  "S101",
+  "E501",
+  "PTH",
+  "PLC",
+  "NPY",
+]
+"scripts/**" = [
+  "T201",
+  "D",
+  "ANN",
+  "E501",
+  "PTH123",
+  "B904",
+  "PTH",
+  "UP",
+  "F",
+  "E",
+  "W",
+  "I",
+  "B",
+  "SIM",
+  "C",
+  "PLC",
+  "PLW",
+]
+"benchmarks/**" = [
+  "T201",    # print is the output mechanism for benchmark results
+  "D",       # module docstrings only; per-function docstrings add nothing here
+  "ANN",     # not type-checked (pyright include = ["python"])
+  "E501",    # aligned table-format print lines run long by design
+  "EM",      # inline error-message strings are fine in manual harnesses
+  "PLC0415", # deferred ptwm imports keep import cost out of arg parsing
+]
+"docs/benchmarks/**" = [
+  "T201",     # print is the output mechanism for benchmark scripts
+  "D",
+  "ANN",
+  "E501",
+  "ARG",      # PyTorch hook signatures (module, input, output) leave args unused
+  "EM",       # f-string exception messages are fine in throwaway probes
+  "F841",     # exploratory scripts accumulate unused locals
+  "B904",
+  "BLE001",   # broad except around optional codec calls is intentional
+  "PTH",
+  "PLR2004",  # magic numbers (shapes, thresholds) are inherent to probes
+  "PLC0415",  # deferred heavy imports (torch/transformers) inside funcs
+  "PLW",
+  "C",
+  "SIM",
+  "NPY002",   # legacy numpy RNG is fine for probes
+]
+"examples/**" = [
+  "T201",
+  "D",
+  "ANN",
+  "E501",
+  "E402",
+  "PTH118",
+  "PTH120",
+  "PTH100",
+]
+"python/ptwm/cli/compress.py" = ["T201", "EM102", "E501"]
+"python/ptwm/cli/chains.py" = ["T201", "EM102", "E501", "PLC0415", "ARG001"]
+"python/ptwm/cli/trust.py" = ["T201", "EM102", "E501", "ARG001", "PTH110"]
+"python/ptwm/cli/policy.py" = ["T201", "EM102", "E501", "ARG001", "PTH110", "BLE001"]
+"python/ptwm/cli/ext.py" = ["T201", "EM102", "E501", "ARG001", "PTH110", "BLE001", "PLR1714", "PLC0415"]
+"python/ptwm/ext_tooling/pack.py" = ["PLC0415"]
+"python/ptwm/ext_tooling/sign.py" = ["PLC0415"]
+"python/ptwm/cli/bench.py" = ["T201", "EM102", "E501", "ARG001"]
+"python/ptwm/core/_compressor.py" = ["ARG002", "E501"]
+"python/ptwm/core/_decompressor.py" = ["E501"]
+"python/ptwm/core/_header.py" = ["E501", "B904"]
+"python/ptwm/integrations/_hf.py" = [
+  "PLC0415",
+]
+"python/ptwm/integrations/_safetensors.py" = ["PLC0415", "PYI036"]
+"python/ptwm/utils/_patch.py" = ["E501"]
+
+[tool.ruff.format]
+docstring-code-format = true
+docstring-code-line-length = "dynamic"
+
+[project.scripts]
+ptwm = "ptwm.cli.main:main"

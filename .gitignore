@@ -1,0 +1,54 @@
+# --- Environment ---
+.env
+.direnv
+
+# --- Pre-commit ---
+.pre-commit-config.yaml
+prek.toml
+
+# -- Python ---
+.pytest_cache
+.benchmarks
+.ruff_cache
+.venv
+.hypothesis/
+__pycache__
+*.egg-info
+dist/
+build/
+
+# --- Benchmark locks ---
+*.csv.lock
+
+# --- Coverage ---
+.coverage
+.coverage.*
+coverage.xml
+coverage.json
+coverage.lcov
+htmlcov/
+.cache/
+
+# --- Rust ---
+target/
+
+# --- cargo-fuzz local caches ---
+# Discovered-corpus and failing-input directories are populated by
+# `cargo fuzz run` on each developer's machine. CI uploads the
+# `artifacts/` directory on failure, so reproducers don't get lost.
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+
+# --- Extensions ---
+*.so
+*.dylib
+*.pyd
+
+# --- Node ---
+node_modules/
+.pnpm
+
+# --- Local overrides / logs ---
+*.local.*
+logs/

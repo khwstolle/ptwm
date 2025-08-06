@@ -1,0 +1,44 @@
+name: Feature request
+description: Propose a new capability or extension to PTWM.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: |
+        What use case isn't currently served, or what existing flow is
+        awkward? Concrete scenarios beat abstract wishes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-solution
+    attributes:
+      label: Proposed solution
+      description: |
+        Rough shape of the API, CLI flag, or codec change you have in mind.
+        Don't worry about polishing — implementation discussion happens in
+        the PR.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: |
+        Workarounds you tried, or adjacent designs you decided against and
+        why.
+    validations:
+      required: false
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: |
+        Links to relevant papers, upstream issues, or benchmark numbers
+        that motivate the request.
+    validations:
+      required: false

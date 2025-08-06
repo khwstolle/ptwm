@@ -1,0 +1,14 @@
+[bundle]
+name = "ref-integration-adapter"
+version = "0.1.0"
+author_pubkey = "ed25519:0000000000000000000000000000000000000000000000000000000000000000"
+description = "PTWM v1 reference contribution for the integration_adapter kind."
+
+[[contributions]]
+id = "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+label = "io.ptwm.ref.integration_adapter"
+kind = "integration_adapter"
+abi_version = 1
+lifecycle = "thread"
+flavors = ["host"]
+capabilities = { determinism = true, hardware_class = "cpu" }

@@ -1,0 +1,3 @@
+# PTWM bundled trust keyring. The v1 placeholder entry is not yet seeded;
+# for now this file is empty.
+entries = []

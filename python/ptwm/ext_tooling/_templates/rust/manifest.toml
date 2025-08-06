@@ -1,0 +1,14 @@
+[bundle]
+name = "{{ name }}"
+version = "{{ version }}"
+author_pubkey = "{{ author_pubkey }}"
+description = "{{ description }}"
+
+[[contributions]]
+id = "{{ canonical_id }}"
+label = "{{ label }}"
+kind = "{{ kind }}"
+abi_version = 1
+lifecycle = "thread"
+flavors = ["wasm"]
+capabilities = { determinism = true, hardware_class = "cpu" }

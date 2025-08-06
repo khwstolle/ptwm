@@ -1,0 +1,19 @@
+[nvidia]
+linux_dpkg_keys  = ["nvidia-cuda-toolkit", "cuda-12-0", "cuda-12-1", "libcuda1"]
+linux_rpm_keys   = ["nvidia-driver-cuda"]
+macos_team_ids   = []
+
+[amd]
+linux_dpkg_keys  = ["rocm-libs", "amdgpu-dkms"]
+linux_rpm_keys   = ["rocm-runtime"]
+macos_team_ids   = []
+
+[apple]
+linux_dpkg_keys  = []
+linux_rpm_keys   = []
+macos_team_ids   = []
+
+[intel]
+linux_dpkg_keys  = ["intel-oneapi-runtime"]
+linux_rpm_keys   = []
+macos_team_ids   = []

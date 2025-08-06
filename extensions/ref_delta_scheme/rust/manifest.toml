@@ -1,0 +1,14 @@
+[bundle]
+name = "ref-delta-scheme"
+version = "0.1.0"
+author_pubkey = "ed25519:0000000000000000000000000000000000000000000000000000000000000000"
+description = "PTWM v1 reference contribution for the delta_scheme kind."
+
+[[contributions]]
+id = "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+label = "io.ptwm.ref.delta_scheme"
+kind = "delta_scheme"
+abi_version = 1
+lifecycle = "thread"
+flavors = ["wasm"]
+capabilities = { determinism = true, hardware_class = "cpu" }

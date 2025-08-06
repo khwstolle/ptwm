@@ -1,0 +1,14 @@
+[bundle]
+name = "ref-benchmark-metric"
+version = "0.1.0"
+author_pubkey = "ed25519:0000000000000000000000000000000000000000000000000000000000000000"
+description = "PTWM v1 reference contribution for the benchmark_metric kind."
+
+[[contributions]]
+id = "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+label = "io.ptwm.ref.benchmark_metric"
+kind = "benchmark_metric"
+abi_version = 1
+lifecycle = "thread"
+flavors = ["host"]
+capabilities = { determinism = true, hardware_class = "cpu" }

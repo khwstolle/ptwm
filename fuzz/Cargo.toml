@@ -1,0 +1,97 @@
+[package]
+name = "ptwm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Exclude from the workspace so `cargo test --workspace` and `cargo build`
+# don't try to compile the libfuzzer-sys crate (which needs +nightly).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ptwm-core = { path = "../crates/ptwm-core" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "huffman_decode"
+path = "fuzz_targets/huffman_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rans_decode"
+path = "fuzz_targets/rans_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_header"
+path = "fuzz_targets/parse_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_wire"
+path = "fuzz_targets/parse_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "container_open"
+path = "fuzz_targets/container_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "order1_scale_ac_decode"
+path = "fuzz_targets/order1_scale_ac_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "order1_scale_ac_state_parse"
+path = "fuzz_targets/order1_scale_ac_state_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "chain_wire"
+path = "fuzz_targets/chain_wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extension_table"
+path = "fuzz_targets/extension_table.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "ptwx_wasm_extract"
+path = "fuzz_targets/ptwx_wasm_extract.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "policy_resolve"
+path = "fuzz_targets/policy_resolve.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "raw_binary_schema"
+path = "fuzz_targets/raw_binary_schema.rs"
+test = false
+doc = false

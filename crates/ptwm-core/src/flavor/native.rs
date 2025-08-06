@@ -1,0 +1,313 @@
+//! Native cdylib loader. Loads a `.so` / `.dylib` / `.dll` via libloading,
+//! probes for the per-kind ABI symbols, and exposes a thin handle the
+//! dispatcher uses to invoke each method.
+//!
+//! Safety invariant: the caller MUST have verified the signature against
+//! the active trust state before calling `NativeExtension::load`. The
+//! `VerifiedToken` opaque type makes this an enforced precondition.
+
+use std::path::Path;
+
+use libloading::{Library, Symbol};
+
+use crate::extension::{CanonicalId, ExtensionTableEntry, Kind, Lifecycle};
+use crate::flavor::abi::CodecError;
+
+/// Capability token proving the caller verified the contribution's
+/// signature. Construct via `VerifiedToken::new_unchecked` only when
+/// the verifier returned Trusted.
+pub struct VerifiedToken {
+    _private: (),
+}
+
+impl VerifiedToken {
+    /// Create a token. ONLY call this after the Verifier returned
+    /// TrustVerdict::Trusted for the entry.
+    pub fn new_unchecked() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Symbol set discovered at load time. Each Option carries the raw fn
+/// pointer for the corresponding ABI export, or None if absent.
+///
+/// `libloading::Library` must outlive every fn pointer derived from
+/// it; we hold the Library inside NativeExtension and the fn pointers
+/// alongside.
+pub struct NativeSymbols {
+    // PlaneCodec
+    pub plane_codec_v1_encode: Option<PlaneCodecFn>,
+    pub plane_codec_v1_decode: Option<PlaneCodecFn>,
+    /// Optional state-aware decode symbol. When present, the dispatcher
+    /// uses it for any plane carrying inline / shared state bytes; when
+    /// absent, the dispatcher falls back to the stateless
+    /// `plane_codec_v1_decode` symbol.
+    pub plane_codec_v1_decode_stateful: Option<PlaneCodecStatefulFn>,
+    // Transform
+    pub transform_v1_forward: Option<TransformFn>,
+    pub transform_v1_inverse: Option<TransformFn>,
+}
+
+pub type PlaneCodecFn = unsafe extern "C" fn(
+    *const u8, // input ptr
+    usize,     // input len
+    *mut u8,   // output ptr
+    usize,     // output len
+) -> i64;
+
+/// State-aware decode symbol.
+///
+/// Signature: `(state_version, state_ptr, state_len, in_ptr, in_len,
+/// out_ptr, out_cap) -> i64`. Return convention matches `PlaneCodecFn`
+/// (non-negative output length, or one of the negative error codes
+/// decoded by `decode_rc`).
+pub type PlaneCodecStatefulFn = unsafe extern "C" fn(
+    u8,        // state_format_version
+    *const u8, // state ptr
+    usize,     // state len
+    *const u8, // input ptr
+    usize,     // input len
+    *mut u8,   // output ptr
+    usize,     // output cap
+) -> i64;
+
+pub type TransformFn = PlaneCodecFn;
+
+pub struct NativeExtension {
+    // Held for its drop-time side effect: keeping the dlopen handle alive
+    // so all fn pointers in `symbols` remain valid.
+    #[allow(dead_code)]
+    library: Library,
+    pub canonical_id: CanonicalId,
+    pub kind: Kind,
+    pub lifecycle: Lifecycle,
+    pub symbols: NativeSymbols,
+}
+
+impl NativeExtension {
+    /// Load and resolve symbols. Caller MUST present a VerifiedToken.
+    ///
+    /// # Safety
+    /// The library at `path` will be `dlopen`-ed. The caller has
+    /// verified its signature.
+    pub fn load(
+        path: &Path,
+        entry: &ExtensionTableEntry,
+        _verified: VerifiedToken,
+    ) -> Result<Self, CodecError> {
+        let library = unsafe { Library::new(path) }.map_err(|_| CodecError::InvalidInput)?;
+
+        let mut symbols = NativeSymbols {
+            plane_codec_v1_encode: None,
+            plane_codec_v1_decode: None,
+            plane_codec_v1_decode_stateful: None,
+            transform_v1_forward: None,
+            transform_v1_inverse: None,
+        };
+
+        // Probe symbols depending on the kind.
+        match entry.kind {
+            Kind::PlaneCodec => {
+                symbols.plane_codec_v1_encode =
+                    resolve::<PlaneCodecFn>(&library, b"ptwm_plane_codec_v1_encode\0");
+                symbols.plane_codec_v1_decode =
+                    resolve::<PlaneCodecFn>(&library, b"ptwm_plane_codec_v1_decode\0");
+                // Optional: a state-aware decoder. Stateless codecs leave
+                // this absent and the router falls back to the unadorned
+                // decode symbol.
+                symbols.plane_codec_v1_decode_stateful = resolve::<PlaneCodecStatefulFn>(
+                    &library,
+                    b"ptwm_plane_codec_v1_decode_stateful\0",
+                );
+                if symbols.plane_codec_v1_encode.is_none()
+                    || symbols.plane_codec_v1_decode.is_none()
+                {
+                    return Err(CodecError::Unsupported {
+                        feature: "missing required plane_codec_v1 symbol".into(),
+                    });
+                }
+            }
+            Kind::Transform => {
+                symbols.transform_v1_forward =
+                    resolve::<TransformFn>(&library, b"ptwm_transform_v1_forward\0");
+                symbols.transform_v1_inverse =
+                    resolve::<TransformFn>(&library, b"ptwm_transform_v1_inverse\0");
+                if symbols.transform_v1_forward.is_none() || symbols.transform_v1_inverse.is_none()
+                {
+                    return Err(CodecError::Unsupported {
+                        feature: "missing required transform_v1 symbol".into(),
+                    });
+                }
+            }
+            _ => {
+                // Other kinds: probe is lenient for v1. The dispatcher
+                // will yield Unsupported on invocation if the symbol's
+                // missing; per-kind probes can be added incrementally.
+            }
+        }
+
+        Ok(Self {
+            library,
+            canonical_id: entry.canonical_id,
+            kind: entry.kind,
+            lifecycle: entry.lifecycle,
+            symbols,
+        })
+    }
+
+    /// Invoke `ptwm_plane_codec_v1_encode`. Caller-allocates buffers.
+    pub fn invoke_plane_codec_encode(
+        &self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, CodecError> {
+        let f = self
+            .symbols
+            .plane_codec_v1_encode
+            .ok_or(CodecError::Unsupported {
+                feature: "plane_codec_v1_encode not present".into(),
+            })?;
+        let rc = unsafe {
+            f(
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        };
+        decode_rc(rc, output.len())
+    }
+
+    /// Invoke `ptwm_plane_codec_v1_decode`. Caller-allocates buffers.
+    pub fn invoke_plane_codec_decode(
+        &self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, CodecError> {
+        let f = self
+            .symbols
+            .plane_codec_v1_decode
+            .ok_or(CodecError::Unsupported {
+                feature: "plane_codec_v1_decode not present".into(),
+            })?;
+        let rc = unsafe {
+            f(
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        };
+        decode_rc(rc, output.len())
+    }
+
+    /// Invoke `ptwm_plane_codec_v1_decode_stateful`. Caller-allocates
+    /// buffers. Falls back to the stateless [`Self::invoke_plane_codec_decode`]
+    /// when the extension didn't export the stateful variant — appropriate
+    /// for stateless codecs whose state slice is empty.
+    pub fn invoke_plane_codec_decode_stateful(
+        &self,
+        state_version: u8,
+        state_bytes: &[u8],
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, CodecError> {
+        if let Some(f) = self.symbols.plane_codec_v1_decode_stateful {
+            // For empty slices, `as_ptr()` returns a non-null dangling
+            // pointer (e.g. 0x1). C-side codecs commonly null-check the
+            // state pointer to decide whether state is present, so pass
+            // a real null when the slice is empty.
+            let state_ptr = if state_bytes.is_empty() {
+                std::ptr::null()
+            } else {
+                state_bytes.as_ptr()
+            };
+            let rc = unsafe {
+                f(
+                    state_version,
+                    state_ptr,
+                    state_bytes.len(),
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            };
+            return decode_rc(rc, output.len());
+        }
+        // No stateful symbol — only legal when the caller is passing an
+        // empty state. A stateful plane reaching a stateless codec would
+        // be a decode-time misconfiguration.
+        if !state_bytes.is_empty() {
+            return Err(CodecError::Unsupported {
+                feature: "plane_codec_v1_decode_stateful not exported but plane carries state \
+                          bytes; codec cannot honour the per-plane state"
+                    .into(),
+            });
+        }
+        self.invoke_plane_codec_decode(input, output)
+    }
+}
+
+fn decode_rc(rc: i64, out_capacity: usize) -> Result<usize, CodecError> {
+    if rc < 0 {
+        return Err(match rc {
+            -1 => CodecError::InvalidInput,
+            -2 => CodecError::BufferTooSmall { needed: 0 },
+            -3 => CodecError::MissingCapability {
+                name: String::new(),
+            },
+            -4 => CodecError::MissingNativeDep {
+                name: String::new(),
+                version_constraint: String::new(),
+            },
+            -5 => CodecError::Unsupported {
+                feature: String::new(),
+            },
+            _ => CodecError::InternalError,
+        });
+    }
+    let n = rc as usize;
+    if n > out_capacity {
+        return Err(CodecError::InternalError);
+    }
+    Ok(n)
+}
+
+fn resolve<F: Copy>(library: &Library, name: &[u8]) -> Option<F> {
+    unsafe { library.get::<F>(name).ok().map(|sym: Symbol<F>| *sym) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extension::{
+        Attestation, CapabilityMap, ExtensionTableEntry, Kind, Lifecycle, table::FLAVOR_NATIVE,
+    };
+
+    fn entry(kind: Kind) -> ExtensionTableEntry {
+        ExtensionTableEntry {
+            canonical_id: CanonicalId::from_bytes([0xCD; 32]),
+            human_label: "io.test.native".into(),
+            kind,
+            abi_version: 1,
+            lifecycle: Lifecycle::Thread,
+            flavor_hints: FLAVOR_NATIVE,
+            capabilities: CapabilityMap::new(),
+            attestation: Attestation::PgpSignature(Vec::new()),
+            install_hint: None,
+            embedded_wasm_offset: None,
+            embedded_wasm_length: None,
+        }
+    }
+
+    #[test]
+    fn missing_library_path_is_invalid_input() {
+        let res = NativeExtension::load(
+            Path::new("/this/path/does/not/exist.so"),
+            &entry(Kind::PlaneCodec),
+            VerifiedToken::new_unchecked(),
+        );
+        assert!(matches!(res, Err(CodecError::InvalidInput)));
+    }
+}

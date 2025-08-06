@@ -1,0 +1,45 @@
+name: Extension Interop
+
+on:
+  pull_request:
+  # No push trigger: the PR already gates merges into master, so re-running
+  # interop on the merge commit just doubles the Actions spend.
+
+permissions:
+  contents: read
+
+# Cancel superseded in-progress runs on the same PR branch (pushes to
+# master always run to completion).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  interop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Setup Rust (stable, with wasm32-wasip1 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install ext-dev deps (for the wasmtime Python package)
+        run: uv pip install --system 'wasmtime>=26' 'zstandard>=0.22' 'tomli-w>=1.0.0'
+
+      - name: Run interop tests
+        run: uv run pytest tests/interop -v --no-cov

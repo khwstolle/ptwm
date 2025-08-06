@@ -1,0 +1,10 @@
+category,model,dtype,total_bytes,n_tensors,strategy,plane,entropy_bits_per_byte
+audio,facebook/encodec_24khz,fp32,92815360,98,raw,all,7.466885
+audio,facebook/encodec_24khz,fp32,92815360,98,shuffle,byte0,7.999991
+audio,facebook/encodec_24khz,fp32,92815360,98,shuffle,byte1,7.999989
+audio,facebook/encodec_24khz,fp32,92815360,98,shuffle,byte2,7.971179
+audio,facebook/encodec_24khz,fp32,92815360,98,shuffle,byte3,3.300500
+audio,facebook/encodec_24khz,fp32,92815360,98,reorder,mantissa_lo,7.999991
+audio,facebook/encodec_24khz,fp32,92815360,98,reorder,mantissa_mid,7.999989
+audio,facebook/encodec_24khz,fp32,92815360,98,reorder,mantissa_hi,7.971185
+audio,facebook/encodec_24khz,fp32,92815360,98,reorder,exponent,3.250730

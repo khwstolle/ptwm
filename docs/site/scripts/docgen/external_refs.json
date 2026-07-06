@@ -1,0 +1,17 @@
+{
+  "comment": "Static intersphinx-style inventory for cross-package references in docstrings. Longest-prefix match; the value is the URL to link to (no per-anchor templating today).",
+  "entries": {
+    "pathlib.Path": "https://docs.python.org/3/library/pathlib.html#pathlib.Path",
+    "pathlib": "https://docs.python.org/3/library/pathlib.html",
+    "torch.Tensor": "https://docs.pytorch.org/docs/stable/tensors.html",
+    "torch.nn.Module": "https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html",
+    "torch": "https://docs.pytorch.org/docs/stable/index.html",
+    "numpy.ndarray": "https://numpy.org/doc/stable/reference/generated/numpy.ndarray.html",
+    "numpy": "https://numpy.org/doc/stable/",
+    "transformers.PreTrainedModel": "https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel",
+    "transformers.PreTrainedModel.from_pretrained": "https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.from_pretrained",
+    "transformers": "https://huggingface.co/docs/transformers",
+    "safetensors.torch.safe_open": "https://huggingface.co/docs/safetensors/api/torch",
+    "safetensors": "https://huggingface.co/docs/safetensors"
+  }
+}

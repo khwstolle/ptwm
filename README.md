@@ -4,6 +4,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/ptwm.svg)](https://pypi.org/project/ptwm/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/khwstolle/ptwm/actions/workflows/python-tests.yml/badge.svg)](https://github.com/khwstolle/ptwm/actions/workflows/python-tests.yml)
+[![Docs](https://github.com/khwstolle/ptwm/actions/workflows/docs.yml/badge.svg)](https://github.com/khwstolle/ptwm/actions/workflows/docs.yml)
 
 A lossless compression library for PyTorch model weights. PTWM
 exploits the byte-level structure of IEEE 754 floats and the layout of
@@ -15,8 +16,8 @@ The output format, `.ptwm`, is a multi-tensor container with
 random-access lookup, hash-verified payloads, and per-tensor codec
 dispatch.
 
-Benchmarks live under [`docs/benchmarks/`](docs/benchmarks/); design
-docs live under [`docs/architecture/`](docs/architecture/).
+Full documentation, benchmarks, and the API reference live at
+**[ptwm.khws.io](https://ptwm.khws.io)**.
 
 ## What this library does and does not do
 
@@ -375,15 +376,19 @@ ptwm bench attribute model.bin --leave-one-out --out attr-out/
   preprocessing graph, codec dispatch, extension system, and trust
   model.
 - **`docs/benchmarks/`**: benchmark results and per-feature CSVs.
+- **`docs/site/`**: the Nuxt-based documentation site deployed at
+  [ptwm.khws.io](https://ptwm.khws.io).
 - **`tests/`**: the pytest suite.
 - **`benchmarks/`**: manual performance and validation harnesses.
+- **`scripts/`**: small maintenance/CI utility scripts.
 - **`fuzz/`**: `cargo-fuzz` targets for the container format and
   entropy coders.
 
 ## Development
 
 The development environment lives in `pyproject.toml` + `uv.lock`,
-driven by [uv](https://docs.astral.sh/uv/).
+driven by [uv](https://docs.astral.sh/uv/). Nix is optional, a
+reproducible convenience rather than a requirement.
 
 **Prerequisites:**
 
@@ -391,6 +396,17 @@ driven by [uv](https://docs.astral.sh/uv/).
 - A stable Rust toolchain (`rustc`, `cargo`) for building the
   `ptwm._core` native extension
 - [uv](https://docs.astral.sh/uv/getting-started/installation/)
+
+**With Nix:**
+
+```sh
+nix develop
+```
+
+The flake provisions Python, Rust, and uv at pinned versions. Shell
+entry creates `.venv/` automatically.
+
+**Without Nix:**
 
 Install the prerequisites via your system package manager or
 [rustup](https://rustup.rs/). uv can provision a matching Python
@@ -401,12 +417,16 @@ uv sync --dev
 source .venv/bin/activate
 ```
 
+Both paths produce an equivalent `.venv/`. If you use
+[direnv](https://direnv.net/), the repo's `.envrc` checks for Nix first
+and falls back to uv.
+
 **Pre-commit hooks.** Prek manages the hook set:
 
 ```sh
 uv tool install prek
 prek install
-prek run --all-files
+nix develop -c prek run --all-files
 ```
 
 ## Benchmarks

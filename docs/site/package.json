@@ -1,0 +1,55 @@
+{
+  "name": "ptwm-docs",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Documentation site for PTWM (PyTorch Weights Manifest).",
+  "type": "module",
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "dev": "nuxt dev",
+    "build": "nuxt generate",
+    "generate": "nuxt generate",
+    "preview": "nuxt preview",
+    "prepare": "nuxt prepare",
+    "typecheck": "nuxt typecheck",
+    "lint": "eslint .",
+    "docgen": "node scripts/docgen/build.mjs",
+    "docgen:python": "python scripts/docgen/extract-python.py",
+    "docgen:rust": "bash scripts/docgen/extract-rust.sh",
+    "docgen:normalize": "node scripts/docgen/normalize.mjs",
+    "deploy": "wrangler pages deploy .output/public --project-name=ptwm-docs",
+    "deploy:preview": "wrangler pages deploy .output/public --project-name=ptwm-docs --branch=preview"
+  },
+  "dependencies": {
+    "@iconify-json/lucide": "^1.2.106",
+    "@iconify-json/simple-icons": "^1.2.81",
+    "@iconify-json/vscode-icons": "^1.2.49",
+    "@nuxt/content": "^3.13.0",
+    "@nuxt/fonts": "^0.11.0",
+    "@nuxt/image": "^1.8.0",
+    "@nuxt/ui": "^4.7.1",
+    "@nuxtjs/mdc": "^0.21.1",
+    "@vueuse/core": "^14.3.0",
+    "better-sqlite3": "^12.10.0",
+    "nuxt": "^4.0.0",
+    "nuxt-llms": "0.2.0",
+    "shiki": "^1.24.0",
+    "ufo": "^1.6.4",
+    "vue": "^3.5.0"
+  },
+  "devDependencies": {
+    "@nuxt/eslint": "^1.15.2",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.10.0",
+    "eslint": "^9.0.0",
+    "js-yaml": "^4.1.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.0",
+    "vue-tsc": "^2.1.10",
+    "wrangler": "^3.95.0",
+    "zod": "^3.23.0"
+  }
+}

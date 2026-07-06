@@ -1,0 +1,255 @@
+@import "tailwindcss";
+@import "@nuxt/ui";
+
+@source "../../../content/**/*";
+
+/* Type system
+ * -----------
+ * Display  — Geist (variable, wght 100-900). Vercel / Basement Studio's
+ *            engineering sans: sharp terminals, geometric construction,
+ *            tight default tracking. Reads as technical instrumentation.
+ * Body     — IBM Plex Sans. Engineered for technical reading, distinct
+ *            from Roboto / Inter, ample x-height for UI chrome.
+ * Mono     — IBM Plex Mono. Shares design DNA with Plex Sans so inline
+ *            code sits naturally inside body copy. */
+@theme static {
+  --font-display: 'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* Wireframe / instrument-panel aesthetic.
+ *
+ * Tight radii (≤ 4 px), hairline-ring shadows in place of soft drop
+ * shadows. The 1px ring is what carries the "outline" feel — the small
+ * y-offset shadow only adds depth on overlay surfaces. */
+@theme static {
+  --radius-xs: 0;
+  --radius-sm: 1px;
+  --radius-md: 2px;
+  --radius-lg: 3px;
+  --radius-xl: 4px;
+  --radius-2xl: 6px;
+  --radius-3xl: 8px;
+
+  --shadow-2xs: 0 0 0 1px color-mix(in oklab, currentColor 6%, transparent);
+  --shadow-xs:  0 0 0 1px color-mix(in oklab, currentColor 8%, transparent);
+  --shadow-sm:  0 1px 0 0 rgb(0 0 0 / 0.04), 0 0 0 1px color-mix(in oklab, currentColor 10%, transparent);
+  --shadow-md:  0 1px 2px rgb(0 0 0 / 0.05), 0 0 0 1px color-mix(in oklab, currentColor 10%, transparent);
+  --shadow-lg:  0 2px 4px rgb(0 0 0 / 0.06), 0 0 0 1px color-mix(in oklab, currentColor 12%, transparent);
+  --shadow-xl:  0 4px 8px rgb(0 0 0 / 0.08), 0 0 0 1px color-mix(in oklab, currentColor 14%, transparent);
+  --shadow-2xl: 0 8px 16px rgb(0 0 0 / 0.10), 0 0 0 1px color-mix(in oklab, currentColor 16%, transparent);
+}
+
+/* Primary palette: PyTorch Orange (#EE4C2C, hue ~30). The 500 step is
+ * pinned to the brand spec — neighboring steps walk lightness and chroma
+ * symmetrically so the ramp keeps the brand colour as its centre of mass
+ * and the accent is recognisable as PyTorch-adjacent. */
+@theme static {
+  --color-primary-50:  oklch(96.5% 0.025 30);
+  --color-primary-100: oklch(92%   0.05  30);
+  --color-primary-200: oklch(85%   0.10  30);
+  --color-primary-300: oklch(76%   0.15  30);
+  --color-primary-400: oklch(70%   0.18  30);
+  --color-primary-500: oklch(64%   0.20  30);
+  --color-primary-600: oklch(56%   0.19  30);
+  --color-primary-700: oklch(48%   0.16  30);
+  --color-primary-800: oklch(39%   0.13  30);
+  --color-primary-900: oklch(30%   0.10  30);
+  --color-primary-950: oklch(20%   0.07  30);
+}
+
+@layer base {
+  :root {
+    --ui-primary: var(--ui-color-primary-500);
+    /* Tighten NuxtUI's component radius globally — buttons, inputs, cards,
+     * badges all key off this token. */
+    --ui-radius: 0.125rem;
+  }
+
+  html {
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: 'kern', 'liga', 'calt';
+  }
+
+  body {
+    line-height: 1.6;
+  }
+
+  /* Headings: Space Grotesk. Tracking tightens with size, weight steps
+   * with hierarchy. text-wrap: balance keeps multi-line headings honest. */
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-display);
+    color: var(--ui-color-text-highlighted, inherit);
+    text-wrap: balance;
+    font-feature-settings: 'kern';
+  }
+
+  h1,
+  .u-page-hero :where(h1) {
+    font-weight: 600;
+    letter-spacing: 0;
+    line-height: 1.05;
+  }
+
+  /* Hero h2 is treated as a deck / standfirst — display face, lighter
+   * weight. Geist ships normal-only on Google Fonts, so we lean on
+   * weight + colour for emphasis instead of italic. */
+  .u-page-hero :where(h2) {
+    font-weight: 400;
+    letter-spacing: 0;
+    line-height: 1.25;
+    color: var(--ui-color-text-muted, inherit);
+  }
+
+  h2,
+  .u-page-section :where(h2) {
+    font-weight: 600;
+    letter-spacing: 0;
+    line-height: 1.15;
+  }
+
+  h3 {
+    font-weight: 600;
+    letter-spacing: 0;
+    line-height: 1.2;
+  }
+
+  h4 {
+    font-weight: 500;
+    letter-spacing: 0;
+    line-height: 1.25;
+  }
+
+  h5, h6 {
+    font-weight: 500;
+    letter-spacing: 0;
+    line-height: 1.3;
+  }
+
+  /* Strong emphasis stays on the weight axis. Plex Sans 600 reads like
+   * other faces' 700 — drop a step to avoid over-bolding. */
+  strong, b {
+    font-weight: 600;
+  }
+
+  em, i, cite, dfn {
+    font-style: italic;
+  }
+
+  /* Monospaced text: Plex Mono. Ligatures off — operator boundaries
+   * (`->`, `>>=`, `!=`, `>>`) matter in compression / tensor code, and
+   * fused glyphs hide arity. */
+  code, kbd, samp, pre, var, .font-mono {
+    font-family: var(--font-mono);
+    font-variant-ligatures: none;
+    font-feature-settings: 'calt' off, 'liga' off;
+  }
+
+  /* Inline code: tightened size + crisp 1px border (no chip background). */
+  :not(pre) > code {
+    font-size: 0.9em;
+    padding-inline: 0.3em;
+    padding-block: 0.05em;
+    border-radius: 2px;
+    border: 1px solid color-mix(in oklab, currentColor 12%, transparent);
+    color: var(--ui-color-text-highlighted, inherit);
+  }
+
+  :where(h1, h2, h3, h4, h5, h6) :where(code, kbd, samp, var) {
+    font-style: normal;
+    font-weight: inherit;
+    font-size: 0.85em;
+  }
+
+  small,
+  .text-xs,
+  .text-2xs,
+  caption,
+  figcaption {
+    letter-spacing: 0.005em;
+  }
+
+  /* Tabular figures wherever numerals appear in tables. Plex Sans supports
+   * the `tnum` feature; this keeps benchmark CSV columns aligned. */
+  table, .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Wireframe table styling: hard 1px outer frame, hairline horizontal
+   * rows only (no vertical column rules — they fight the eye). No
+   * rounded corners, no zebra striping. Reads as datasheet, not card.
+   *
+   * Scoped via :not(.not-prose) so component-level tables (e.g.
+   * <ApiItem>, anything tagged `not-prose`) keep their own chrome. */
+  :where(:not(.not-prose, .not-prose *)) > table,
+  :where(:not(.not-prose, .not-prose *)) table:not([class]) {
+    border-collapse: collapse;
+    width: 100%;
+    margin-block: 1.5rem;
+    border-block: 1px solid var(--ui-color-border-accented, color-mix(in oklab, currentColor 22%, transparent));
+    font-variant-numeric: tabular-nums;
+  }
+
+  :where(:not(.not-prose, .not-prose *)) > table :where(th, td),
+  :where(:not(.not-prose, .not-prose *)) table:not([class]) :where(th, td) {
+    padding-block: 0.6rem;
+    padding-inline: 1rem;
+    vertical-align: top;
+    border: 0;
+  }
+
+  :where(:not(.not-prose, .not-prose *)) > table :where(thead),
+  :where(:not(.not-prose, .not-prose *)) table:not([class]) :where(thead) {
+    border-bottom: 1px solid var(--ui-color-border-accented, color-mix(in oklab, currentColor 22%, transparent));
+  }
+
+  :where(:not(.not-prose, .not-prose *)) > table :where(tbody tr + tr),
+  :where(:not(.not-prose, .not-prose *)) table:not([class]) :where(tbody tr + tr) {
+    border-top: 1px solid var(--ui-color-border, color-mix(in oklab, currentColor 10%, transparent));
+  }
+
+  :where(:not(.not-prose, .not-prose *)) > table :where(th),
+  :where(:not(.not-prose, .not-prose *)) table:not([class]) :where(th) {
+    font-family: var(--font-display);
+    font-weight: 500;
+    font-size: 0.78em;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ui-color-text-muted, inherit);
+    /* Honour markdown alignment markers — don't force start. */
+  }
+
+  /* Inline code inside table cells: drop the chip border so cells stay
+   * uncluttered. Mono font + subtle muted colour does the work. */
+  :where(:not(.not-prose, .not-prose *)) > table :not(pre) > code,
+  :where(:not(.not-prose, .not-prose *)) table:not([class]) :not(pre) > code {
+    border: 0;
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    font-size: 0.92em;
+  }
+
+  /* Horizontal rules are 1 px hairlines, not the default 2 px. */
+  :where(:not(.not-prose, .not-prose *)) > hr {
+    border: 0;
+    border-top: 1px solid var(--ui-color-border, color-mix(in oklab, currentColor 14%, transparent));
+    margin-block: 2rem;
+  }
+}
+
+/* Custom semantic colours for API-kind badges. Chroma kept moderate so
+ * the badges read as a coherent diagnostic legend, and `constant` is
+ * shifted off hue 30 to avoid clashing with the PyTorch-Orange primary. */
+@theme static {
+  --color-kind-module:   oklch(58% 0.12 200);
+  --color-kind-type:     oklch(58% 0.14 320);
+  --color-kind-function: oklch(58% 0.12 150);
+  --color-kind-method:   oklch(58% 0.12 100);
+  --color-kind-property: oklch(58% 0.12  85);
+  --color-kind-constant: oklch(58% 0.13 270);
+}

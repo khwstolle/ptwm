@@ -1,0 +1,24 @@
+<template>
+  <svg
+    viewBox="0 0 128 32"
+    xmlns="http://www.w3.org/2000/svg"
+    aria-label="PTWM"
+    role="img"
+  >
+    <title>PTWM</title>
+    <g fill="var(--ui-primary)">
+      <rect x="0" y="5" width="26" height="5" rx="1.25" />
+      <rect x="0" y="13" width="20" height="5" rx="1.25" opacity="0.6" />
+      <rect x="0" y="21" width="13" height="5" rx="1.25" opacity="0.3" />
+    </g>
+    <text
+      x="36"
+      y="23"
+      font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+      font-size="20"
+      font-weight="700"
+      letter-spacing="0"
+      fill="currentColor"
+    >PTWM</text>
+  </svg>
+</template>

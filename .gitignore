@@ -2,6 +2,10 @@
 .env
 .direnv
 
+# --- Nix ---
+/result
+/result/
+
 # --- Pre-commit ---
 .pre-commit-config.yaml
 prek.toml

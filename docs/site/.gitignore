@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Nuxt build output
+/.nuxt/
+/.output/
+/.data/
+
+# Link to the output
+/dist
+
+# Cloudflare local state
+.wrangler/
+
+# Generated docgen artifacts
+.docgen/
+
+# Generated API content (regenerated from source by `pnpm run docgen`)
+content/api/python/**
+content/api/rust/**
+
+# Keep the explanatory index pages that live alongside the generated tree.
+!content/api/python/.gitkeep
+!content/api/rust/.gitkeep
+
+# Pagefind index
+public/_pagefind/
+
+# Logs / OS junk
+*.log
+.DS_Store

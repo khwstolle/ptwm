@@ -36,10 +36,10 @@ classifiers = [
   "Topic :: System :: Archiving :: Compression",
 ]
 dependencies = [
-    "accelerate>=1.4.0",
-    "cbor2>=5.6.5",
+    "accelerate>=1.13.0",
+    "cbor2>=5.9.0",
     "torch>=2.6.0",
-    "xxhash>=3.5.0",
+    "xxhash>=3.7.0",
 ]
 
 [project.optional-dependencies]
@@ -48,7 +48,8 @@ webdataset = ["webdataset>=0.2"]
 ext-dev = ["blake3>=0.4", "tomli-w>=1.0.0", "wasmtime>=26", "zstandard>=0.22"]
 
 [project.urls]
-Homepage = "https://github.com/khwstolle/ptwm"
+Homepage = "https://ptwm.khws.io"
+Documentation = "https://ptwm.khws.io"
 Repository = "https://github.com/khwstolle/ptwm"
 Issues = "https://github.com/khwstolle/ptwm/issues"
 
@@ -68,19 +69,19 @@ environments = ["sys_platform == 'linux'"]
 [dependency-groups]
 dev = [
   "blake3>=0.4",
-  "hypothesis>=6.127.6",
-  "pandas>=2.2.3",
-  "pytest>=8.3.5",
+  "hypothesis>=6.141.0",
+  "pandas>=2.3.3",
+  "pytest>=8.4.2",
   "pytest-benchmark>=5.1.0",
-  "pytest-cov>=6.0.0",
+  "pytest-cov>=7.0.0",
   "pytest-github-actions-annotate-failures>=0.3.0",
-  "pytest-mock>=3.14.0",
-  "pytest-sugar>=1.0.0",
-  "pytest-xdist>=3.6.1",
-  "ruff>=0.9.9",
-  "pyright>=1.1.396",
+  "pytest-mock>=3.15.1",
+  "pytest-sugar>=1.1.1",
+  "pytest-xdist>=3.8.0",
+  "ruff>=0.15.4",
+  "pyright>=1.1.400",
   "setuptools",
-  "safetensors>=0.6.1",
+  "safetensors",
   "psutil",
   "maturin>=1.7,<2.0",
   "tomli-w>=1.0.0",
@@ -97,7 +98,7 @@ ext-dev = [
   "zstandard>=0.22",
 ]
 docs = [
-  "griffe>=1.6.0",
+  "griffe>=1.7.0",
 ]
 
 [tool.coverage.run]
@@ -256,6 +257,19 @@ convention = "numpy"
   "E501",    # aligned table-format print lines run long by design
   "EM",      # inline error-message strings are fine in manual harnesses
   "PLC0415", # deferred ptwm imports keep import cost out of arg parsing
+]
+"docs/site/scripts/**" = [
+  "T201",
+  "D",
+  "ANN",
+  "E501",
+  "F",
+  "PIE",
+  "PLC",
+  "PLW",
+  "PLR0911",
+  "RET504",
+  "SIM103",
 ]
 "docs/benchmarks/**" = [
   "T201",     # print is the output mechanism for benchmark scripts

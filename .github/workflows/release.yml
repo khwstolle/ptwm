@@ -45,11 +45,27 @@ jobs:
         # input) so the resulting wheels run on any modern glibc-based
         # distro. macOS runners build native wheels — macos-13 emits
         # x86_64, macos-14 emits arm64.
+        #
+        # CFLAGS_aarch64_unknown_linux_gnu works around a `ring` build
+        # failure under the manylinux2014 aarch64 cross-compiler: its
+        # pregenerated ARM assembly expects the preprocessor macro
+        # __ARM_ARCH, which that gcc doesn't define by default. This
+        # only affects the aarch64-unknown-linux-gnu target (docker
+        # cross-compile), so it's a no-op for the other matrix entries.
+        #
+        # before-script-linux installs perl-IPC-Cmd: git2's
+        # vendored-openssl feature builds OpenSSL from source for
+        # portability, and its Configure script needs that module,
+        # which the manylinux2014 image's perl doesn't ship. Only runs
+        # inside the Linux docker container, so it's a no-op on macOS.
         uses: PyO3/maturin-action@v1
+        env:
+          CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
         with:
           target: ${{ matrix.target }}
           args: --release --out dist --interpreter 3.12 3.13
           manylinux: ${{ matrix.manylinux }}
+          before-script-linux: yum install -y perl-IPC-Cmd || apt-get install -y libipc-cmd-perl
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4

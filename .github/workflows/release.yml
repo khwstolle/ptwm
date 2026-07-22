@@ -27,7 +27,11 @@ jobs:
           - os: ubuntu-latest
             target: aarch64
             manylinux: auto
-          - os: macos-13
+          # macos-13 (Intel) hosted runners were retired December 2025;
+          # macos-15-intel is the current x86_64 label. macos-14 is
+          # Apple Silicon (arm64) and stays until the announced 2027
+          # architecture cutover.
+          - os: macos-15-intel
             target: x86_64
             manylinux: ''
           - os: macos-14

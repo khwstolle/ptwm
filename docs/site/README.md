@@ -1,9 +1,9 @@
 # PTWM documentation site
 
-A Nuxt 4 + Cloudflare Workers documentation site for PTWM. The site
-unifies handwritten content (concepts, guides, benchmarks) with
-auto-generated API reference pages for the Python package and the Rust
-crate.
+A Nuxt 4 documentation site for PTWM, prerendered to static HTML and
+served from GitHub Pages. The site unifies handwritten content
+(concepts, guides, benchmarks) with auto-generated API reference pages
+for the Python package and the Rust crate.
 
 ## Architecture in 30 seconds
 
@@ -13,8 +13,8 @@ docs/site/
   content/       Handwritten Markdown + generated content/api/**
   scripts/       Python + Rust extractors and the normalizer
   .docgen/       (gitignored) JSON dumps from griffe and rustdoc
-  .output/       (gitignored) Nuxt build output, deployed to Workers
-  wrangler.toml  Cloudflare Workers + Static Assets deploy config
+  .output/       (gitignored) Nuxt build output, deployed to GitHub Pages
+  public/CNAME   Custom domain (ptwm.khws.io) for the Pages deploy
 ```
 
 The cohesion guarantee: both Python (Griffe) and Rust (`cargo rustdoc
@@ -31,7 +31,7 @@ Python and Rust items share the exact DOM structure.
 nix develop .#docs
 ```
 
-The `docs` devShell provides Node 22, pnpm 9, wrangler, pagefind, uv,
+The `docs` devShell provides Node 22, pnpm 9, pagefind, uv,
 prek, and a **nightly Rust toolchain** via the `fenix` flake input
 (rustdoc JSON requires `-Z unstable-options`, which only nightly
 accepts). No separate `rustup` install needed.
@@ -89,10 +89,11 @@ pnpm run build
 pnpm run search:index
 ```
 
-The first command builds Nuxt with the `cloudflare_module` Nitro
-preset, emitting `.output/server/index.mjs` and `.output/public/**`.
-The second runs Pagefind over the static output to build the search
-index under `/_pagefind/`.
+The first command builds Nuxt with the `static` Nitro preset, emitting
+fully prerendered HTML under `.output/public/**` (no server bundle —
+see the preset comment in `nuxt.config.ts` for why `cloudflare_*`
+presets are avoided). The second runs Pagefind over the static output
+to build the search index under `/_pagefind/`.
 
 ### Local preview of the production bundle
 
@@ -102,16 +103,14 @@ pnpm run preview
 
 ### Deploy
 
-`.github/workflows/docs.yml` automates deployment. A push to `master`
-triggers a production deploy; a pull request triggers a preview deploy
-and links the preview URL back into the PR.
+`.github/workflows/docs.yml` automates deployment via GitHub Pages
+(`actions/upload-pages-artifact` + `actions/deploy-pages`). A push to
+`master` builds and publishes; a pull request only runs the build to
+verify the site compiles — GitHub Pages has no per-PR preview
+environment, so there's no live preview URL for PRs.
 
-Manual deploy from your machine (requires `wrangler login` and a
-Workers project named `ptwm-docs`):
-
-```bash
-pnpm run deploy
-```
+The custom domain (`ptwm.khws.io`) is set via `public/CNAME`, which
+Nuxt copies verbatim into `.output/public/CNAME`.
 
 ## Authoring conventions
 
@@ -211,8 +210,3 @@ the repository root.
 
 **Pagefind index empty** — make sure `pnpm run build` ran before
 `pnpm run search:index`. Pagefind crawls `.output/public/`.
-
-**Cloudflare deploy fails on `wrangler versions upload`** — your
-Cloudflare account needs Workers Static Assets enabled for the project,
-and the `CF_API_TOKEN` secret must include "Workers Scripts: Edit" and
-"Account → Workers KV Storage: Edit" permissions.

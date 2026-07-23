@@ -30,8 +30,6 @@ concurrency:
 
 permissions:
   contents: read
-  pull-requests: write
-  deployments: write
 
 env:
   NUXT_TELEMETRY_DISABLED: '1'
@@ -86,76 +84,33 @@ jobs:
         working-directory: docs/site
         run: pnpm run generate
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+      # GitHub Pages' own artifact format (tar, permission-normalized) —
+      # separate from a plain actions/upload-artifact, and consumed
+      # directly by actions/deploy-pages in the deploy job below.
+      - name: Upload Pages artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/upload-pages-artifact@v3
         with:
-          name: docs-site
-          path: |
-            docs/site/.output/public/**
-            docs/site/wrangler.toml
-          if-no-files-found: error
-          retention-days: 14
+          path: docs/site/.output/public
 
-  # Deploy jobs run only when the Cloudflare API token is configured.
-  # On forks / first-time setups the secret may be missing — in that
-  # case the build still verifies the site, but deploys are skipped
-  # cleanly rather than failing the PR.
+  # Only a push to master publishes. GitHub Pages has no per-PR preview
+  # environment (unlike Cloudflare Pages' branch deploys) — PRs get the
+  # build-verification above but no live preview URL.
   deploy:
     needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master' && vars.CF_DEPLOY_ENABLED == 'true'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    permissions:
+      pages: write
+      id-token: write
     environment:
-      name: docs-production
-      url: ${{ steps.deploy.outputs.url }}
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: docs-site
-          path: docs/site
-
-      - name: Deploy to Cloudflare Pages (production)
-        id: deploy
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CF_API_TOKEN }}
-          accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          workingDirectory: docs/site
-          command: pages deploy .output/public --project-name=ptwm-docs --branch=main
-
-  preview:
-    needs: build
-    if: github.event_name == 'pull_request' && vars.CF_DEPLOY_ENABLED == 'true'
-    runs-on: ubuntu-latest
-    environment:
-      name: docs-preview-${{ github.event.pull_request.number }}
-      url: ${{ steps.deploy.outputs.url }}
-
-    steps:
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: docs-site
-          path: docs/site
-
-      - name: Deploy preview
-        id: deploy
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CF_API_TOKEN }}
-          accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          workingDirectory: docs/site
-          command: pages deploy .output/public --project-name=ptwm-docs --branch=pr-${{ github.event.pull_request.number }}
-
-      - name: Comment preview URL on PR
-        if: steps.deploy.outputs.url
-        uses: marocchino/sticky-pull-request-comment@v2
-        with:
-          header: docs-preview
-          message: |
-            **Docs preview** for this PR is live:
-
-            <${{ steps.deploy.outputs.url }}>
-
-            *Updated on every push.*
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -7,7 +7,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 
 authors = [{ "name" = "Kurt H. W. Stolle", "email" = "kurt@computer.org" }]
-version = "1.0.0"
+version = "1.0.1"
 keywords = [
   "ptwm",
   "compression",
@@ -38,6 +38,7 @@ classifiers = [
 dependencies = [
     "accelerate>=1.13.0",
     "cbor2>=5.9.0",
+    "tomli-w>=1.0.0",
     "torch>=2.6.0",
     "xxhash>=3.7.0",
 ]
@@ -45,7 +46,7 @@ dependencies = [
 [project.optional-dependencies]
 lmdb = ["lmdb>=1.4"]
 webdataset = ["webdataset>=0.2"]
-ext-dev = ["blake3>=0.4", "tomli-w>=1.0.0", "wasmtime>=26", "zstandard>=0.22"]
+ext-dev = ["blake3>=0.4", "wasmtime>=26", "zstandard>=0.22"]
 
 [project.urls]
 Homepage = "https://ptwm.khws.io"

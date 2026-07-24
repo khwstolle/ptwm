@@ -1,6 +1,6 @@
 //! PTWM flavor system: WASM (Wasmtime), native cdylib (dlopen), and
 //! host-language entry points (Python). Each flavor materializes a
-//! Box<dyn AnyContribution> from a disk path + manifest entry.
+//! `Box<dyn AnyContribution>` from a disk path + manifest entry.
 //!
 //! This file re-exports the submodules that make up the flavor system.
 

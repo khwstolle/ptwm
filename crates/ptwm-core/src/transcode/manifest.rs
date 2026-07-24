@@ -6,7 +6,7 @@
 //! embedded modules) are referenced by member key and live outside the JSON.
 //!
 //! The schema restricts scalars to integers, strings, booleans, and `null`;
-//! opaque byte fields are carried as base64 (`*_b64`). See [`super::jcs`] for
+//! opaque byte fields are carried as base64 (`*_b64`). See `super::jcs` for
 //! the canonicalization that makes manifest hashes reproducible.
 
 use serde::{Deserialize, Serialize};

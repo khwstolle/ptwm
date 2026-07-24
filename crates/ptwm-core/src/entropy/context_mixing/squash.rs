@@ -3,7 +3,7 @@
 //! `stretch(p)` is its inverse. Both are integer and deterministic.
 
 /// Inverse-logit: map a logit `d` (clamped to ±2047) to a probability `0..=4095`.
-/// `const fn` so [`STRETCH_TABLE`] can be built at compile time.
+/// `const fn` so `STRETCH_TABLE` can be built at compile time.
 pub const fn squash(d: i32) -> i32 {
     const T: [i32; 33] = [
         1, 2, 3, 6, 10, 16, 27, 45, 73, 120, 194, 310, 488, 747, 1101, 1546, 2047, 2549, 2994,

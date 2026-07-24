@@ -366,7 +366,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
     }
 
     /// Append a tensor whose record bytes were serialized ahead of time (e.g.
-    /// in parallel via [`write_tensor_record`](crate::tensor_record::write_tensor_record)).
+    /// in parallel via [`crate::tensor_record::write_tensor_record`]).
     /// Identical on-disk effect to [`Self::append_tensor`] but skips the
     /// (payload-copy-heavy) serialization, which the caller has already done.
     pub fn append_serialized_tensor(

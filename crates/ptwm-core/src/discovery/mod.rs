@@ -1,11 +1,13 @@
 //! Filesystem discovery + index cache for installed extensions.
 //!
 //! Layout per extension bundle:
-//!   $PTWM_EXTENSION_PATH-or-XDG-dir/<author-fingerprint>/<name>@<version>/
-//!     manifest.toml
-//!     <contribution>.wasm
-//!     <contribution>.so / .dylib / .dll
-//!     signature.bin
+//! ```text
+//! $PTWM_EXTENSION_PATH-or-XDG-dir/<author-fingerprint>/<name>@<version>/
+//!   manifest.toml
+//!   <contribution>.wasm
+//!   <contribution>.so / .dylib / .dll
+//!   signature.bin
+//! ```
 //!
 //! Resolution order:
 //!   * $PTWM_EXTENSION_PATH (colon-separated) if set

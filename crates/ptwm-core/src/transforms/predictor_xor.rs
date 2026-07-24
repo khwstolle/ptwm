@@ -4,7 +4,7 @@
 //! values using a small fixed-context-model hash table, then emits
 //! `truth XOR prediction`. The output is concentrated around zero
 //! (heavy leading-zero distribution) when the underlying values change
-//! smoothly — exactly the regime where Huffman / [`crate::codecs::Fpc`]
+//! smoothly — exactly the regime where Huffman / [`crate::codecs::fpc::Fpc`]
 //! both win.
 //!
 //! ## Predictor: fixed-context model (fcm)

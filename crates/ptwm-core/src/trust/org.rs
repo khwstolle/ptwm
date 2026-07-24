@@ -1,7 +1,7 @@
 //! Org trust manifests — signed TOML files vouching for member author keys.
 //!
 //! Lifecycle:
-//!   1. Org publishes <manifest>.toml at a URL + a sibling <manifest>.toml.sig.
+//!   1. Org publishes `<manifest>.toml` at a URL + a sibling `<manifest>.toml.sig`.
 //!   2. User runs `ptwm trust add --org <URL>`.
 //!   3. PTWM fetches both, verifies the manifest signature against
 //!      `org.key`, parses members, adds the *org key* to the user's

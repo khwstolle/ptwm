@@ -4,7 +4,7 @@
 //! # Dispatch order
 //!
 //! 1. **Built-ins** — resolved via [`dispatch_builtin`] and wrapped in
-//!    [`BuiltinAdapter`].
+//!    `BuiltinAdapter`.
 //! 2. **Native** (`.so` / `.dylib` / `.dll`) — resolved by scanning `bundle_dir`
 //!    for a native artifact, then dlopen-loaded via [`NativeExtension`].
 //! 3. **WASM** — resolved by scanning `bundle_dir` for a `.wasm` artifact, then
@@ -207,9 +207,9 @@ impl DispatchedPlaneCodec for WasmAdapter {
 
 /// Resolves a `CanonicalId` to a `Box<dyn DispatchedPlaneCodec>`.
 ///
-/// Construct once per decode session (or shared) and call [`get`] for each
-/// plane. Results are internally cached so expensive dynamic loads happen at
-/// most once per id.
+/// Construct once per decode session (or shared) and call [`Self::get`] for
+/// each plane. Results are internally cached so expensive dynamic loads
+/// happen at most once per id.
 pub struct PlaneCodecRouter {
     installed: Vec<DiscoveredContribution>,
     cache: Mutex<HashMap<CanonicalId, Arc<dyn DispatchedPlaneCodec>>>,

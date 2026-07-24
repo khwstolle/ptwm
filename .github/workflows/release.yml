@@ -47,8 +47,8 @@ jobs:
       - name: Build wheels via maturin
         # Linux runners use manylinux2014 (set via the `manylinux: auto`
         # input) so the resulting wheels run on any modern glibc-based
-        # distro. macOS runners build native wheels — macos-13 emits
-        # x86_64, macos-14 emits arm64.
+        # distro. macOS runners build native wheels — macos-15-intel
+        # emits x86_64, macos-14 emits arm64.
         #
         # CFLAGS_aarch64_unknown_linux_gnu works around a `ring` build
         # failure under the manylinux2014 aarch64 cross-compiler: its
@@ -57,17 +57,18 @@ jobs:
         # only affects the aarch64-unknown-linux-gnu target (docker
         # cross-compile), so it's a no-op for the other matrix entries.
         #
-        # before-script-linux installs Perl's IPC::Cmd: git2's
+        # before-script-linux installs a full Perl distribution: git2's
         # vendored-openssl feature builds OpenSSL from source for
-        # portability, and its Configure script needs that module. The
-        # x86_64 leg's manylinux2014 image is RHEL-based (yum, package
-        # perl-IPC-Cmd); the aarch64 leg cross-compiles inside
-        # ghcr.io/rust-cross/manylinux2014-cross, which is Debian-based
-        # (apt) — there's no libipc-cmd-perl package there, but IPC::Cmd
-        # ships as a core module in the full `perl` package (via its
-        # perl-modules-* dependency), so installing that plus refreshing
-        # the apt cache first covers it. Only runs inside the Linux
-        # docker container, so it's a no-op on macOS.
+        # portability, and its Configure script pulls in whichever core
+        # modules that OpenSSL release needs (IPC::Cmd, Time::Piece, and
+        # possibly others as upstream OpenSSL's build scripting evolves)
+        # — installing the full `perl` package rather than chasing
+        # individual modules covers the set regardless of which ones a
+        # given OpenSSL version needs. The x86_64 leg's manylinux2014
+        # image is RHEL-based (yum); the aarch64 leg cross-compiles
+        # inside ghcr.io/rust-cross/manylinux2014-cross, which is
+        # Debian-based (apt, cache refreshed first). Only runs inside
+        # the Linux docker container, so it's a no-op on macOS.
         uses: PyO3/maturin-action@v1
         env:
           CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
@@ -75,7 +76,7 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist --interpreter 3.12 3.13
           manylinux: ${{ matrix.manylinux }}
-          before-script-linux: (yum install -y perl-IPC-Cmd) || (apt-get update && apt-get install -y perl)
+          before-script-linux: (yum install -y perl) || (apt-get update && apt-get install -y perl)
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4

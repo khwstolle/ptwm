@@ -29,6 +29,33 @@ impl CanonicalId {
         out.copy_from_slice(h.finalize().as_bytes());
         Self(out)
     }
+
+    /// Parse the `Display` format (`"blake3:<64 lowercase hex chars>"`) back
+    /// into a `CanonicalId`. Also accepts uppercase hex.
+    pub fn parse(s: &str) -> Result<Self, super::ExtensionError> {
+        let hex = s
+            .strip_prefix("blake3:")
+            .ok_or_else(|| super::ExtensionError::InvalidRef(s.to_string()))?;
+        if hex.len() != 64 {
+            return Err(super::ExtensionError::InvalidRef(s.to_string()));
+        }
+        let mut out = [0u8; 32];
+        for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+            let hi = hex_nibble(chunk[0]).ok_or_else(|| super::ExtensionError::InvalidRef(s.to_string()))?;
+            let lo = hex_nibble(chunk[1]).ok_or_else(|| super::ExtensionError::InvalidRef(s.to_string()))?;
+            out[i] = (hi << 4) | lo;
+        }
+        Ok(Self(out))
+    }
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 impl core::fmt::Debug for CanonicalId {
@@ -106,5 +133,28 @@ mod tests {
     fn ref_parse_rejects_malformed() {
         assert!(ContributionRef::parse("no-version").is_err());
         assert!(ContributionRef::parse("@1.0.0").is_err());
+    }
+
+    #[test]
+    fn canonical_id_parse_roundtrips_through_display() {
+        let id = CanonicalId::derive(&[0x42u8; 32], "foo", "1.0.0");
+        let s = id.to_string();
+        let parsed = CanonicalId::parse(&s).unwrap();
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn canonical_id_parse_accepts_uppercase_hex() {
+        let id = CanonicalId::from_bytes([0xABu8; 32]);
+        let hex: String = [0xABu8; 32].iter().map(|b| format!("{:02X}", b)).collect();
+        let parsed = CanonicalId::parse(&format!("blake3:{hex}")).unwrap();
+        assert_eq!(parsed, id);
+    }
+
+    #[test]
+    fn canonical_id_parse_rejects_malformed() {
+        assert!(CanonicalId::parse("sha256:aabb").is_err());
+        assert!(CanonicalId::parse("blake3:short").is_err());
+        assert!(CanonicalId::parse("").is_err());
     }
 }

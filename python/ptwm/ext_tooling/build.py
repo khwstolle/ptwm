@@ -42,8 +42,8 @@ def detect_language(cwd: Path) -> str:
     raise BuildError(msg)
 
 
-def build_extension(cwd: Path, release: bool = True) -> Path:
-    """Build the extension in *cwd* and return the path to the produced .wasm.
+def build_extension(cwd: Path, release: bool = True, flavor: str = "wasm") -> Path:
+    """Build the extension in *cwd* and return the path to the produced binary.
 
     Parameters
     ----------
@@ -51,20 +51,28 @@ def build_extension(cwd: Path, release: bool = True) -> Path:
         Root directory of the extension project (must contain ``manifest.toml``).
     release:
         When ``True`` (default), build with optimizations enabled.
+    flavor:
+        ``"wasm"`` (default) builds a `wasm32-wasip1` module. ``"native"``
+        builds a plain cdylib (`.so` / `.dylib`) instead — rust-only.
 
     Returns
     -------
     Path
-        Path to the ``.wasm`` file placed next to ``manifest.toml``.
+        Path to the built binary, placed next to ``manifest.toml``.
 
     Raises
     ------
     BuildError
-        When language detection or the underlying toolchain invocation fails.
+        When language detection or the underlying toolchain invocation
+        fails, or when ``flavor="native"`` is requested for a language
+        that only supports wasm.
     """
     lang = detect_language(cwd)
     if lang == "rust":
-        return _build_rust(cwd, release)
+        return _build_rust(cwd, release, flavor)
+    if flavor == "native":
+        msg = f"native builds are rust-only (got lang={lang!r})"
+        raise BuildError(msg)
     if lang == "c":
         return _build_c(cwd)
     if lang == "zig":
@@ -82,7 +90,9 @@ def _run(cmd: list[str], cwd: Path) -> None:
         raise BuildError(msg)
 
 
-def _build_rust(cwd: Path, release: bool) -> Path:
+def _build_rust(cwd: Path, release: bool, flavor: str = "wasm") -> Path:
+    if flavor == "native":
+        return _build_rust_native(cwd, release)
     cmd = ["cargo", "build", "--target", "wasm32-wasip1"]
     if release:
         cmd.append("--release")
@@ -91,6 +101,26 @@ def _build_rust(cwd: Path, release: bool) -> Path:
     src = next((cwd / "target" / "wasm32-wasip1" / sub).glob("*.wasm"))
     name = _manifest_name(cwd)
     dst = cwd / f"{name}.wasm"
+    shutil.copyfile(src, dst)
+    return dst
+
+
+def _build_rust_native(cwd: Path, release: bool) -> Path:
+    cmd = ["cargo", "build"]
+    if release:
+        cmd.append("--release")
+    _run(cmd, cwd)
+    sub = "release" if release else "debug"
+    out_dir = cwd / "target" / sub
+    try:
+        src = next(
+            p for pattern in ("*.so", "*.dylib") for p in out_dir.glob(pattern)
+        )
+    except StopIteration as e:
+        msg = f"no native .so/.dylib produced under {out_dir}"
+        raise BuildError(msg) from e
+    name = _manifest_name(cwd)
+    dst = cwd / f"{name}{src.suffix}"
     shutil.copyfile(src, dst)
     return dst
 

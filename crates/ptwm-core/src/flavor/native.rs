@@ -46,6 +46,9 @@ pub struct NativeSymbols {
     // Transform
     pub transform_v1_forward: Option<TransformFn>,
     pub transform_v1_inverse: Option<TransformFn>,
+    // DeltaScheme
+    pub delta_scheme_v1_encode: Option<DeltaSchemeFn>,
+    pub delta_scheme_v1_decode: Option<DeltaSchemeFn>,
 }
 
 pub type PlaneCodecFn = unsafe extern "C" fn(
@@ -72,6 +75,24 @@ pub type PlaneCodecStatefulFn = unsafe extern "C" fn(
 ) -> i64;
 
 pub type TransformFn = PlaneCodecFn;
+
+/// `delta_scheme_v1_{encode,decode}` symbol shape.
+///
+/// Unlike the WASM ABI's `ptwm_delta_scheme_v1_{init,cleanup,encode,decode}`
+/// (which threads an opaque state handle because WASM linear memory forces
+/// the host to manage allocation explicitly — see
+/// `extensions/ref_delta_scheme/rust/src/lib.rs`), the native (dlopen)
+/// surface carries no state handle, matching [`PlaneCodecFn`]'s existing
+/// native convention: a native contribution manages any internal state as
+/// ordinary process-local Rust/C state, not through an FFI-visible handle.
+pub type DeltaSchemeFn = unsafe extern "C" fn(
+    *const u8, // base ptr
+    usize,     // base len
+    *const u8, // target (encode) / delta (decode) ptr
+    usize,     // target/delta len
+    *mut u8,   // output ptr
+    usize,     // output len
+) -> i64;
 
 pub struct NativeExtension {
     // Held for its drop-time side effect: keeping the dlopen handle alive
@@ -103,6 +124,8 @@ impl NativeExtension {
             plane_codec_v1_decode_stateful: None,
             transform_v1_forward: None,
             transform_v1_inverse: None,
+            delta_scheme_v1_encode: None,
+            delta_scheme_v1_decode: None,
         };
 
         // Probe symbols depending on the kind.
@@ -136,6 +159,19 @@ impl NativeExtension {
                 {
                     return Err(CodecError::Unsupported {
                         feature: "missing required transform_v1 symbol".into(),
+                    });
+                }
+            }
+            Kind::DeltaScheme => {
+                symbols.delta_scheme_v1_encode =
+                    resolve::<DeltaSchemeFn>(&library, b"ptwm_delta_scheme_v1_encode\0");
+                symbols.delta_scheme_v1_decode =
+                    resolve::<DeltaSchemeFn>(&library, b"ptwm_delta_scheme_v1_decode\0");
+                if symbols.delta_scheme_v1_encode.is_none()
+                    || symbols.delta_scheme_v1_decode.is_none()
+                {
+                    return Err(CodecError::Unsupported {
+                        feature: "missing required delta_scheme_v1 symbol".into(),
                     });
                 }
             }
@@ -246,6 +282,58 @@ impl NativeExtension {
             });
         }
         self.invoke_plane_codec_decode(input, output)
+    }
+
+    /// Invoke `ptwm_delta_scheme_v1_encode`. Caller-allocates buffers.
+    pub fn invoke_delta_scheme_encode(
+        &self,
+        base: &[u8],
+        target: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, CodecError> {
+        let f = self
+            .symbols
+            .delta_scheme_v1_encode
+            .ok_or(CodecError::Unsupported {
+                feature: "delta_scheme_v1_encode not present".into(),
+            })?;
+        let rc = unsafe {
+            f(
+                base.as_ptr(),
+                base.len(),
+                target.as_ptr(),
+                target.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        };
+        decode_rc(rc, output.len())
+    }
+
+    /// Invoke `ptwm_delta_scheme_v1_decode`. Caller-allocates buffers.
+    pub fn invoke_delta_scheme_decode(
+        &self,
+        base: &[u8],
+        delta: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, CodecError> {
+        let f = self
+            .symbols
+            .delta_scheme_v1_decode
+            .ok_or(CodecError::Unsupported {
+                feature: "delta_scheme_v1_decode not present".into(),
+            })?;
+        let rc = unsafe {
+            f(
+                base.as_ptr(),
+                base.len(),
+                delta.as_ptr(),
+                delta.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        };
+        decode_rc(rc, output.len())
     }
 }
 

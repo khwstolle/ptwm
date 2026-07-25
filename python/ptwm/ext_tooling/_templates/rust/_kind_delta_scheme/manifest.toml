@@ -7,7 +7,7 @@ description = "{{ description }}"
 [[contributions]]
 id = "{{ canonical_id }}"
 label = "{{ label }}"
-kind = "{{ kind }}"
+kind = "delta_scheme"
 abi_version = 1
 lifecycle = "thread"
 flavors = ["{{ flavor }}"]

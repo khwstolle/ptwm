@@ -9,6 +9,8 @@ use wasmtime::{
     Config, Engine, Instance, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
     TypedFunc,
 };
+use wasmtime_wasi::WasiCtxBuilder;
+use wasmtime_wasi::preview1::{self, WasiP1Ctx};
 
 use crate::extension::{
     Attestation, CanonicalId, ExtensionTableEntry, Lifecycle, capability::CapabilityValue,
@@ -38,6 +40,14 @@ pub struct WasmExtension {
 pub struct WasmState {
     pub limits: StoreLimits,
     pub canonical_id: CanonicalId,
+    /// Satisfies the `wasi_snapshot_preview1` imports every `std`-linked
+    /// `wasm32-wasip1` module pulls in for its runtime/panic machinery
+    /// (`environ_get`, `fd_write`, `proc_exit`, ...), even when the
+    /// contribution's own code never touches stdio/env/fs. Fully
+    /// sandboxed by `WasiCtxBuilder`'s defaults: closed stdin, sunk
+    /// stdout/stderr, no env, no args, no preopens — no capability
+    /// beyond what the byte-buffer ABI itself grants.
+    pub wasi: WasiP1Ctx,
 }
 
 impl WasmExtension {
@@ -47,7 +57,13 @@ impl WasmExtension {
         config.consume_fuel(true);
         config.async_support(false);
         config.wasm_simd(true);
-        config.wasm_reference_types(false);
+        // Stock `rustc`/LLVM wasm32-wasip1 codegen emits reference-types
+        // encoded `call_indirect` (multi-table-shaped, even for ordinary
+        // indirect calls with a single table) — disabling this rejects any
+        // unmodified `std`-linked module at parse time ("zero byte
+        // expected"). Keep wasmtime's own default (on); it depends on
+        // bulk_memory, already enabled below.
+        config.wasm_reference_types(true);
         config.wasm_bulk_memory(true);
         config.wasm_threads(false);
         config.wasm_memory64(false);
@@ -132,6 +148,7 @@ impl WasmExtension {
             WasmState {
                 limits,
                 canonical_id: self.canonical_id,
+                wasi: WasiCtxBuilder::new().build_p1(),
             },
         );
         store.limiter(|st| &mut st.limits);
@@ -142,11 +159,17 @@ impl WasmExtension {
     }
 
     pub fn instantiate(&self, store: &mut Store<WasmState>) -> Result<Instance, CodecError> {
-        let linker = Linker::<WasmState>::new(&self.engine);
-        // No host imports are wired by default. host_imports from the
-        // declared set would be added here if v1 supported any — for
-        // now we deny anything that's declared, since no concrete host-
-        // import bindings exist yet.
+        let mut linker = Linker::<WasmState>::new(&self.engine);
+        // Every `std`-linked wasm32-wasip1 module needs its
+        // wasi_snapshot_preview1 runtime imports satisfied (see the
+        // `WasmState::wasi` doc comment) — wire those in before anything
+        // declared-host-imports-specific below.
+        preview1::add_to_linker_sync(&mut linker, |state: &mut WasmState| &mut state.wasi)
+            .map_err(|_| CodecError::InternalError)?;
+        // No host imports beyond WASI preview1 are wired by default.
+        // host_imports from the declared set would be added here if v1
+        // supported any — for now we deny anything that's declared, since
+        // no concrete host-import bindings exist yet.
         if !self.declared_imports.is_empty() {
             return Err(CodecError::Unsupported {
                 feature: format!(
@@ -374,6 +397,179 @@ pub fn invoke_plane_codec_decode_stateful(
         let _ = free.call(&mut *store, (state_ptr, state_bytes.len() as u32));
     }
     let _ = free.call(&mut *store, (in_ptr, input.len() as u32));
+    let _ = free.call(&mut *store, (out_ptr, output.len() as u32));
+    result
+}
+
+/// Helper: dispatch into the delta_scheme_v1 encode export.
+///
+/// Unlike `plane_codec`'s invoke helpers, this threads the per-call state
+/// handle the reference ABI actually exports
+/// (`ptwm_delta_scheme_v1_{init,cleanup,encode,decode}` — see
+/// `extensions/ref_delta_scheme/rust/src/lib.rs`): call `init` for a fresh
+/// handle, pass it to `encode`, then `cleanup` it, all within this one
+/// invocation (matching the existing per-call store/instance lifecycle in
+/// `WasmAdapter`).
+pub fn invoke_delta_scheme_encode(
+    instance: &Instance,
+    store: &mut Store<WasmState>,
+    base: &[u8],
+    target: &[u8],
+    output: &mut [u8],
+) -> Result<usize, CodecError> {
+    let memory: Memory = instance
+        .get_memory(&mut *store, "memory")
+        .ok_or(CodecError::InvalidInput)?;
+    let alloc: TypedFunc<u32, u32> = instance
+        .get_typed_func(&mut *store, "ptwm_alloc")
+        .map_err(|_| CodecError::InvalidInput)?;
+    let free: TypedFunc<(u32, u32), ()> = instance
+        .get_typed_func(&mut *store, "ptwm_free")
+        .map_err(|_| CodecError::InvalidInput)?;
+    let init: TypedFunc<(), u32> = instance
+        .get_typed_func(&mut *store, "ptwm_delta_scheme_v1_init")
+        .map_err(|_| CodecError::InvalidInput)?;
+    let cleanup: TypedFunc<u32, ()> = instance
+        .get_typed_func(&mut *store, "ptwm_delta_scheme_v1_cleanup")
+        .map_err(|_| CodecError::InvalidInput)?;
+    let encode: TypedFunc<(u32, u32, u32, u32, u32, u32, u32), i64> = instance
+        .get_typed_func(&mut *store, "ptwm_delta_scheme_v1_encode")
+        .map_err(|_| CodecError::InvalidInput)?;
+
+    let state = init
+        .call(&mut *store, ())
+        .map_err(|_| CodecError::InternalError)?;
+
+    let base_ptr = alloc
+        .call(&mut *store, base.len() as u32)
+        .map_err(|_| CodecError::InternalError)?;
+    memory
+        .write(&mut *store, base_ptr as usize, base)
+        .map_err(|_| CodecError::InternalError)?;
+    let target_ptr = alloc
+        .call(&mut *store, target.len() as u32)
+        .map_err(|_| CodecError::InternalError)?;
+    memory
+        .write(&mut *store, target_ptr as usize, target)
+        .map_err(|_| CodecError::InternalError)?;
+    let out_ptr = alloc
+        .call(&mut *store, output.len() as u32)
+        .map_err(|_| CodecError::InternalError)?;
+
+    let result: Result<usize, CodecError> = (|| {
+        let rc = encode
+            .call(
+                &mut *store,
+                (
+                    state,
+                    base_ptr,
+                    base.len() as u32,
+                    target_ptr,
+                    target.len() as u32,
+                    out_ptr,
+                    output.len() as u32,
+                ),
+            )
+            .map_err(|_| CodecError::InternalError)?;
+        if rc < 0 {
+            return Err(decode_codec_error(rc));
+        }
+        if rc > output.len() as i64 {
+            return Err(CodecError::InternalError);
+        }
+        let written = rc as usize;
+        memory
+            .read(&mut *store, out_ptr as usize, &mut output[..written])
+            .map_err(|_| CodecError::InternalError)?;
+        Ok(written)
+    })();
+
+    let _ = cleanup.call(&mut *store, state);
+    let _ = free.call(&mut *store, (base_ptr, base.len() as u32));
+    let _ = free.call(&mut *store, (target_ptr, target.len() as u32));
+    let _ = free.call(&mut *store, (out_ptr, output.len() as u32));
+    result
+}
+
+/// Helper: dispatch into the delta_scheme_v1 decode export. See
+/// [`invoke_delta_scheme_encode`] for the state-handle lifecycle.
+pub fn invoke_delta_scheme_decode(
+    instance: &Instance,
+    store: &mut Store<WasmState>,
+    base: &[u8],
+    delta: &[u8],
+    output: &mut [u8],
+) -> Result<usize, CodecError> {
+    let memory: Memory = instance
+        .get_memory(&mut *store, "memory")
+        .ok_or(CodecError::InvalidInput)?;
+    let alloc: TypedFunc<u32, u32> = instance
+        .get_typed_func(&mut *store, "ptwm_alloc")
+        .map_err(|_| CodecError::InvalidInput)?;
+    let free: TypedFunc<(u32, u32), ()> = instance
+        .get_typed_func(&mut *store, "ptwm_free")
+        .map_err(|_| CodecError::InvalidInput)?;
+    let init: TypedFunc<(), u32> = instance
+        .get_typed_func(&mut *store, "ptwm_delta_scheme_v1_init")
+        .map_err(|_| CodecError::InvalidInput)?;
+    let cleanup: TypedFunc<u32, ()> = instance
+        .get_typed_func(&mut *store, "ptwm_delta_scheme_v1_cleanup")
+        .map_err(|_| CodecError::InvalidInput)?;
+    let decode: TypedFunc<(u32, u32, u32, u32, u32, u32, u32), i64> = instance
+        .get_typed_func(&mut *store, "ptwm_delta_scheme_v1_decode")
+        .map_err(|_| CodecError::InvalidInput)?;
+
+    let state = init
+        .call(&mut *store, ())
+        .map_err(|_| CodecError::InternalError)?;
+
+    let base_ptr = alloc
+        .call(&mut *store, base.len() as u32)
+        .map_err(|_| CodecError::InternalError)?;
+    memory
+        .write(&mut *store, base_ptr as usize, base)
+        .map_err(|_| CodecError::InternalError)?;
+    let delta_ptr = alloc
+        .call(&mut *store, delta.len() as u32)
+        .map_err(|_| CodecError::InternalError)?;
+    memory
+        .write(&mut *store, delta_ptr as usize, delta)
+        .map_err(|_| CodecError::InternalError)?;
+    let out_ptr = alloc
+        .call(&mut *store, output.len() as u32)
+        .map_err(|_| CodecError::InternalError)?;
+
+    let result: Result<usize, CodecError> = (|| {
+        let rc = decode
+            .call(
+                &mut *store,
+                (
+                    state,
+                    base_ptr,
+                    base.len() as u32,
+                    delta_ptr,
+                    delta.len() as u32,
+                    out_ptr,
+                    output.len() as u32,
+                ),
+            )
+            .map_err(|_| CodecError::InternalError)?;
+        if rc < 0 {
+            return Err(decode_codec_error(rc));
+        }
+        if rc > output.len() as i64 {
+            return Err(CodecError::InternalError);
+        }
+        let written = rc as usize;
+        memory
+            .read(&mut *store, out_ptr as usize, &mut output[..written])
+            .map_err(|_| CodecError::InternalError)?;
+        Ok(written)
+    })();
+
+    let _ = cleanup.call(&mut *store, state);
+    let _ = free.call(&mut *store, (base_ptr, base.len() as u32));
+    let _ = free.call(&mut *store, (delta_ptr, delta.len() as u32));
     let _ = free.call(&mut *store, (out_ptr, output.len() as u32));
     result
 }
@@ -711,5 +907,186 @@ mod tests {
         .unwrap();
         assert_eq!(n, original.len());
         assert_eq!(&output[..n], original);
+    }
+
+    /// Passthrough delta_scheme: encode copies `target` (ignores `base`),
+    /// decode copies `delta` (ignores `base`) — same behavioral invariant
+    /// as `extensions/ref_delta_scheme/rust/src/lib.rs`, hand-rolled in WAT
+    /// so the test doesn't need a Cargo subbuild. Both encode and decode
+    /// take the `init`-issued state handle as their first argument, per
+    /// that reference's actual exported signature.
+    const DELTA_SCHEME_PASSTHROUGH_WAT: &str = r#"
+(module
+  (memory (export "memory") 1)
+  (global $bump (mut i32) (i32.const 1024))
+
+  (func (export "ptwm_alloc") (param $len i32) (result i32)
+    (local $p i32)
+    local.get $len
+    i32.const 0
+    i32.le_s
+    if (result i32)
+      i32.const 1024
+    else
+      global.get $bump
+      local.set $p
+      global.get $bump
+      local.get $len
+      i32.add
+      global.set $bump
+      local.get $p
+    end)
+
+  (func (export "ptwm_free") (param $p i32) (param $len i32))
+
+  (func (export "ptwm_delta_scheme_v1_init") (result i32)
+    i32.const 1)
+
+  (func (export "ptwm_delta_scheme_v1_cleanup") (param $state i32))
+
+  (func (export "ptwm_delta_scheme_v1_encode")
+        (param $state i32)
+        (param $base_ptr i32) (param $base_len i32)
+        (param $target_ptr i32) (param $target_len i32)
+        (param $out_ptr i32) (param $out_len i32)
+        (result i64)
+    (local $i i32)
+    local.get $out_len
+    local.get $target_len
+    i32.lt_s
+    if
+      i64.const -2
+      return
+    end
+    (block $done
+      (loop $copy
+        local.get $i
+        local.get $target_len
+        i32.ge_s
+        br_if $done
+        local.get $out_ptr
+        local.get $i
+        i32.add
+        local.get $target_ptr
+        local.get $i
+        i32.add
+        i32.load8_u
+        i32.store8
+        local.get $i
+        i32.const 1
+        i32.add
+        local.set $i
+        br $copy))
+    local.get $target_len
+    i64.extend_i32_s)
+
+  (func (export "ptwm_delta_scheme_v1_decode")
+        (param $state i32)
+        (param $base_ptr i32) (param $base_len i32)
+        (param $delta_ptr i32) (param $delta_len i32)
+        (param $out_ptr i32) (param $out_len i32)
+        (result i64)
+    (local $i i32)
+    local.get $out_len
+    local.get $delta_len
+    i32.lt_s
+    if
+      i64.const -2
+      return
+    end
+    (block $done
+      (loop $copy
+        local.get $i
+        local.get $delta_len
+        i32.ge_s
+        br_if $done
+        local.get $out_ptr
+        local.get $i
+        i32.add
+        local.get $delta_ptr
+        local.get $i
+        i32.add
+        i32.load8_u
+        i32.store8
+        local.get $i
+        i32.const 1
+        i32.add
+        local.set $i
+        br $copy))
+    local.get $delta_len
+    i64.extend_i32_s)
+)
+"#;
+
+    fn make_delta_scheme_entry() -> ExtensionTableEntry {
+        ExtensionTableEntry {
+            canonical_id: CanonicalId::from_bytes([0xDE; 32]),
+            human_label: "io.test.delta_scheme".into(),
+            kind: Kind::DeltaScheme,
+            abi_version: 1,
+            lifecycle: Lc::Thread,
+            flavor_hints: FLAVOR_WASM,
+            capabilities: CapabilityMap::new(),
+            attestation: Attestation::PgpSignature(Vec::new()),
+            install_hint: None,
+            embedded_wasm_offset: None,
+            embedded_wasm_length: None,
+        }
+    }
+
+    #[test]
+    fn delta_scheme_encode_copies_target_ignores_base() {
+        let engine = WasmExtension::make_engine();
+        let wasm = wat::parse_str(DELTA_SCHEME_PASSTHROUGH_WAT).expect("WAT parse");
+        let entry = make_delta_scheme_entry();
+        let ext = WasmExtension::load(&engine, &wasm, &entry).unwrap();
+        let mut store = ext.make_store(&HostPolicy::default()).unwrap();
+        let inst = ext.instantiate(&mut store).unwrap();
+
+        let base = b"base tensor bytes (ignored)";
+        let target = b"target tensor bytes";
+        let mut output = vec![0u8; 64];
+        let n = invoke_delta_scheme_encode(&inst, &mut store, base, target, &mut output).unwrap();
+        assert_eq!(&output[..n], target);
+    }
+
+    #[test]
+    fn delta_scheme_decode_copies_delta_ignores_base() {
+        let engine = WasmExtension::make_engine();
+        let wasm = wat::parse_str(DELTA_SCHEME_PASSTHROUGH_WAT).expect("WAT parse");
+        let entry = make_delta_scheme_entry();
+        let ext = WasmExtension::load(&engine, &wasm, &entry).unwrap();
+        let mut store = ext.make_store(&HostPolicy::default()).unwrap();
+        let inst = ext.instantiate(&mut store).unwrap();
+
+        let base = b"base tensor bytes (ignored)";
+        let delta = b"delta bytes";
+        let mut output = vec![0u8; 64];
+        let n = invoke_delta_scheme_decode(&inst, &mut store, base, delta, &mut output).unwrap();
+        assert_eq!(&output[..n], delta);
+    }
+
+    #[test]
+    fn delta_scheme_round_trips_encode_then_decode() {
+        let engine = WasmExtension::make_engine();
+        let wasm = wat::parse_str(DELTA_SCHEME_PASSTHROUGH_WAT).expect("WAT parse");
+        let entry = make_delta_scheme_entry();
+        let ext = WasmExtension::load(&engine, &wasm, &entry).unwrap();
+
+        let base = b"shared base tensor";
+        let target = b"the real target tensor payload";
+
+        let mut store = ext.make_store(&HostPolicy::default()).unwrap();
+        let inst = ext.instantiate(&mut store).unwrap();
+        let mut delta = vec![0u8; 64];
+        let n = invoke_delta_scheme_encode(&inst, &mut store, base, target, &mut delta).unwrap();
+        delta.truncate(n);
+
+        let mut store2 = ext.make_store(&HostPolicy::default()).unwrap();
+        let inst2 = ext.instantiate(&mut store2).unwrap();
+        let mut recon = vec![0u8; 64];
+        let m =
+            invoke_delta_scheme_decode(&inst2, &mut store2, base, &delta, &mut recon).unwrap();
+        assert_eq!(&recon[..m], target);
     }
 }

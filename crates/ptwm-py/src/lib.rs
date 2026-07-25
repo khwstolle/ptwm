@@ -16,6 +16,7 @@ use ptwm_core::compressor::{
 use ptwm_core::container::ContainerReader;
 use ptwm_core::{PtwmCoreError, codec_tagged, delta, entropy};
 
+mod delta_scheme;
 mod ext;
 mod host_flavor;
 mod inspect;
@@ -59,6 +60,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     host_flavor::register(m)?;
     ext::register(m)?;
     inspect::register(m)?;
+    delta_scheme::register(m)?;
     Ok(())
 }
 

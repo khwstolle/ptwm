@@ -150,6 +150,7 @@ def test_cmd_init_scaffolds_via_init_extension(
             name="demo-codec",
             lang="rust",
             kind="plane_codec",
+            flavor="wasm",
             dir=target,
             description="A demo codec.",
         ),

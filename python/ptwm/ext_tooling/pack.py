@@ -12,7 +12,8 @@ def pack_bundle(cwd: Path) -> Path:
     """Create a ``<name>-<version>.tar.zst`` archive from the bundle in *cwd*.
 
     The archive contains ``manifest.toml``, ``signature.bin`` (if present),
-    and ``<name>.wasm`` (if present).
+    and whichever built binaries exist: ``<name>.wasm``, ``<name>.so``,
+    ``<name>.dylib``.
 
     Parameters
     ----------
@@ -48,7 +49,14 @@ def pack_bundle(cwd: Path) -> Path:
     # Build the tar in memory, then zstd-encode.
     tar_buf = io.BytesIO()
     with tarfile.open(fileobj=tar_buf, mode="w") as tf:
-        for member in ("manifest.toml", "signature.bin", f"{name}.wasm"):
+        members = (
+            "manifest.toml",
+            "signature.bin",
+            f"{name}.wasm",
+            f"{name}.so",
+            f"{name}.dylib",
+        )
+        for member in members:
             p = cwd / member
             if p.exists():
                 tf.add(p, arcname=member)

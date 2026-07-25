@@ -80,6 +80,12 @@ def _add_init_parser(sub: argparse._SubParsersAction) -> None:  # type: ignore[t
         help="Contribution kind (default: plane_codec).",
     )
     init_p.add_argument(
+        "--flavor",
+        default="wasm",
+        choices=("wasm", "native"),
+        help="Target flavor the scaffold builds for (default: wasm).",
+    )
+    init_p.add_argument(
         "--dir",
         type=Path,
         default=None,
@@ -102,6 +108,13 @@ def _add_build_parser(sub: argparse._SubParsersAction) -> None:  # type: ignore[
         action="store_false",
         dest="release",
         help="Build without optimizations.",
+    )
+    build_p.add_argument(
+        "--flavor",
+        default="wasm",
+        choices=("wasm", "native"),
+        help="Target flavor to build (default: wasm). 'native' is rust-only "
+        "and produces a .so/.dylib cdylib instead of a wasm32-wasip1 module.",
     )
     build_p.set_defaults(func=cmd_build)
 
@@ -255,9 +268,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         name=args.name,
         lang=args.lang,
         kind=args.kind,
+        flavor=args.flavor,
         description=args.description,
     )
-    print(f"scaffolded {args.kind} extension at {target}")
+    print(f"scaffolded {args.kind} ({args.flavor}) extension at {target}")
     print(f"next: cd {target} && ptwm ext build")
     return 0
 
@@ -266,7 +280,7 @@ def cmd_build(args: argparse.Namespace) -> int:
     from ptwm.ext_tooling.build import BuildError, build_extension
 
     try:
-        out = build_extension(Path.cwd(), release=args.release)
+        out = build_extension(Path.cwd(), release=args.release, flavor=args.flavor)
     except BuildError as exc:
         print(f"build failed: {exc}", file=sys.stderr)
         return 1

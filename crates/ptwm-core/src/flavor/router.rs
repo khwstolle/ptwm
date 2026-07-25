@@ -36,8 +36,8 @@ use crate::extension::{
 use crate::flavor::abi::CodecError;
 use crate::flavor::native::{NativeExtension, VerifiedToken};
 use crate::flavor::wasm::{
-    WasmExtension, invoke_plane_codec_decode, invoke_plane_codec_decode_stateful,
-    invoke_plane_codec_encode,
+    WasmExtension, invoke_delta_scheme_decode, invoke_delta_scheme_encode,
+    invoke_plane_codec_decode, invoke_plane_codec_decode_stateful, invoke_plane_codec_encode,
 };
 use crate::policy::capability_check::HostPolicy;
 
@@ -324,6 +324,142 @@ impl PlaneCodecRouter {
     }
 }
 
+// ── DeltaScheme router ──────────────────────────────────────────────────────
+
+/// Uniform encode/decode surface for a resolved `delta_scheme` contribution.
+///
+/// Mirrors [`DispatchedPlaneCodec`], but over the two-buffer delta ABI:
+/// `encode(base, target) -> delta`, `decode(base, delta) -> target`.
+pub trait DispatchedDeltaScheme: Send + Sync {
+    fn encode(&self, base: &[u8], target: &[u8], output: &mut [u8]) -> Result<usize, CodecError>;
+    fn decode(&self, base: &[u8], delta: &[u8], output: &mut [u8]) -> Result<usize, CodecError>;
+}
+
+struct NativeDeltaSchemeAdapter {
+    inner: Arc<NativeExtension>,
+}
+
+impl DispatchedDeltaScheme for NativeDeltaSchemeAdapter {
+    fn encode(&self, base: &[u8], target: &[u8], output: &mut [u8]) -> Result<usize, CodecError> {
+        self.inner.invoke_delta_scheme_encode(base, target, output)
+    }
+
+    fn decode(&self, base: &[u8], delta: &[u8], output: &mut [u8]) -> Result<usize, CodecError> {
+        self.inner.invoke_delta_scheme_decode(base, delta, output)
+    }
+}
+
+struct WasmDeltaSchemeAdapter {
+    ext: WasmExtension,
+}
+
+impl DispatchedDeltaScheme for WasmDeltaSchemeAdapter {
+    fn encode(&self, base: &[u8], target: &[u8], output: &mut [u8]) -> Result<usize, CodecError> {
+        let policy = HostPolicy::default();
+        let mut store = self.ext.make_store(&policy)?;
+        let instance = self.ext.instantiate(&mut store)?;
+        invoke_delta_scheme_encode(&instance, &mut store, base, target, output)
+    }
+
+    fn decode(&self, base: &[u8], delta: &[u8], output: &mut [u8]) -> Result<usize, CodecError> {
+        let policy = HostPolicy::default();
+        let mut store = self.ext.make_store(&policy)?;
+        let instance = self.ext.instantiate(&mut store)?;
+        invoke_delta_scheme_decode(&instance, &mut store, base, delta, output)
+    }
+}
+
+/// Resolves a `CanonicalId` to a `Box<dyn DispatchedDeltaScheme>`.
+///
+/// Same shape as [`PlaneCodecRouter`], minus the built-in step: `ptwm`
+/// ships zero built-in `delta_scheme` contributions today, so resolution
+/// goes straight to the installed-extension search (native preferred over
+/// WASM). Results are cached by `CanonicalId`, same as `PlaneCodecRouter`.
+pub struct DeltaSchemeRouter {
+    installed: Vec<DiscoveredContribution>,
+    cache: Mutex<HashMap<CanonicalId, Arc<dyn DispatchedDeltaScheme>>>,
+}
+
+impl std::fmt::Debug for DeltaSchemeRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeltaSchemeRouter")
+            .field("installed_count", &self.installed.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DeltaSchemeRouter {
+    /// Create a new router with the given set of discovered installed
+    /// extensions. Pass an empty `Vec` to get `Unsupported` for every id
+    /// (there are no built-in delta schemes to fall back to).
+    pub fn new(installed: Vec<DiscoveredContribution>) -> Self {
+        Self {
+            installed,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Resolve `canonical_id` to a `DispatchedDeltaScheme`.
+    pub fn get(
+        &self,
+        canonical_id: &CanonicalId,
+    ) -> Result<Arc<dyn DispatchedDeltaScheme>, CodecError> {
+        {
+            let cache = self.cache.lock().unwrap();
+            if let Some(scheme) = cache.get(canonical_id) {
+                return Ok(Arc::clone(scheme));
+            }
+        }
+
+        let scheme = self.resolve(canonical_id)?;
+        let arc = Arc::from(scheme);
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.insert(*canonical_id, Arc::clone(&arc));
+        }
+        Ok(arc)
+    }
+
+    fn resolve(
+        &self,
+        canonical_id: &CanonicalId,
+    ) -> Result<Box<dyn DispatchedDeltaScheme>, CodecError> {
+        if let Some(install) = find_install(canonical_id, &self.installed) {
+            let bundle_dir = &install.bundle_dir;
+
+            if let Ok(native_path) = find_native_path(bundle_dir) {
+                let entry = manifest_entry_for(install, canonical_id)?;
+                let token = VerifiedToken::new_unchecked();
+                let ext = NativeExtension::load(&native_path, &entry, token)?;
+                let adapter = NativeDeltaSchemeAdapter {
+                    inner: Arc::new(ext),
+                };
+                return Ok(Box::new(adapter));
+            }
+
+            if let Ok(wasm_path) = find_wasm_path(bundle_dir) {
+                let entry = manifest_entry_for(install, canonical_id)?;
+                let engine = WasmExtension::make_engine();
+                let ext = WasmExtension::load_from_path(&engine, &wasm_path, &entry)?;
+                let adapter = WasmDeltaSchemeAdapter { ext };
+                return Ok(Box::new(adapter));
+            }
+
+            return Err(CodecError::Unsupported {
+                feature: format!(
+                    "extension for {canonical_id} is installed but no native or wasm \
+                     artifact was found in {}",
+                    bundle_dir.display()
+                ),
+            });
+        }
+
+        Err(CodecError::Unsupported {
+            feature: format!("no delta_scheme registered for canonical id {canonical_id}"),
+        })
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Find the `DiscoveredContribution` whose manifest declares a contribution
@@ -572,5 +708,15 @@ mod tests {
     fn parse_canonical_id_str_rejects_wrong_prefix() {
         assert!(parse_canonical_id_str("sha256:aabb").is_none());
         assert!(parse_canonical_id_str("aabbcc").is_none());
+    }
+
+    #[test]
+    fn delta_scheme_router_errors_for_unknown_canonical_id() {
+        let router = DeltaSchemeRouter::new(Vec::new());
+        let id = CanonicalId::from_bytes([0xEEu8; 32]);
+        assert!(
+            matches!(router.get(&id), Err(CodecError::Unsupported { .. })),
+            "expected Unsupported for unknown delta_scheme canonical id"
+        );
     }
 }

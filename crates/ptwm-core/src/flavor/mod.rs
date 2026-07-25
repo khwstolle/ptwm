@@ -17,7 +17,14 @@ pub use abi::{
     PlaneCodec, RawBinary, Scorer, TrainingHook, Transform,
 };
 pub use host::HostExtension;
-pub use native::{NativeExtension, NativeSymbols, PlaneCodecFn, TransformFn, VerifiedToken};
-pub use router::{DispatchedPlaneCodec, PlaneCodecRouter};
+pub use native::{
+    DeltaSchemeFn, NativeExtension, NativeSymbols, PlaneCodecFn, TransformFn, VerifiedToken,
+};
+pub use router::{
+    DeltaSchemeRouter, DispatchedDeltaScheme, DispatchedPlaneCodec, PlaneCodecRouter,
+};
 pub use third_party::ThirdPartyPlaneCodec;
-pub use wasm::{WasmExtension, WasmState, invoke_plane_codec_decode, invoke_plane_codec_encode};
+pub use wasm::{
+    WasmExtension, WasmState, invoke_delta_scheme_decode, invoke_delta_scheme_encode,
+    invoke_plane_codec_decode, invoke_plane_codec_encode,
+};

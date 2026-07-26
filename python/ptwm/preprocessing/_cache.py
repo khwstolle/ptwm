@@ -4,6 +4,16 @@ Caches *structural templates* (internal_dtype + op tuple + byte-split planes)
 rather than serialised chain wire bytes: exploration discovers a chain on
 one tensor with one shape, but the same template applies to any tensor of
 the same (dtype, role) regardless of shape.
+
+Keyed by ``(dtype_code, role, signature_bucket)``, where the signature
+bucket groups tensors by Shannon entropy (see :func:`signature_bucket_for`).
+The keying assumption is that two tensors with similar entropy fingerprints
+benefit from the same chain, so an explorer run on one model extends the
+candidate set for future runs on models with similar weight distributions,
+without pulling in templates discovered on tensors with a very different
+byte-statistics profile. Callers that do not have a tensor's bytes on hand
+(or do not care to distinguish by entropy) can omit ``signature_bucket``,
+which defaults to a single shared bucket.
 """
 
 from __future__ import annotations
@@ -27,6 +37,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CacheEntry",
+    "SIGNATURE_BUCKET_WIDTH",
     "cache_dir",
     "cache_info",
     "cache_path_for",
@@ -34,11 +45,36 @@ __all__ = [
     "load_cached_builders",
     "load_cached_entries",
     "save_cached_entries",
+    "signature_bucket_for",
 ]
 
-# Bumped when the cache wire format changes incompatibly.
-_SCHEMA_VERSION = 1
-_MAGIC = b"PTWMCHC\x01"
+# Bumped when the cache wire format changes incompatibly. v2 adds the
+# signature bucket to the cache key (see module docstring).
+_SCHEMA_VERSION = 2
+_MAGIC = b"PTWMCHC\x02"
+
+# Shannon entropy (bits/byte) is bounded [0, 8]; a 0.5-bit bucket width
+# gives 17 buckets. Coarse enough to produce hit rates in practice (an
+# entropy-signature match need not be exact to indicate similar byte
+# statistics); fine enough to actually separate distinct distributions
+# (e.g. a near-degenerate all-zero-padded tensor from a well-spread one).
+# Not measured against real hit-rate data yet — a reasonable starting
+# point, not a tuned constant.
+SIGNATURE_BUCKET_WIDTH = 0.5
+_N_BUCKETS = int(8.0 / SIGNATURE_BUCKET_WIDTH) + 1
+
+
+def signature_bucket_for(entropy_bits_per_byte: float) -> int:
+    """Map a Shannon-entropy value (bits/byte, expected in [0, 8]) to a bucket.
+
+    Values outside [0, 8] (should not occur for a real byte plane, but
+    defends against a caller passing a raw float from elsewhere) are
+    clamped rather than raising, so a bad upstream measurement degrades to
+    a cache miss instead of an exception.
+    """
+    clamped = min(max(entropy_bits_per_byte, 0.0), 8.0)
+    bucket = int(clamped / SIGNATURE_BUCKET_WIDTH)
+    return min(bucket, _N_BUCKETS - 1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,8 +107,10 @@ def cache_dir() -> Path:
     return base / "ptwm" / "chains" / f"v{_SCHEMA_VERSION}"
 
 
-def cache_path_for(dtype_code: int, role: ClassifierRole) -> Path:
-    return cache_dir() / f"{dtype_code:04x}_{int(role)}.cbor"
+def cache_path_for(
+    dtype_code: int, role: ClassifierRole, signature_bucket: int = 0
+) -> Path:
+    return cache_dir() / f"{dtype_code:04x}_{int(role)}_{signature_bucket:02d}.cbor"
 
 
 def _serialise(entries: Iterable[CacheEntry]) -> bytes:
@@ -116,9 +154,14 @@ def _deserialise(blob: bytes) -> list[CacheEntry]:
     return out
 
 
-def load_cached_entries(dtype_code: int, role: ClassifierRole) -> list[CacheEntry]:
-    """Return cached entries for `(dtype_code, role)`, or `[]` on miss / corruption."""
-    path = cache_path_for(dtype_code, role)
+def load_cached_entries(
+    dtype_code: int, role: ClassifierRole, signature_bucket: int = 0
+) -> list[CacheEntry]:
+    """Return cached entries for `(dtype_code, role, signature_bucket)`.
+
+    Returns `[]` on miss or corruption.
+    """
+    path = cache_path_for(dtype_code, role, signature_bucket)
     if not path.exists():
         return []
     try:
@@ -129,15 +172,20 @@ def load_cached_entries(dtype_code: int, role: ClassifierRole) -> list[CacheEntr
         return []
 
 
-def load_cached_builders(dtype_code: int, role: ClassifierRole) -> list[ChainBuilder]:
-    """Return runtime `ChainBuilder`s for cached entries of `(dtype_code, role)`."""
-    return [e.to_builder() for e in load_cached_entries(dtype_code, role)]
+def load_cached_builders(
+    dtype_code: int, role: ClassifierRole, signature_bucket: int = 0
+) -> list[ChainBuilder]:
+    """Return runtime `ChainBuilder`s for `(dtype_code, role, signature_bucket)`."""
+    return [
+        e.to_builder() for e in load_cached_entries(dtype_code, role, signature_bucket)
+    ]
 
 
 def save_cached_entries(
     dtype_code: int,
     role: ClassifierRole,
     new_entries: Iterable[CacheEntry],
+    signature_bucket: int = 0,
 ) -> int:
     """Union `new_entries` with the existing cache file. Returns count added.
 
@@ -145,7 +193,7 @@ def save_cached_entries(
     """
     existing = {
         (e.internal_dtype, e.ops, e.byte_split_planes): e
-        for e in load_cached_entries(dtype_code, role)
+        for e in load_cached_entries(dtype_code, role, signature_bucket)
     }
     added = 0
     for e in new_entries:
@@ -155,7 +203,7 @@ def save_cached_entries(
             added += 1
     if added == 0:
         return 0
-    path = cache_path_for(dtype_code, role)
+    path = cache_path_for(dtype_code, role, signature_bucket)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(_serialise(existing.values()))
     return added

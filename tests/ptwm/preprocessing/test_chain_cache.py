@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from ptwm.preprocessing import (
+    SIGNATURE_BUCKET_WIDTH,
     CacheEntry,
     ClassifierRole,
     cache_dir,
@@ -20,6 +21,7 @@ from ptwm.preprocessing import (
     load_cached_builders,
     load_cached_entries,
     save_cached_entries,
+    signature_bucket_for,
 )
 
 
@@ -73,7 +75,7 @@ def test_load_schema_mismatch_returns_empty(monkeypatch) -> None:
     path = cache_path_for(0x0006, ClassifierRole.STANDARD)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"schema_version": 99, "entries": []}
-    path.write_bytes(b"PTWMCHC\x01" + cbor2.dumps(payload))
+    path.write_bytes(b"PTWMCHC\x02" + cbor2.dumps(payload))
     assert load_cached_entries(0x0006, ClassifierRole.STANDARD) == []
 
 
@@ -118,4 +120,47 @@ def test_cache_info_reports_counts() -> None:
         ],
     )
     info = cache_info()
-    assert any("0006_0.cbor" in k and v == 2 for k, v in info.items())
+    assert any("0006_0_00.cbor" in k and v == 2 for k, v in info.items())
+
+
+def test_signature_bucket_for_clamps_to_valid_range() -> None:
+    assert signature_bucket_for(-1.0) == 0
+    assert signature_bucket_for(0.0) == 0
+    assert signature_bucket_for(100.0) == signature_bucket_for(8.0)
+
+
+def test_signature_bucket_for_separates_low_and_high_entropy() -> None:
+    low = signature_bucket_for(0.1)
+    high = signature_bucket_for(7.9)
+    assert low != high
+
+
+def test_signature_bucket_for_boundary_is_half_open() -> None:
+    # Bucket edges fall on the lower bucket; the next bucket starts exactly
+    # at the next multiple of the bucket width.
+    edge = signature_bucket_for(SIGNATURE_BUCKET_WIDTH)
+    just_below = signature_bucket_for(SIGNATURE_BUCKET_WIDTH - 1e-9)
+    assert edge == just_below + 1
+
+
+def test_different_signature_buckets_are_isolated() -> None:
+    entry_low = CacheEntry(internal_dtype=0x000F, ops=(0x0030,), byte_split_planes=1)
+    entry_high = CacheEntry(
+        internal_dtype=0x000F, ops=(0x0010, 0x0020), byte_split_planes=2
+    )
+    save_cached_entries(0x0006, ClassifierRole.STANDARD, [entry_low], 0)
+    save_cached_entries(0x0006, ClassifierRole.STANDARD, [entry_high], 5)
+
+    assert load_cached_entries(0x0006, ClassifierRole.STANDARD, 0) == [entry_low]
+    assert load_cached_entries(0x0006, ClassifierRole.STANDARD, 5) == [entry_high]
+    # The default bucket (0) must not see entries written under a different
+    # bucket, and vice versa.
+    assert load_cached_entries(0x0006, ClassifierRole.STANDARD, 1) == []
+
+
+def test_cache_path_for_encodes_signature_bucket() -> None:
+    path_bucket_0 = cache_path_for(0x0006, ClassifierRole.STANDARD, 0)
+    path_bucket_5 = cache_path_for(0x0006, ClassifierRole.STANDARD, 5)
+    assert path_bucket_0 != path_bucket_5
+    assert path_bucket_0.name == "0006_0_00.cbor"
+    assert path_bucket_5.name == "0006_0_05.cbor"

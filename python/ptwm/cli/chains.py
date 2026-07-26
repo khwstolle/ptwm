@@ -394,23 +394,25 @@ def handle_export(args: argparse.Namespace) -> None:
     bundle: list[dict[str, object]] = []
     for f in sorted(root.glob("*.cbor")):
         try:
-            dtype_hex, role_str = f.stem.split("_")
+            dtype_hex, role_str, bucket_str = f.stem.split("_")
             dtype_code = int(dtype_hex, 16)
             role = ClassifierRole(int(role_str))
+            signature_bucket = int(bucket_str)
         except (ValueError, KeyError):
             continue
-        for entry in load_cached_entries(dtype_code, role):
+        for entry in load_cached_entries(dtype_code, role, signature_bucket):
             bundle.append(
                 {
                     "dtype_code": dtype_code,
                     "role": int(role),
+                    "signature_bucket": signature_bucket,
                     "internal_dtype": entry.internal_dtype,
                     "ops": list(entry.ops),
                     "byte_split_planes": entry.byte_split_planes,
                 }
             )
 
-    payload = {"schema_version": 1, "entries": bundle}
+    payload = {"schema_version": 2, "entries": bundle}
     out_path = Path(args.output)
     out_path.write_bytes(b"PTWMEXC\x01" + cbor2.dumps(payload))
     print(f"Exported {len(bundle)} chain(s) to {out_path}.")
@@ -449,7 +451,7 @@ def handle_import(args: argparse.Namespace) -> None:
     if not isinstance(payload, dict):
         print(f"error: {in_path}: payload is not a CBOR map.", file=sys.stderr)
         sys.exit(1)
-    if payload.get("schema_version") != 1:
+    if payload.get("schema_version") != 2:
         print(
             f"error: {in_path}: unsupported schema_version "
             f"{payload.get('schema_version')!r}.",
@@ -457,12 +459,13 @@ def handle_import(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
-    by_key: dict[tuple[int, ClassifierRole], list[CacheEntry]] = {}
+    by_key: dict[tuple[int, ClassifierRole, int], list[CacheEntry]] = {}
     rejected = 0
     for raw_entry in payload.get("entries", []):
         try:
             dtype_code = int(raw_entry["dtype_code"])
             role = ClassifierRole(int(raw_entry["role"]))
+            signature_bucket = int(raw_entry["signature_bucket"])
             internal_dtype = int(raw_entry["internal_dtype"])
             ops = tuple(int(o) for o in raw_entry["ops"])
             planes = int(raw_entry["byte_split_planes"])
@@ -483,11 +486,11 @@ def handle_import(args: argparse.Namespace) -> None:
         entry = CacheEntry(
             internal_dtype=internal_dtype, ops=ops, byte_split_planes=planes
         )
-        by_key.setdefault((dtype_code, role), []).append(entry)
+        by_key.setdefault((dtype_code, role, signature_bucket), []).append(entry)
 
     total_added = 0
-    for (dtype_code, role), entries in by_key.items():
-        total_added += save_cached_entries(dtype_code, role, entries)
+    for (dtype_code, role, signature_bucket), entries in by_key.items():
+        total_added += save_cached_entries(dtype_code, role, entries, signature_bucket)
 
     print(
         f"Imported {total_added} new chain(s) from {in_path} "

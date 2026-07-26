@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
+from .._rust import shannon
 from ..classify import (
     AuditLog,
     ClassifierChain,
@@ -20,6 +21,7 @@ from ..preprocessing._cache import (
     CacheEntry,
     load_cached_builders,
     save_cached_entries,
+    signature_bucket_for,
 )
 from ..preprocessing._chains import (
     CHAIN_BYTE_PASSTHROUGH_VALUE,
@@ -106,31 +108,39 @@ def _chain_bytes_for(
     shape: tuple[int, ...],
     explore_options: ExploreOptions | None = None,
     *,
-    builder_cache: dict[tuple[int, TensorRole], list] | None = None,
+    raw: bytes = b"",
+    builder_cache: dict[tuple[int, TensorRole, int], list] | None = None,
     warned_passthrough: set[tuple[int, TensorRole]] | None = None,
     use_user_cache: bool = True,
-    new_templates: dict[tuple[int, TensorRole], list[CacheEntry]] | None = None,
+    new_templates: dict[tuple[int, TensorRole, int], list[CacheEntry]] | None = None,
 ) -> list[bytes]:
     """Return candidate chain wire-byte blobs for a tensor.
 
     The candidate set is, in order: production chains for the
     ``(dtype_code, role)`` pair, builders loaded from the user-local cache
-    (when ``use_user_cache`` is set), and — when *explore_options* is
-    provided — fresh candidates from the explorer.
+    keyed by ``(dtype_code, role, signature_bucket)`` — the tensor's own
+    Shannon-entropy bucket, computed from ``raw`` — (when ``use_user_cache``
+    is set), and — when *explore_options* is provided — fresh candidates
+    from the explorer.
 
     When ``new_templates`` is supplied, freshly discovered explorer templates
     land in the mapping so the caller can persist them to the user cache
     after compression succeeds.
     """
     classifier_role = _ROLE_MAP[role]
-    cache_key = (dtype_code, role)
+    passthrough_key = (dtype_code, role)
+    signature_bucket = signature_bucket_for(shannon(raw)) if raw else 0
+    cache_key = (dtype_code, role, signature_bucket)
 
     if builder_cache is not None and cache_key in builder_cache:
         builders = builder_cache[cache_key]
     else:
         builders = list(chains_for(dtype_code, classifier_role))
         if not builders:
-            if warned_passthrough is not None and cache_key not in warned_passthrough:
+            if (
+                warned_passthrough is not None
+                and passthrough_key not in warned_passthrough
+            ):
                 _log.warning(
                     "No production chain registered for dtype_code=0x%04X "
                     "role=%s; falling back to BytePassthrough (no compression). "
@@ -138,12 +148,12 @@ def _chain_bytes_for(
                     dtype_code,
                     role.name,
                 )
-                warned_passthrough.add(cache_key)
+                warned_passthrough.add(passthrough_key)
             builders = [CHAIN_BYTE_PASSTHROUGH_VALUE]
 
         if use_user_cache:
             builders = list(builders) + load_cached_builders(
-                dtype_code, classifier_role
+                dtype_code, classifier_role, signature_bucket
             )
 
         if explore_options is not None:
@@ -256,18 +266,19 @@ def compress_safetensors_file(
 
     # Track discovered-chain reporting per (dtype_code, role) pair.
     _reported: set[tuple[int, TensorRole]] = set()
-    # Cache builder lists per (dtype, role) to avoid re-running
-    # explore_chains for every tensor of the same role; one-time passthrough
-    # warning set.
-    _builder_cache: dict[tuple[int, TensorRole], list] = {}
+    # Cache builder lists per (dtype, role, signature_bucket) to avoid
+    # re-running explore_chains for every tensor sharing all three; one-time
+    # passthrough warning set (dtype, role only — not signature-specific).
+    _builder_cache: dict[tuple[int, TensorRole, int], list] = {}
     _warned_passthrough: set[tuple[int, TensorRole]] = set()
     # Harvest discovered structural templates and write them to the user
     # cache only after the whole compress completes successfully — partial
     # writes from a failing run would poison the cache.
-    _new_templates: dict[tuple[int, TensorRole], list[CacheEntry]] = {}
+    _new_templates: dict[tuple[int, TensorRole, int], list[CacheEntry]] = {}
 
     def _build_chains_and_record(
         name: str,
+        raw: bytes,
         dtype_in: Any,
         shape: tuple[int, ...],
         role: TensorRole,
@@ -279,6 +290,7 @@ def compress_safetensors_file(
             role,
             shape,
             explore_options,
+            raw=raw,
             builder_cache=_builder_cache,
             warned_passthrough=_warned_passthrough,
             use_user_cache=use_user_cache,
@@ -308,7 +320,11 @@ def compress_safetensors_file(
         shard_chains = (
             [
                 _build_chains_and_record(
-                    name, by_name[name][1], by_name[name][2], by_name[name][3]
+                    name,
+                    by_name[name][0],
+                    by_name[name][1],
+                    by_name[name][2],
+                    by_name[name][3],
                 )
                 for name, _ in shards[0]
             ]
@@ -337,7 +353,11 @@ def compress_safetensors_file(
         shard_chains = (
             [
                 _build_chains_and_record(
-                    name, by_name[name][1], by_name[name][2], by_name[name][3]
+                    name,
+                    by_name[name][0],
+                    by_name[name][1],
+                    by_name[name][2],
+                    by_name[name][3],
                 )
                 for name, _ in shard
             ]
@@ -389,7 +409,7 @@ def compress_safetensors_file(
 
 
 def _persist_discovered(
-    discovered: dict[tuple[int, TensorRole], list[CacheEntry]],
+    discovered: dict[tuple[int, TensorRole, int], list[CacheEntry]],
     use_user_cache: bool,
 ) -> None:
     # Cache write happens after all shards land on disk so a crash mid-run
@@ -397,5 +417,5 @@ def _persist_discovered(
     # materialised.
     if not use_user_cache or not discovered:
         return
-    for (dtype_code, role), entries in discovered.items():
-        save_cached_entries(dtype_code, _ROLE_MAP[role], entries)
+    for (dtype_code, role, signature_bucket), entries in discovered.items():
+        save_cached_entries(dtype_code, _ROLE_MAP[role], entries, signature_bucket)

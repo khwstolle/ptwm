@@ -7,6 +7,7 @@ ops (a :class:`Chain`) — see :mod:`._chains` for the chain builders and
 """
 
 from ._cache import (
+    SIGNATURE_BUCKET_WIDTH,
     CacheEntry,
     cache_dir,
     cache_info,
@@ -15,6 +16,7 @@ from ._cache import (
     load_cached_builders,
     load_cached_entries,
     save_cached_entries,
+    signature_bucket_for,
 )
 from ._chains import (
     CHAIN_BF16_SPLIT,
@@ -40,6 +42,7 @@ from ._explorer import ExploreOptions, explore_chains, is_legal_chain
 from ._plane import Plane
 
 __all__ = [
+    "SIGNATURE_BUCKET_WIDTH",
     "CHAIN_BF16_SPLIT",
     "CHAIN_BYTE_PASSTHROUGH_VALUE",
     "CHAIN_F32_GLOBAL_SCALE",
@@ -70,4 +73,5 @@ __all__ = [
     "load_cached_builders",
     "load_cached_entries",
     "save_cached_entries",
+    "signature_bucket_for",
 ]

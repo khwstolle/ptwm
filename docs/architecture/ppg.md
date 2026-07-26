@@ -90,9 +90,13 @@ one consumes a single input; the cross-tensor ones consume two
 
 The passthrough ops (`BytePassthrough`, `MxFp4Deinterleave`,
 `Reshape`, `Concat`, `IndexBitwidthPack`) handle reshape, dtype-
-specific reinterpretation, and packed-integer cases. The
-`EntropyEstimate` op is a measurement no-op used by the explorer; it
-emits a hash that the explorer caches against.
+specific reinterpretation, and packed-integer cases. `EntropyEstimate`
+is a measurement no-op that computes per-byte Shannon entropy of its
+input and stores it in `vendor_bytes`; it is available to any chain
+but is not currently wired into a production chain or the explorer
+(see the chain cache's own entropy bucketing below, which computes
+the same quantity directly on raw tensor bytes rather than through
+this op).
 
 ## The chain table
 
@@ -127,13 +131,15 @@ gated behind `--explore` because it is expensive: each candidate
 chain requires a full forward pass plus trial encode.
 
 Discovered chains persist to `$XDG_CACHE_HOME/ptwm/chains/` keyed by
-`(dtype, role, signature)`. The signature is a Shannon-entropy
-fingerprint computed by the `EntropyEstimate` op. The keying
-assumption is that two tensors with similar entropy fingerprints
-benefit from the same chain, so an explorer run on one model
-extends the candidate set for future runs on models with similar
-weight distributions. The assumption holds well enough in practice
-that the cache produces meaningful hit rates across model families.
+`(dtype, role, signature_bucket)`. The signature bucket is computed
+by `signature_bucket_for()` (`python/ptwm/preprocessing/_cache.py`)
+from the Shannon entropy of the tensor's raw bytes, quantized into
+0.5-bit-wide buckets. The keying assumption is that two tensors with
+similar entropy fall in the same bucket and benefit from the same
+chain, so an explorer run on one model extends the candidate set for
+future runs on models with similar weight distributions. This
+assumption is a design choice, not yet validated against measured
+hit rates across model families.
 
 The explorer is also the path by which hand-curated chains get into
 the table. `ptwm chains promote` prints the structural breakdown of

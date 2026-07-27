@@ -39,7 +39,8 @@ use crate::flavor::wasm::{
     WasmExtension, invoke_delta_scheme_decode, invoke_delta_scheme_encode,
     invoke_plane_codec_decode, invoke_plane_codec_decode_stateful, invoke_plane_codec_encode,
 };
-use crate::policy::capability_check::HostPolicy;
+use crate::policy::capability_check::{CapabilityVerdict, HostPolicy, check};
+use crate::policy::native_deps::VendorTable;
 
 /// Uniform encode/decode surface exposed by the router.
 ///
@@ -506,6 +507,129 @@ impl DispatchedHardwareBackendCuda for NativeHardwareBackendCudaAdapter {
     }
 }
 
+/// Resolves a `CanonicalId` to a `Box<dyn DispatchedHardwareBackendCuda>`.
+///
+/// Same shape as [`DeltaSchemeRouter`], with two deliberate differences.
+/// First, there is no WASM branch: a `u64` device pointer cannot be
+/// expressed in WASM's 32-bit linear address space, so `hardware_backend`
+/// is native-only by construction. Second, [`resolve`](Self::resolve) runs
+/// [`check`] against the entry's declared capabilities before attempting a
+/// native load; see that method's documentation for why `HostPolicy::default()`
+/// is the correct policy to use there rather than a caller-supplied one.
+pub struct HardwareBackendRouter {
+    installed: Vec<DiscoveredContribution>,
+    cache: Mutex<HashMap<CanonicalId, Arc<dyn DispatchedHardwareBackendCuda>>>,
+}
+
+impl std::fmt::Debug for HardwareBackendRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HardwareBackendRouter")
+            .field("installed_count", &self.installed.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl HardwareBackendRouter {
+    /// Create a new router with the given set of discovered installed
+    /// extensions. Pass an empty `Vec` to get `Unsupported` for every id
+    /// (there are no built-in hardware backends).
+    pub fn new(installed: Vec<DiscoveredContribution>) -> Self {
+        Self {
+            installed,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Resolve `canonical_id` to a `DispatchedHardwareBackendCuda`.
+    pub fn get(
+        &self,
+        canonical_id: &CanonicalId,
+    ) -> Result<Arc<dyn DispatchedHardwareBackendCuda>, CodecError> {
+        {
+            let cache = self.cache.lock().unwrap();
+            if let Some(backend) = cache.get(canonical_id) {
+                return Ok(Arc::clone(backend));
+            }
+        }
+
+        let backend = self.resolve(canonical_id)?;
+        let arc = Arc::from(backend);
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.insert(*canonical_id, Arc::clone(&arc));
+        }
+        Ok(arc)
+    }
+
+    /// Look up `canonical_id`, gate it through [`check`], and dlopen the
+    /// native artifact if admitted.
+    ///
+    /// # Policy default
+    ///
+    /// Neither [`PlaneCodecRouter`] nor [`DeltaSchemeRouter`] threads a
+    /// `HostPolicy` through its constructor, and until this method,
+    /// nothing in the crate outside of `capability_check`'s own test
+    /// module called [`check`] at all: this is the crate's first
+    /// production call site. Using `HostPolicy::default()` here rather
+    /// than adding a `policy` parameter to [`HardwareBackendRouter::new`]
+    /// is a deliberate choice, not an oversight, for one concrete reason:
+    /// `HostPolicy::default().available_hardware` is an empty
+    /// `Vec<String>`, and `check`'s `hardware_class` rule denies any
+    /// contribution whose declared class is not a member of
+    /// `available_hardware`. An empty list therefore denies every
+    /// `hardware_class`-declaring contribution unconditionally, so this
+    /// default cannot silently admit a CUDA backend just because a real
+    /// policy was never wired in. Enabling this feature on a given host
+    /// requires an operator to explicitly list the hardware class (for
+    /// example `"cuda"`) in `available_hardware` through a policy file
+    /// consumed elsewhere in the resolution pipeline; there is no path
+    /// by which this default alone grants access. Threading a
+    /// caller-supplied `HostPolicy` into this router (for example from
+    /// the PyO3 binding that constructs it) is legitimate future work,
+    /// but is not required for this default to be safe today.
+    fn resolve(
+        &self,
+        canonical_id: &CanonicalId,
+    ) -> Result<Box<dyn DispatchedHardwareBackendCuda>, CodecError> {
+        let Some(install) = find_install(canonical_id, &self.installed) else {
+            return Err(CodecError::Unsupported {
+                feature: format!("no hardware_backend registered for canonical id {canonical_id}"),
+            });
+        };
+        let bundle_dir = &install.bundle_dir;
+        let entry = manifest_entry_for(install, canonical_id)?;
+
+        // Deny before dlopen, not after: see this method's doc comment
+        // for why HostPolicy::default() is the correct policy to check
+        // against here.
+        let policy = HostPolicy::default();
+        match check(&entry, &policy, &VendorTable::default()) {
+            CapabilityVerdict::Denied { reason } => {
+                return Err(CodecError::Unsupported {
+                    feature: format!("hardware_backend capability check denied: {reason}"),
+                });
+            }
+            CapabilityVerdict::Admitted => {}
+        }
+
+        if let Ok(native_path) = find_native_path(bundle_dir) {
+            let token = VerifiedToken::new_unchecked();
+            let ext = NativeExtension::load(&native_path, &entry, token)?;
+            return Ok(Box::new(NativeHardwareBackendCudaAdapter {
+                inner: Arc::new(ext),
+            }));
+        }
+
+        Err(CodecError::Unsupported {
+            feature: format!(
+                "hardware_backend {canonical_id} is installed but no native artifact was \
+                 found in {} (hardware_backend is native-only, WASM is not supported)",
+                bundle_dir.display()
+            ),
+        })
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Find the `DiscoveredContribution` whose manifest declares a contribution
@@ -651,7 +775,10 @@ fn hex_nibble(b: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extension::{CanonicalId, builtin_canonical_id};
+    use crate::extension::{
+        CanonicalId, CapabilityMap, ContributionDecl, Kind, Lifecycle, Manifest,
+        builtin_canonical_id, capability::CapabilityValue, manifest::BundleHeader,
+    };
 
     #[test]
     fn router_returns_codec_for_builtin_identity() {
@@ -770,5 +897,90 @@ mod tests {
     fn native_hardware_backend_adapter_forwards_to_extension() {
         fn assert_impl<T: DispatchedHardwareBackendCuda>() {}
         assert_impl::<NativeHardwareBackendCudaAdapter>();
+    }
+
+    #[test]
+    fn hardware_backend_router_errors_for_unknown_canonical_id() {
+        let router = HardwareBackendRouter::new(Vec::new());
+        let id = CanonicalId::from_bytes([0xABu8; 32]);
+        assert!(
+            matches!(router.get(&id), Err(CodecError::Unsupported { .. })),
+            "expected Unsupported for unknown hardware_backend canonical id"
+        );
+    }
+
+    /// Build a `DiscoveredContribution` declaring a single `hardware_backend`
+    /// contribution with the given `hardware_class` capability, rooted at
+    /// `bundle_dir` (which need not exist on disk for capability-check
+    /// tests: the check must run, and deny, before any filesystem access
+    /// is attempted).
+    fn discovered_contribution_with_hardware_class(
+        hardware_class: &str,
+        bundle_dir: &str,
+    ) -> (DiscoveredContribution, CanonicalId) {
+        let id_bytes = [0xCDu8; 32];
+        let id = CanonicalId::from_bytes(id_bytes);
+        let id_hex: String = id_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+        let mut caps = CapabilityMap::new();
+        caps.set(
+            "hardware_class",
+            CapabilityValue::Text(hardware_class.to_string()),
+        );
+
+        let manifest = Manifest {
+            bundle: BundleHeader {
+                name: "test-hardware-backend".into(),
+                version: "0.1.0".into(),
+                author_pubkey: "ed25519:00".into(),
+                description: None,
+            },
+            contributions: vec![ContributionDecl {
+                id: format!("blake3:{id_hex}"),
+                label: "io.example.hardware_backend".into(),
+                kind: Kind::HardwareBackend,
+                abi_version: 1,
+                lifecycle: Lifecycle::Process,
+                flavors: vec!["native".into()],
+                capabilities: caps,
+                install_hint: None,
+            }],
+        };
+
+        let install = DiscoveredContribution {
+            manifest,
+            manifest_path: PathBuf::from(bundle_dir).join("manifest.toml"),
+            bundle_dir: PathBuf::from(bundle_dir),
+            installed_flavors: crate::discovery::FLAVOR_NATIVE,
+        };
+
+        (install, id)
+    }
+
+    #[test]
+    fn hardware_backend_router_denies_before_native_load_when_capability_missing() {
+        // An installed contribution declaring hardware_class = "cuda"
+        // against HostPolicy::default() (available_hardware is empty)
+        // must be Denied before any dlopen is attempted. dlopen-ing a
+        // nonexistent path would itself error, so this test uses a
+        // bundle_dir that does not exist on disk: if capability_check
+        // runs first, the error message must say "capability check
+        // denied", not a filesystem error.
+        let (install, id) = discovered_contribution_with_hardware_class(
+            "cuda",
+            "/this/bundle/dir/does/not/exist",
+        );
+        let router = HardwareBackendRouter::new(vec![install]);
+        let res = router.get(&id);
+        match res {
+            Ok(_) => panic!("expected capability denial, got Ok"),
+            Err(CodecError::Unsupported { feature }) => {
+                assert!(
+                    feature.contains("capability check denied"),
+                    "got: {feature}"
+                );
+            }
+            Err(other) => panic!("expected capability denial, got {other:?}"),
+        }
     }
 }

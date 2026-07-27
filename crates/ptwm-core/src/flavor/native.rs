@@ -94,7 +94,7 @@ pub type DeltaSchemeFn = unsafe extern "C" fn(
     usize,     // output len
 ) -> i64;
 
-/// `hardware_backend_v1_cuda_stream_handle` — returns this backend's own,
+/// `hardware_backend_v1_cuda_stream_handle`: returns this backend's own,
 /// process-persistent CUDA stream (as a raw pointer value) for the given
 /// device ordinal. Callers pass this same handle to `tensor.__dlpack__
 /// (stream=...)` for every tensor involved in a subsequent decode call, so
@@ -115,7 +115,7 @@ pub type HardwareBackendCudaStreamHandleFn = unsafe extern "C" fn(device_ordinal
 ///
 /// Completion contract: by the time this function returns, the kernel has
 /// FULLY COMPLETED (the extension synchronizes its own stream before
-/// returning) — `out_dev_ptr`'s contents are valid and visible to any
+/// returning). `out_dev_ptr`'s contents are valid and visible to any
 /// subsequent CUDA operation on any stream, with no further caller-side
 /// synchronization needed. Both launch-time and execution-time errors are
 /// visible via the return code, since the synchronize() call observes both.

@@ -49,6 +49,9 @@ pub struct NativeSymbols {
     // DeltaScheme
     pub delta_scheme_v1_encode: Option<DeltaSchemeFn>,
     pub delta_scheme_v1_decode: Option<DeltaSchemeFn>,
+    // HardwareBackend
+    pub hardware_backend_v1_cuda_stream_handle: Option<HardwareBackendCudaStreamHandleFn>,
+    pub hardware_backend_v1_dispatch_decode_cuda: Option<HardwareBackendCudaDispatchDecodeFn>,
 }
 
 pub type PlaneCodecFn = unsafe extern "C" fn(
@@ -164,6 +167,8 @@ impl NativeExtension {
             transform_v1_inverse: None,
             delta_scheme_v1_encode: None,
             delta_scheme_v1_decode: None,
+            hardware_backend_v1_cuda_stream_handle: None,
+            hardware_backend_v1_dispatch_decode_cuda: None,
         };
 
         // Probe symbols depending on the kind.
@@ -210,6 +215,23 @@ impl NativeExtension {
                 {
                     return Err(CodecError::Unsupported {
                         feature: "missing required delta_scheme_v1 symbol".into(),
+                    });
+                }
+            }
+            Kind::HardwareBackend => {
+                symbols.hardware_backend_v1_cuda_stream_handle = resolve::<HardwareBackendCudaStreamHandleFn>(
+                    &library,
+                    b"ptwm_hardware_backend_v1_cuda_stream_handle\0",
+                );
+                symbols.hardware_backend_v1_dispatch_decode_cuda = resolve::<HardwareBackendCudaDispatchDecodeFn>(
+                    &library,
+                    b"ptwm_hardware_backend_v1_dispatch_decode_cuda\0",
+                );
+                if symbols.hardware_backend_v1_cuda_stream_handle.is_none()
+                    || symbols.hardware_backend_v1_dispatch_decode_cuda.is_none()
+                {
+                    return Err(CodecError::Unsupported {
+                        feature: "missing required hardware_backend_v1 symbol".into(),
                     });
                 }
             }
@@ -432,6 +454,22 @@ mod tests {
         let res = NativeExtension::load(
             Path::new("/this/path/does/not/exist.so"),
             &entry(Kind::PlaneCodec),
+            VerifiedToken::new_unchecked(),
+        );
+        assert!(matches!(res, Err(CodecError::InvalidInput)));
+    }
+
+    #[test]
+    fn hardware_backend_missing_required_symbols_is_unsupported() {
+        // A library with neither ptwm_hardware_backend_v1_cuda_stream_handle
+        // nor ptwm_hardware_backend_v1_dispatch_decode_cuda must fail to load
+        // for Kind::HardwareBackend, same strictness as PlaneCodec/DeltaScheme.
+        // This test is a placeholder for Task 11's real artifact-backed test;
+        // the path-doesn't-exist error fires before symbol probing, so the test
+        // passes trivially for now.
+        let res = NativeExtension::load(
+            Path::new("/this/path/does/not/exist.so"),
+            &entry(Kind::HardwareBackend),
             VerifiedToken::new_unchecked(),
         );
         assert!(matches!(res, Err(CodecError::InvalidInput)));

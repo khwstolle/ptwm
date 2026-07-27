@@ -460,6 +460,52 @@ impl DeltaSchemeRouter {
     }
 }
 
+// ── HardwareBackend router ─────────────────────────────────────────────────────
+
+/// Uniform decode surface for GPU-accelerated decode operations.
+///
+/// Provides two methods: `dispatch_decode_cuda` for decoding on CUDA devices,
+/// and `cuda_stream_handle` to acquire a stream for a given device ordinal.
+pub trait DispatchedHardwareBackendCuda: Send + Sync {
+    fn dispatch_decode_cuda(
+        &self,
+        state_bytes: &[u8],
+        codec_id: &CanonicalId,
+        in_dev_ptr: u64,
+        in_len: usize,
+        out_dev_ptr: u64,
+        out_len: usize,
+        device_ordinal: u32,
+    ) -> Result<usize, CodecError>;
+
+    fn cuda_stream_handle(&self, device_ordinal: u32) -> Result<u64, CodecError>;
+}
+
+struct NativeHardwareBackendCudaAdapter {
+    inner: Arc<NativeExtension>,
+}
+
+impl DispatchedHardwareBackendCuda for NativeHardwareBackendCudaAdapter {
+    fn dispatch_decode_cuda(
+        &self,
+        state_bytes: &[u8],
+        codec_id: &CanonicalId,
+        in_dev_ptr: u64,
+        in_len: usize,
+        out_dev_ptr: u64,
+        out_len: usize,
+        device_ordinal: u32,
+    ) -> Result<usize, CodecError> {
+        self.inner.invoke_hardware_backend_dispatch_decode_cuda(
+            state_bytes, codec_id, in_dev_ptr, in_len, out_dev_ptr, out_len, device_ordinal,
+        )
+    }
+
+    fn cuda_stream_handle(&self, device_ordinal: u32) -> Result<u64, CodecError> {
+        self.inner.invoke_hardware_backend_cuda_stream_handle(device_ordinal)
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Find the `DiscoveredContribution` whose manifest declares a contribution
@@ -718,5 +764,11 @@ mod tests {
             matches!(router.get(&id), Err(CodecError::Unsupported { .. })),
             "expected Unsupported for unknown delta_scheme canonical id"
         );
+    }
+
+    #[test]
+    fn native_hardware_backend_adapter_forwards_to_extension() {
+        fn assert_impl<T: DispatchedHardwareBackendCuda>() {}
+        assert_impl::<NativeHardwareBackendCudaAdapter>();
     }
 }

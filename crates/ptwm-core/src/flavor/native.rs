@@ -94,6 +94,44 @@ pub type DeltaSchemeFn = unsafe extern "C" fn(
     usize,     // output len
 ) -> i64;
 
+/// `hardware_backend_v1_cuda_stream_handle` — returns this backend's own,
+/// process-persistent CUDA stream (as a raw pointer value) for the given
+/// device ordinal. Callers pass this same handle to `tensor.__dlpack__
+/// (stream=...)` for every tensor involved in a subsequent decode call, so
+/// PyTorch's DLPack producer inserts the correct cross-stream wait before
+/// handing back the device pointer. Returns 0 on failure (no such device,
+/// CUDA init failed).
+pub type HardwareBackendCudaStreamHandleFn = unsafe extern "C" fn(device_ordinal: u32) -> u64;
+
+/// `hardware_backend_v1_dispatch_decode_cuda` — decode `in_dev_ptr` into
+/// `out_dev_ptr`, two distinct device buffers (this is NOT an in-place
+/// transform over one buffer; "zero-copy" means no host round-trip, not a
+/// shared address). `state_bytes` carries the codec's small per-tensor
+/// state (e.g. a 16-entry codebook), in the same `(state_format_version,
+/// state_bytes)` shape `plane_codec`'s existing `decode_stateful` path
+/// already carries. `codec_id` self-describes the wire format for the
+/// extension to validate against (distinct from the backend's own
+/// canonical id, which the router already resolved to get here).
+///
+/// Completion contract: by the time this function returns, the kernel has
+/// FULLY COMPLETED (the extension synchronizes its own stream before
+/// returning) — `out_dev_ptr`'s contents are valid and visible to any
+/// subsequent CUDA operation on any stream, with no further caller-side
+/// synchronization needed. Both launch-time and execution-time errors are
+/// visible via the return code, since the synchronize() call observes both.
+pub type HardwareBackendCudaDispatchDecodeFn = unsafe extern "C" fn(
+    state_format_version: u8,
+    state_ptr: *const u8,
+    state_len: usize,
+    codec_id_ptr: *const u8,
+    codec_id_len: usize,
+    in_dev_ptr: u64,
+    in_len: usize,
+    out_dev_ptr: u64,
+    out_len: usize,
+    device_ordinal: u32,
+) -> i64;
+
 pub struct NativeExtension {
     // Held for its drop-time side effect: keeping the dlopen handle alive
     // so all fn pointers in `symbols` remain valid.

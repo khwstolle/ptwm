@@ -31,7 +31,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::discovery::DiscoveredContribution;
 use crate::extension::{
-    Attestation, BuiltinKind, CanonicalId, ExtensionTableEntry, dispatch_builtin,
+    Attestation, BuiltinKind, CanonicalId, ExtensionTableEntry, capability::CapabilityValue,
+    dispatch_builtin,
 };
 use crate::flavor::abi::CodecError;
 use crate::flavor::native::{NativeExtension, VerifiedToken};
@@ -561,8 +562,9 @@ impl HardwareBackendRouter {
         Ok(arc)
     }
 
-    /// Look up `canonical_id`, gate it through [`check`], and dlopen the
-    /// native artifact if admitted.
+    /// Look up `canonical_id`, gate it through a `hardware_class`
+    /// precondition and [`check`], and dlopen the native artifact if
+    /// admitted.
     ///
     /// # Policy default
     ///
@@ -572,21 +574,33 @@ impl HardwareBackendRouter {
     /// module called [`check`] at all: this is the crate's first
     /// production call site. Using `HostPolicy::default()` here rather
     /// than adding a `policy` parameter to [`HardwareBackendRouter::new`]
-    /// is a deliberate choice, not an oversight, for one concrete reason:
+    /// is a deliberate choice, not an oversight.
     /// `HostPolicy::default().available_hardware` is an empty
     /// `Vec<String>`, and `check`'s `hardware_class` rule denies any
-    /// contribution whose declared class is not a member of
-    /// `available_hardware`. An empty list therefore denies every
-    /// `hardware_class`-declaring contribution unconditionally, so this
-    /// default cannot silently admit a CUDA backend just because a real
-    /// policy was never wired in. Enabling this feature on a given host
-    /// requires an operator to explicitly list the hardware class (for
-    /// example `"cuda"`) in `available_hardware` through a policy file
-    /// consumed elsewhere in the resolution pipeline; there is no path
-    /// by which this default alone grants access. Threading a
-    /// caller-supplied `HostPolicy` into this router (for example from
-    /// the PyO3 binding that constructs it) is legitimate future work,
-    /// but is not required for this default to be safe today.
+    /// contribution whose *declared* class is not a member of
+    /// `available_hardware`.
+    ///
+    /// That rule only fires when `hardware_class` is present and typed
+    /// as `CapabilityValue::Text`, though: every rule in `check` inspects
+    /// capability keys that are present rather than requiring a key to
+    /// exist, so a contribution whose manifest never declares
+    /// `hardware_class` at all (or declares it as some other
+    /// `CapabilityValue` variant) would not trip that rule, or any other
+    /// rule in `check`, and would resolve to `Admitted` regardless of
+    /// policy. This method closes that gap itself, before calling
+    /// [`check`]: `hardware_class` must be present and
+    /// `CapabilityValue::Text`, or resolution is denied immediately.
+    /// With that precondition enforced, every `hardware_backend`
+    /// contribution this router can admit necessarily has a declared
+    /// class subject to `check`'s `hardware_class` rule, so the empty
+    /// default `available_hardware` denies all of them. Enabling this
+    /// feature on a given host requires an operator to explicitly list
+    /// the hardware class (for example `"cuda"`) in `available_hardware`
+    /// through a policy file consumed elsewhere in the resolution
+    /// pipeline. Threading a caller-supplied `HostPolicy` into this
+    /// router (for example from the PyO3 binding that constructs it) is
+    /// legitimate future work, but is not required for this default to
+    /// be safe today.
     fn resolve(
         &self,
         canonical_id: &CanonicalId,
@@ -598,6 +612,24 @@ impl HardwareBackendRouter {
         };
         let bundle_dir = &install.bundle_dir;
         let entry = manifest_entry_for(install, canonical_id)?;
+
+        // check()'s hardware_class rule only denies a *declared*
+        // mismatched class; it has no rule that fires when
+        // hardware_class is absent or of the wrong CapabilityValue
+        // variant, since every one of its rules inspects keys that are
+        // present. Enforce presence and type here, before check() runs,
+        // so omission is treated as denial rather than silently skipped
+        // (see this method's doc comment for the full reasoning).
+        if !matches!(
+            entry.capabilities.get("hardware_class"),
+            Some(CapabilityValue::Text(_))
+        ) {
+            return Err(CodecError::Unsupported {
+                feature: "hardware_backend contribution must declare hardware_class as a \
+                          capability"
+                    .into(),
+            });
+        }
 
         // Deny before dlopen, not after: see this method's doc comment
         // for why HostPolicy::default() is the correct policy to check
@@ -981,6 +1013,73 @@ mod tests {
                 );
             }
             Err(other) => panic!("expected capability denial, got {other:?}"),
+        }
+    }
+
+    /// Build a `DiscoveredContribution` declaring a single `hardware_backend`
+    /// contribution whose capability map does not declare `hardware_class`
+    /// at all, rooted at `bundle_dir` (which need not exist on disk: the
+    /// omission precondition must deny before any filesystem access is
+    /// attempted).
+    fn discovered_contribution_missing_hardware_class(
+        bundle_dir: &str,
+    ) -> (DiscoveredContribution, CanonicalId) {
+        let id_bytes = [0xEFu8; 32];
+        let id = CanonicalId::from_bytes(id_bytes);
+        let id_hex: String = id_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+        let manifest = Manifest {
+            bundle: BundleHeader {
+                name: "test-hardware-backend-no-class".into(),
+                version: "0.1.0".into(),
+                author_pubkey: "ed25519:00".into(),
+                description: None,
+            },
+            contributions: vec![ContributionDecl {
+                id: format!("blake3:{id_hex}"),
+                label: "io.example.hardware_backend_no_class".into(),
+                kind: Kind::HardwareBackend,
+                abi_version: 1,
+                lifecycle: Lifecycle::Process,
+                flavors: vec!["native".into()],
+                capabilities: CapabilityMap::new(),
+                install_hint: None,
+            }],
+        };
+
+        let install = DiscoveredContribution {
+            manifest,
+            manifest_path: PathBuf::from(bundle_dir).join("manifest.toml"),
+            bundle_dir: PathBuf::from(bundle_dir),
+            installed_flavors: crate::discovery::FLAVOR_NATIVE,
+        };
+
+        (install, id)
+    }
+
+    #[test]
+    fn hardware_backend_router_denies_when_hardware_class_capability_missing() {
+        // check()'s hardware_class rule only fires on a *declared*
+        // mismatched class; an omitted key can't fail a rule that only
+        // inspects present keys. HardwareBackendRouter::resolve enforces
+        // presence itself, so a contribution that never declares
+        // hardware_class must still be denied before any dlopen is
+        // attempted, using the same nonexistent-bundle-dir trick as
+        // above so a filesystem error can't masquerade as the intended
+        // denial.
+        let (install, id) =
+            discovered_contribution_missing_hardware_class("/this/bundle/dir/does/not/exist");
+        let router = HardwareBackendRouter::new(vec![install]);
+        let res = router.get(&id);
+        match res {
+            Ok(_) => panic!("expected denial for missing hardware_class, got Ok"),
+            Err(CodecError::Unsupported { feature }) => {
+                assert!(
+                    feature.contains("hardware_class"),
+                    "got: {feature}"
+                );
+            }
+            Err(other) => panic!("expected denial for missing hardware_class, got {other:?}"),
         }
     }
 }

@@ -103,7 +103,7 @@ pub type DeltaSchemeFn = unsafe extern "C" fn(
 /// CUDA init failed).
 pub type HardwareBackendCudaStreamHandleFn = unsafe extern "C" fn(device_ordinal: u32) -> u64;
 
-/// `hardware_backend_v1_dispatch_decode_cuda` — decode `in_dev_ptr` into
+/// `hardware_backend_v1_dispatch_decode_cuda`: decode `in_dev_ptr` into
 /// `out_dev_ptr`, two distinct device buffers (this is NOT an in-place
 /// transform over one buffer; "zero-copy" means no host round-trip, not a
 /// shared address). `state_bytes` carries the codec's small per-tensor

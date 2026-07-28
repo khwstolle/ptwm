@@ -5,6 +5,7 @@
 //! Passthrough: copies input to output, ignoring the plane_codec_id.
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
+#[cfg(target_arch = "wasm32")]
 use std::alloc::Layout;
 
 // ---------------------------------------------------------------------------

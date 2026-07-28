@@ -21,7 +21,8 @@ pub use native::{
     DeltaSchemeFn, NativeExtension, NativeSymbols, PlaneCodecFn, TransformFn, VerifiedToken,
 };
 pub use router::{
-    DeltaSchemeRouter, DispatchedDeltaScheme, DispatchedPlaneCodec, PlaneCodecRouter,
+    DeltaSchemeRouter, DispatchedDeltaScheme, DispatchedHardwareBackendCuda, DispatchedPlaneCodec,
+    HardwareBackendRouter, PlaneCodecRouter,
 };
 pub use third_party::ThirdPartyPlaneCodec;
 pub use wasm::{

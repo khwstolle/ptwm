@@ -41,5 +41,16 @@ jobs:
       - name: Install ext-dev deps (for the wasmtime Python package)
         run: uv pip install --system 'wasmtime>=26' 'zstandard>=0.22' 'tomli-w>=1.0.0'
 
+      - name: Build ref_hardware_backend (native flavor)
+        run: |
+          cd extensions/ref_hardware_backend/rust
+          cargo build --release
+
+      - name: Run hardware_backend native dispatch tests
+        run: cargo test -p ptwm-core --test hardware_backend_router_native -- --ignored
+
       - name: Run interop tests
         run: uv run pytest tests/interop -v --no-cov
+
+      - name: Run hardware_backend dispatch pytest
+        run: uv run pytest tests/ptwm/ext/test_hardware_backend_dispatch.py -v --no-cov

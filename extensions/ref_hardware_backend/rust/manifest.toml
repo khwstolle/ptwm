@@ -10,5 +10,5 @@ label = "io.ptwm.ref.hardware_backend"
 kind = "hardware_backend"
 abi_version = 1
 lifecycle = "thread"
-flavors = ["wasm"]
+flavors = ["wasm", "native"]
 capabilities = { determinism = true, hardware_class = "cpu" }

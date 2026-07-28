@@ -105,8 +105,16 @@ def _build_rust(cwd: Path, release: bool, flavor: str = "wasm") -> Path:
     return dst
 
 
+def _uses_cuda_oxide(cwd: Path) -> bool:
+    cargo_toml = cwd / "Cargo.toml"
+    if not cargo_toml.exists():
+        return False
+    deps = tomllib.loads(cargo_toml.read_text(encoding="utf-8")).get("dependencies", {})
+    return "cuda-oxide" in deps
+
+
 def _build_rust_native(cwd: Path, release: bool) -> Path:
-    cmd = ["cargo", "build"]
+    cmd = ["cargo", "oxide", "build"] if _uses_cuda_oxide(cwd) else ["cargo", "build"]
     if release:
         cmd.append("--release")
     _run(cmd, cwd)

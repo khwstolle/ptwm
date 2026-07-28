@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use ptwm_core::extension::CanonicalId;
-use ptwm_core::policy::{PolicyFile, ResolvedPolicy, resolve};
+use ptwm_core::policy::{HostPolicy, PolicyFile, ResolvedPolicy, resolve};
 
 fn to_pyerr<E: std::fmt::Display>(e: E) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e.to_string())
@@ -86,6 +86,20 @@ impl PyResolvedPolicy {
             .collect();
         ids.sort();
         ids
+    }
+}
+
+impl PyResolvedPolicy {
+    /// Crate-internal accessor for the resolved `HostPolicy`, used by
+    /// other PyO3 bindings (e.g. `hardware.rs`) that need to pass a
+    /// caller-supplied policy into a router such as
+    /// `HardwareBackendRouter::new_with_policy` instead of that router's
+    /// own default-deny policy. Not exposed to Python: callers on the
+    /// Python side only ever hand a whole `ResolvedPolicy` object back
+    /// into another PyO3 function, never read `HostPolicy` fields
+    /// directly.
+    pub(crate) fn host_policy(&self) -> HostPolicy {
+        self.inner.host.clone()
     }
 }
 

@@ -499,12 +499,19 @@ impl DispatchedHardwareBackendCuda for NativeHardwareBackendCudaAdapter {
         device_ordinal: u32,
     ) -> Result<usize, CodecError> {
         self.inner.invoke_hardware_backend_dispatch_decode_cuda(
-            state_bytes, codec_id, in_dev_ptr, in_len, out_dev_ptr, out_len, device_ordinal,
+            state_bytes,
+            codec_id,
+            in_dev_ptr,
+            in_len,
+            out_dev_ptr,
+            out_len,
+            device_ordinal,
         )
     }
 
     fn cuda_stream_handle(&self, device_ordinal: u32) -> Result<u64, CodecError> {
-        self.inner.invoke_hardware_backend_cuda_stream_handle(device_ordinal)
+        self.inner
+            .invoke_hardware_backend_cuda_stream_handle(device_ordinal)
     }
 }
 
@@ -515,10 +522,11 @@ impl DispatchedHardwareBackendCuda for NativeHardwareBackendCudaAdapter {
 /// expressed in WASM's 32-bit linear address space, so `hardware_backend`
 /// is native-only by construction. Second, [`resolve`](Self::resolve) runs
 /// [`check`] against the entry's declared capabilities before attempting a
-/// native load; see that method's documentation for why `HostPolicy::default()`
-/// is the correct policy to use there rather than a caller-supplied one.
+/// native load, using `self.policy`; see [`Self::new`] and
+/// [`Self::new_with_policy`] for how that policy is chosen.
 pub struct HardwareBackendRouter {
     installed: Vec<DiscoveredContribution>,
+    policy: HostPolicy,
     cache: Mutex<HashMap<CanonicalId, Arc<dyn DispatchedHardwareBackendCuda>>>,
 }
 
@@ -532,11 +540,45 @@ impl std::fmt::Debug for HardwareBackendRouter {
 
 impl HardwareBackendRouter {
     /// Create a new router with the given set of discovered installed
-    /// extensions. Pass an empty `Vec` to get `Unsupported` for every id
-    /// (there are no built-in hardware backends).
+    /// extensions, gated by the default (empty-`available_hardware`)
+    /// [`HostPolicy`]. Pass an empty `Vec` to get `Unsupported` for every
+    /// id (there are no built-in hardware backends).
+    ///
+    /// This constructor's signature and default-deny behavior stay fixed
+    /// for every existing caller: it never admits a `hardware_class`-
+    /// declaring contribution, regardless of what that contribution
+    /// declares. A caller that needs a different policy (for example, an
+    /// operator who has confirmed a given host truly has CUDA available)
+    /// uses [`Self::new_with_policy`] instead; adding that constructor
+    /// leaves this method's own behavior unchanged.
     pub fn new(installed: Vec<DiscoveredContribution>) -> Self {
         Self {
             installed,
+            policy: HostPolicy::default(),
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Create a new router with the given set of discovered installed
+    /// extensions, gated by a caller-supplied [`HostPolicy`] instead of
+    /// the default.
+    ///
+    /// This is the mechanism [`Self::resolve`]'s doc comment names as
+    /// "legitimate future work": a caller that has independently
+    /// established a host's true hardware availability (for example, a
+    /// PyO3 binding that read a `ResolvedPolicy` produced from an
+    /// operator's policy file) can pass that policy here, so `resolve`
+    /// checks the entry's declared capabilities against it instead of
+    /// against the always-empty `HostPolicy::default()`. This does not
+    /// change what [`check`] itself does, and does not remove the
+    /// `hardware_class`-presence precondition enforced in
+    /// [`Self::resolve`]: a contribution is only ever admitted when its
+    /// declared capabilities pass [`check`] against whichever policy is
+    /// in effect.
+    pub fn new_with_policy(installed: Vec<DiscoveredContribution>, policy: HostPolicy) -> Self {
+        Self {
+            installed,
+            policy,
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -566,19 +608,21 @@ impl HardwareBackendRouter {
     /// precondition and [`check`], and dlopen the native artifact if
     /// admitted.
     ///
-    /// # Policy default
+    /// # Policy
     ///
     /// Neither [`PlaneCodecRouter`] nor [`DeltaSchemeRouter`] threads a
-    /// `HostPolicy` through its constructor, and until this method,
-    /// nothing in the crate outside of `capability_check`'s own test
-    /// module called [`check`] at all: this is the crate's first
-    /// production call site. Using `HostPolicy::default()` here rather
-    /// than adding a `policy` parameter to [`HardwareBackendRouter::new`]
-    /// is a deliberate choice, not an oversight.
+    /// `HostPolicy` through its constructor; [`HardwareBackendRouter`]
+    /// does, via `self.policy` (set by [`Self::new`] to
+    /// `HostPolicy::default()`, or by [`Self::new_with_policy`] to a
+    /// caller-supplied value). This method was the crate's first
+    /// production call site for [`check`] at all: previously nothing
+    /// outside `capability_check`'s own test module called it.
     /// `HostPolicy::default().available_hardware` is an empty
     /// `Vec<String>`, and `check`'s `hardware_class` rule denies any
     /// contribution whose *declared* class is not a member of
-    /// `available_hardware`.
+    /// `available_hardware`; a router built via [`Self::new`] therefore
+    /// still denies every `hardware_class`-declaring contribution by
+    /// default, exactly as before.
     ///
     /// That rule only fires when `hardware_class` is present and typed
     /// as `CapabilityValue::Text`, though: every rule in `check` inspects
@@ -592,15 +636,14 @@ impl HardwareBackendRouter {
     /// `CapabilityValue::Text`, or resolution is denied immediately.
     /// With that precondition enforced, every `hardware_backend`
     /// contribution this router can admit necessarily has a declared
-    /// class subject to `check`'s `hardware_class` rule, so the empty
-    /// default `available_hardware` denies all of them. Enabling this
-    /// feature on a given host requires an operator to explicitly list
-    /// the hardware class (for example `"cuda"`) in `available_hardware`
-    /// through a policy file consumed elsewhere in the resolution
-    /// pipeline. Threading a caller-supplied `HostPolicy` into this
-    /// router (for example from the PyO3 binding that constructs it) is
-    /// legitimate future work, but is not required for this default to
-    /// be safe today.
+    /// class subject to `check`'s `hardware_class` rule, so a
+    /// `self.policy` whose `available_hardware` doesn't list that class
+    /// denies it. Enabling this feature for a given hardware class thus
+    /// requires the router to be constructed via
+    /// [`Self::new_with_policy`] with a policy whose `available_hardware`
+    /// explicitly lists that class (for example `"cuda"`), an operator
+    /// decision made upstream of this router, not something `resolve`
+    /// infers on its own.
     fn resolve(
         &self,
         canonical_id: &CanonicalId,
@@ -632,10 +675,10 @@ impl HardwareBackendRouter {
         }
 
         // Deny before dlopen, not after: see this method's doc comment
-        // for why HostPolicy::default() is the correct policy to check
-        // against here.
-        let policy = HostPolicy::default();
-        match check(&entry, &policy, &VendorTable::default()) {
+        // for how self.policy is chosen (HostPolicy::default() via
+        // Self::new, or a caller-supplied policy via
+        // Self::new_with_policy).
+        match check(&entry, &self.policy, &VendorTable::default()) {
             CapabilityVerdict::Denied { reason } => {
                 return Err(CodecError::Unsupported {
                     feature: format!("hardware_backend capability check denied: {reason}"),
@@ -998,10 +1041,8 @@ mod tests {
         // bundle_dir that does not exist on disk: if capability_check
         // runs first, the error message must say "capability check
         // denied", not a filesystem error.
-        let (install, id) = discovered_contribution_with_hardware_class(
-            "cuda",
-            "/this/bundle/dir/does/not/exist",
-        );
+        let (install, id) =
+            discovered_contribution_with_hardware_class("cuda", "/this/bundle/dir/does/not/exist");
         let router = HardwareBackendRouter::new(vec![install]);
         let res = router.get(&id);
         match res {
@@ -1074,12 +1115,50 @@ mod tests {
         match res {
             Ok(_) => panic!("expected denial for missing hardware_class, got Ok"),
             Err(CodecError::Unsupported { feature }) => {
-                assert!(
-                    feature.contains("hardware_class"),
-                    "got: {feature}"
-                );
+                assert!(feature.contains("hardware_class"), "got: {feature}");
             }
             Err(other) => panic!("expected denial for missing hardware_class, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hardware_backend_router_new_with_policy_admits_the_case_default_denies() {
+        // Same "cuda" fixture shape reused with hardware_class = "cpu" to
+        // match the real ref_hardware_backend fixture's declared class.
+        // Against HardwareBackendRouter::new (HostPolicy::default(),
+        // available_hardware empty) this would be denied at the
+        // capability-check step, exactly like
+        // hardware_backend_router_denies_before_native_load_when_capability_missing
+        // above. This is the regression guard for new_with_policy: a
+        // policy that explicitly lists "cpu" in available_hardware must
+        // let resolution past the capability check. The bundle_dir still
+        // does not exist on disk, so resolution is expected to fail
+        // afterward at the "no native artifact" step, not at capability
+        // check: that distinction is exactly what proves admission
+        // happened before the (necessarily failing, since there is
+        // nothing to dlopen) filesystem step.
+        let (install, id) =
+            discovered_contribution_with_hardware_class("cpu", "/this/bundle/dir/does/not/exist");
+        let policy = HostPolicy {
+            available_hardware: vec!["cpu".into()],
+            ..HostPolicy::default()
+        };
+        let router = HardwareBackendRouter::new_with_policy(vec![install], policy);
+        let res = router.get(&id);
+        match res {
+            Ok(_) => panic!("expected a native-artifact-not-found error, got Ok"),
+            Err(CodecError::Unsupported { feature }) => {
+                assert!(
+                    !feature.contains("capability check denied"),
+                    "capability check should have admitted this contribution, got: {feature}"
+                );
+                assert!(
+                    feature.contains("no native artifact was found"),
+                    "expected a native-artifact-not-found error once past capability \
+                     admission, got: {feature}"
+                );
+            }
+            Err(other) => panic!("expected Unsupported, got {other:?}"),
         }
     }
 }

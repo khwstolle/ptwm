@@ -6,7 +6,7 @@
 use crate::extension::{ExtensionTableEntry, capability::CapabilityValue};
 
 use super::native_deps::{
-    CommandRunner, NativeDep, NativeDepVerdict, RealCommandRunner, VendorTable,
+    CommandRunner, NativeDep, NativeDepVerdict, RealCommandRunner, RunResult, VendorTable,
     verify_native_dep_with,
 };
 
@@ -286,6 +286,114 @@ mod tests {
         match check(&entry, &policy, &VendorTable::default()) {
             CapabilityVerdict::Denied { reason } => assert!(reason.contains("determinism")),
             _ => panic!("expected Denied"),
+        }
+    }
+
+    /// Fake CommandRunner: programmable responses.
+    struct FakeRunner {
+        which_returns: std::collections::HashMap<String, Option<std::path::PathBuf>>,
+        run_returns: std::collections::HashMap<(String, Vec<String>), RunResult>,
+    }
+
+    impl FakeRunner {
+        fn new() -> Self {
+            Self {
+                which_returns: Default::default(),
+                run_returns: Default::default(),
+            }
+        }
+        fn with_which(mut self, prog: &str, path: Option<&str>) -> Self {
+            self.which_returns
+                .insert(prog.to_string(), path.map(std::path::PathBuf::from));
+            self
+        }
+        fn with_run(mut self, prog: &str, args: &[&str], result: RunResult) -> Self {
+            self.run_returns.insert(
+                (
+                    prog.to_string(),
+                    args.iter().map(|s| s.to_string()).collect(),
+                ),
+                result,
+            );
+            self
+        }
+    }
+
+    impl CommandRunner for FakeRunner {
+        fn run(&self, program: &str, args: &[&str]) -> std::io::Result<RunResult> {
+            let key = (
+                program.to_string(),
+                args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            );
+            self.run_returns
+                .get(&key)
+                .map(|r| RunResult {
+                    status_success: r.status_success,
+                    stdout: r.stdout.clone(),
+                    stderr: r.stderr.clone(),
+                })
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("fake runner has no entry for {program} {args:?}"),
+                    )
+                })
+        }
+        fn which(&self, program: &str) -> Option<std::path::PathBuf> {
+            self.which_returns.get(program).cloned().flatten()
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn hardware_backend_cuda_capability_admitted_when_libcuda_present() {
+        let runner = FakeRunner::new()
+            .with_which("dpkg", Some("/usr/bin/dpkg"))
+            .with_run(
+                "dpkg-query",
+                &["-S", "libcuda.so*"],
+                RunResult {
+                    status_success: true,
+                    stdout: "libcuda1: /usr/lib/x86_64-linux-gnu/libcuda.so.1\n".into(),
+                    stderr: String::new(),
+                },
+            )
+            .with_run(
+                "dpkg",
+                &["--verify", "libcuda1"],
+                RunResult { status_success: true, stdout: String::new(), stderr: String::new() },
+            );
+
+        let mut caps = CapabilityMap::new();
+        caps.set("hardware_class", CapabilityValue::Text("cuda".into()));
+        caps.set(
+            "native_deps",
+            CapabilityValue::List(vec![CapabilityValue::Map({
+                let mut m = std::collections::BTreeMap::new();
+                m.insert("name".to_string(), CapabilityValue::Text("cuda".into()));
+                m.insert("version_constraint".to_string(), CapabilityValue::Text(">=12.0".into()));
+                m
+            })]),
+        );
+        let entry = entry_with_caps(caps);
+
+        let mut policy = HostPolicy::default();
+        policy.available_hardware.push("cuda".into());
+
+        let verdict = check_with(&entry, &policy, &VendorTable::default(), &runner);
+        assert!(matches!(verdict, CapabilityVerdict::Admitted), "got: {verdict:?}");
+    }
+
+    #[test]
+    fn hardware_backend_cuda_capability_denied_when_hardware_class_not_in_policy() {
+        let mut caps = CapabilityMap::new();
+        caps.set("hardware_class", CapabilityValue::Text("cuda".into()));
+        let entry = entry_with_caps(caps);
+        let mut policy = HostPolicy::default();
+        policy.available_hardware.push("cpu".into());
+        match check(&entry, &policy, &VendorTable::default()) {
+            CapabilityVerdict::Denied { reason } => assert!(reason.contains("cuda")),
+            other => panic!("expected Denied, got {other:?}"),
         }
     }
 }

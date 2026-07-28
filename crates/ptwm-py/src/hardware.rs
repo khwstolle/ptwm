@@ -21,6 +21,7 @@
 
 use std::os::raw::{c_int, c_void};
 
+use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::{PyCapsule, PyCapsuleMethods, PyDict};
 
@@ -246,6 +247,78 @@ fn extract_device_ptr(capsule: &Bound<'_, PyAny>) -> PyResult<(u64, i32, usize)>
 }
 
 // ---------------------------------------------------------------------------
+// Buffer-protocol fallback: plain `bytes` / `bytearray` inputs
+// ---------------------------------------------------------------------------
+
+/// Either a DLPack capsule (produced by `tensor.__dlpack__()`) or a plain
+/// buffer-protocol object (`bytes`, `bytearray`, ...), resolved once and
+/// kept alive for the duration of the dispatch call.
+///
+/// `resolve_input` picks the variant based on whether the Python object
+/// exposes `__dlpack__`; real `torch.Tensor` arguments always do, so the
+/// DLPack path is unchanged for them. Plain `bytes`/`bytearray` do not, so
+/// they fall back to `Buffer`, which reads/writes the host memory the
+/// buffer protocol exposes directly. This lets a CPU-only caller (this
+/// crate's own interop tests, and any other host-memory caller) exercise a
+/// `hardware_backend` contribution without constructing a fake CUDA-shaped
+/// DLPack tensor; a `hardware_class = "cpu"` contribution such as
+/// `ref_hardware_backend` treats its "device" pointers as ordinary host
+/// pointers already (see that crate's own doc comments), so passing a host
+/// pointer through this path is exactly what such a contribution expects.
+enum InputHandle<'py> {
+    Dlpack(Bound<'py, PyAny>),
+    Buffer(PyBuffer<u8>),
+}
+
+impl InputHandle<'_> {
+    /// Returns `(pointer, device_ordinal, byte_len)`. `device_ordinal` is
+    /// `None` for the buffer-protocol fallback, which carries no device
+    /// information; callers must skip the device-ordinal-agreement check
+    /// in that case rather than treat `None` as a mismatch.
+    fn ptr_len_ordinal(&self) -> PyResult<(u64, Option<i32>, usize)> {
+        match self {
+            InputHandle::Dlpack(capsule) => {
+                let (ptr, ordinal, len) = extract_device_ptr(capsule)?;
+                Ok((ptr, Some(ordinal), len))
+            }
+            InputHandle::Buffer(buf) => Ok((buf.buf_ptr() as u64, None, buf.len_bytes())),
+        }
+    }
+}
+
+/// Resolve one `compressed`/`out` argument to an [`InputHandle`].
+///
+/// `dlpack_kwargs` is only used on the DLPack branch (`stream=` has no
+/// meaning for a plain host buffer). `require_writable` rejects a
+/// read-only buffer on the fallback branch; the DLPack branch has no
+/// equivalent read-only concept at this layer; a decode into a read-only
+/// tensor's backing memory is between the caller and whatever `torch`
+/// enforces, unchanged from before this fallback was added.
+fn resolve_input<'py>(
+    obj: &Bound<'py, PyAny>,
+    dlpack_kwargs: &Bound<'py, PyDict>,
+    role: &str,
+    require_writable: bool,
+) -> PyResult<InputHandle<'py>> {
+    if obj.hasattr("__dlpack__")? {
+        let capsule = obj.call_method("__dlpack__", (), Some(dlpack_kwargs))?;
+        return Ok(InputHandle::Dlpack(capsule));
+    }
+
+    let buf = PyBuffer::<u8>::get(obj)?;
+    if !buf.is_c_contiguous() {
+        return Err(to_pyerr(format!("{role}: buffer must be C-contiguous")));
+    }
+    if require_writable && buf.readonly() {
+        return Err(to_pyerr(format!(
+            "{role}: buffer-protocol fallback requires a writable buffer \
+             (e.g. bytearray), got a read-only buffer"
+        )));
+    }
+    Ok(InputHandle::Buffer(buf))
+}
+
+// ---------------------------------------------------------------------------
 // PyO3-visible functions
 // ---------------------------------------------------------------------------
 
@@ -271,15 +344,25 @@ pub fn hardware_backend_cuda_stream_handle(
 /// Dispatch a CUDA decode through `canonical_id`'s `hardware_backend`
 /// contribution.
 ///
-/// `compressed` and `out` are `torch.Tensor` objects already resident on
-/// the CUDA device identified by `device_ordinal`; both must be
-/// contiguous. `device_ordinal` is an explicit, caller-supplied parameter
-/// rather than something inferred from the tensors: `cuda_stream_handle`
-/// needs a device ordinal before any tensor has been inspected (there is
-/// no tensor yet to peek a `.device.index` from at that point), and v1 of
-/// this design is documented as single-GPU, so requiring the caller to
-/// state the device explicitly is simpler than reaching into tensor
-/// internals and keeps behavior visible rather than silently inferred.
+/// `compressed` and `out` are ordinarily `torch.Tensor` objects already
+/// resident on the CUDA device identified by `device_ordinal`; both must
+/// be contiguous, and are read via `__dlpack__()`. As a fallback, an
+/// object without `__dlpack__` (plain `bytes`/`bytearray`) is accepted
+/// too, read/written directly through the buffer protocol instead: see
+/// [`resolve_input`]. This exists so a `hardware_class = "cpu"`
+/// contribution can be exercised from Python without constructing a fake
+/// CUDA-shaped DLPack tensor or requiring `torch`; a real CUDA tensor
+/// still goes through `__dlpack__` exactly as before. `device_ordinal` is
+/// an explicit, caller-supplied parameter rather than something inferred
+/// from the tensors: `cuda_stream_handle` needs a device ordinal before
+/// any tensor has been inspected (there is no tensor yet to peek a
+/// `.device.index` from at that point), and v1 of this design is
+/// documented as single-GPU, so requiring the caller to state the device
+/// explicitly is simpler than reaching into tensor internals and keeps
+/// behavior visible rather than silently inferred. The device-ordinal
+/// agreement check below only applies when both arguments went through
+/// the DLPack branch; the buffer-protocol fallback carries no device
+/// information to check against.
 #[pyfunction]
 #[pyo3(signature = (
     canonical_id,
@@ -312,22 +395,26 @@ pub fn hardware_backend_dispatch_decode_cuda<'py>(
 
     let dlpack_kwargs = PyDict::new(py);
     dlpack_kwargs.set_item("stream", stream)?;
-    let compressed_capsule = compressed.call_method("__dlpack__", (), Some(&dlpack_kwargs))?;
-    let out_capsule = out.call_method("__dlpack__", (), Some(&dlpack_kwargs))?;
+    let compressed_handle = resolve_input(compressed, &dlpack_kwargs, "compressed", false)?;
+    let out_handle = resolve_input(out, &dlpack_kwargs, "out", true)?;
 
-    let (in_dev_ptr, in_ordinal, in_len) = extract_device_ptr(&compressed_capsule)?;
-    let (out_dev_ptr, out_ordinal, out_len) = extract_device_ptr(&out_capsule)?;
+    let (in_dev_ptr, in_ordinal, in_len) = compressed_handle.ptr_len_ordinal()?;
+    let (out_dev_ptr, out_ordinal, out_len) = out_handle.ptr_len_ordinal()?;
 
     // Both tensors' own DLPack device ordinals must agree with the
     // caller-supplied `device_ordinal` used to acquire the stream above;
     // a mismatch means the stream and the tensor memory belong to
     // different devices, which would silently corrupt the decode rather
-    // than fail loudly.
-    if in_ordinal != device_ordinal as i32 || out_ordinal != device_ordinal as i32 {
-        return Err(to_pyerr(format!(
-            "device_ordinal mismatch: caller supplied {device_ordinal}, but compressed \
-             tensor reports device {in_ordinal} and out tensor reports device {out_ordinal}"
-        )));
+    // than fail loudly. Neither ordinal is known on the buffer-protocol
+    // fallback branch (`None`), so the check is skipped there rather than
+    // treated as a mismatch.
+    if let (Some(in_ordinal), Some(out_ordinal)) = (in_ordinal, out_ordinal) {
+        if in_ordinal != device_ordinal as i32 || out_ordinal != device_ordinal as i32 {
+            return Err(to_pyerr(format!(
+                "device_ordinal mismatch: caller supplied {device_ordinal}, but compressed \
+                 tensor reports device {in_ordinal} and out tensor reports device {out_ordinal}"
+            )));
+        }
     }
 
     py.allow_threads(|| {

@@ -205,4 +205,3 @@ fn concurrent_first_access_resolves_exactly_once_and_all_threads_succeed() {
         h.join().expect("thread panicked");
     }
 }
-

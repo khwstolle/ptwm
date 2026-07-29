@@ -121,9 +121,7 @@ def _build_rust_native(cwd: Path, release: bool) -> Path:
     sub = "release" if release else "debug"
     out_dir = cwd / "target" / sub
     try:
-        src = next(
-            p for pattern in ("*.so", "*.dylib") for p in out_dir.glob(pattern)
-        )
+        src = next(p for pattern in ("*.so", "*.dylib") for p in out_dir.glob(pattern))
     except StopIteration as e:
         msg = f"no native .so/.dylib produced under {out_dir}"
         raise BuildError(msg) from e

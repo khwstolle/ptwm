@@ -39,7 +39,9 @@ REF_DIR = Path(__file__).parents[3] / "extensions" / "ref_hardware_backend" / "r
 REF_SO_CANDIDATES = list((REF_DIR / "target" / "release").glob("*.so")) + list(
     (REF_DIR / "target" / "release").glob("*.dylib")
 )
-CANONICAL_ID = "blake3:" + "00" * 32  # matches ref_hardware_backend/rust/manifest.toml's id
+CANONICAL_ID = (
+    "blake3:" + "00" * 32
+)  # matches ref_hardware_backend/rust/manifest.toml's id
 
 
 @pytest.fixture
@@ -58,7 +60,9 @@ def _cpu_policy(tmp_path: Path):
 
 
 @pytest.mark.interop
-@pytest.mark.skipif(not REF_SO_CANDIDATES, reason="ref_hardware_backend native .so not built")
+@pytest.mark.skipif(
+    not REF_SO_CANDIDATES, reason="ref_hardware_backend native .so not built"
+)
 def test_hardware_backend_cpu_passthrough_round_trip(isolated_extensions: Path) -> None:
     from ptwm._rust.ext import ext_install
     from ptwm._rust.hardware import (
@@ -69,7 +73,9 @@ def test_hardware_backend_cpu_passthrough_round_trip(isolated_extensions: Path) 
     src = isolated_extensions / "src"
     src.mkdir(parents=True, exist_ok=True)
     shutil.copy(REF_DIR / "manifest.toml", src / "manifest.toml")
-    shutil.copy(REF_SO_CANDIDATES[0], src / f"ref-hardware-backend{REF_SO_CANDIDATES[0].suffix}")
+    shutil.copy(
+        REF_SO_CANDIDATES[0], src / f"ref-hardware-backend{REF_SO_CANDIDATES[0].suffix}"
+    )
 
     bundle_dir = ext_install(str(src))
     assert bundle_dir
@@ -94,8 +100,12 @@ def test_hardware_backend_cpu_passthrough_round_trip(isolated_extensions: Path) 
 
 
 @pytest.mark.interop
-@pytest.mark.skipif(not REF_SO_CANDIDATES, reason="ref_hardware_backend native .so not built")
-def test_hardware_backend_unknown_canonical_id_raises(isolated_extensions: Path) -> None:
+@pytest.mark.skipif(
+    not REF_SO_CANDIDATES, reason="ref_hardware_backend native .so not built"
+)
+def test_hardware_backend_unknown_canonical_id_raises(
+    isolated_extensions: Path,
+) -> None:
     from ptwm._rust.hardware import hardware_backend_cuda_stream_handle
 
     # No policy needed: an unknown canonical id is rejected by

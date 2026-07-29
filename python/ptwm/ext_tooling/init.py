@@ -35,7 +35,9 @@ def init_extension(
     # doesn't fit that shape (e.g. delta_scheme's two-buffer base+target /
     # base+delta signature) — see `_templates/rust/_kind_delta_scheme/`.
     kind_template_dir = _TEMPLATES_DIR / lang / f"_kind_{kind}"
-    template_dir = kind_template_dir if kind_template_dir.is_dir() else _TEMPLATES_DIR / lang
+    template_dir = (
+        kind_template_dir if kind_template_dir.is_dir() else _TEMPLATES_DIR / lang
+    )
     if not template_dir.is_dir():
         msg = f"template not found: {template_dir}"
         raise FileNotFoundError(msg)

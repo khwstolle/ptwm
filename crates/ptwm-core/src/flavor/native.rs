@@ -219,14 +219,16 @@ impl NativeExtension {
                 }
             }
             Kind::HardwareBackend => {
-                symbols.hardware_backend_v1_cuda_stream_handle = resolve::<HardwareBackendCudaStreamHandleFn>(
-                    &library,
-                    b"ptwm_hardware_backend_v1_cuda_stream_handle\0",
-                );
-                symbols.hardware_backend_v1_dispatch_decode_cuda = resolve::<HardwareBackendCudaDispatchDecodeFn>(
-                    &library,
-                    b"ptwm_hardware_backend_v1_dispatch_decode_cuda\0",
-                );
+                symbols.hardware_backend_v1_cuda_stream_handle =
+                    resolve::<HardwareBackendCudaStreamHandleFn>(
+                        &library,
+                        b"ptwm_hardware_backend_v1_cuda_stream_handle\0",
+                    );
+                symbols.hardware_backend_v1_dispatch_decode_cuda =
+                    resolve::<HardwareBackendCudaDispatchDecodeFn>(
+                        &library,
+                        b"ptwm_hardware_backend_v1_dispatch_decode_cuda\0",
+                    );
                 if symbols.hardware_backend_v1_cuda_stream_handle.is_none()
                     || symbols.hardware_backend_v1_dispatch_decode_cuda.is_none()
                 {
@@ -402,11 +404,12 @@ impl NativeExtension {
         &self,
         device_ordinal: u32,
     ) -> Result<u64, CodecError> {
-        let f = self.symbols.hardware_backend_v1_cuda_stream_handle.ok_or(
-            CodecError::Unsupported {
-                feature: "hardware_backend_v1_cuda_stream_handle not present".into(),
-            },
-        )?;
+        let f =
+            self.symbols
+                .hardware_backend_v1_cuda_stream_handle
+                .ok_or(CodecError::Unsupported {
+                    feature: "hardware_backend_v1_cuda_stream_handle not present".into(),
+                })?;
         let handle = unsafe { f(device_ordinal) };
         if handle == 0 {
             return Err(CodecError::Unsupported {
@@ -429,11 +432,12 @@ impl NativeExtension {
         out_len: usize,
         device_ordinal: u32,
     ) -> Result<usize, CodecError> {
-        let f = self.symbols.hardware_backend_v1_dispatch_decode_cuda.ok_or(
-            CodecError::Unsupported {
+        let f = self
+            .symbols
+            .hardware_backend_v1_dispatch_decode_cuda
+            .ok_or(CodecError::Unsupported {
                 feature: "hardware_backend_v1_dispatch_decode_cuda not present".into(),
-            },
-        )?;
+            })?;
         let codec_id_bytes = codec_id.as_bytes();
         let rc = unsafe {
             f(

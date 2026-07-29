@@ -361,7 +361,11 @@ mod tests {
             .with_run(
                 "dpkg",
                 &["--verify", "libcuda1"],
-                RunResult { status_success: true, stdout: String::new(), stderr: String::new() },
+                RunResult {
+                    status_success: true,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
             );
 
         let mut caps = CapabilityMap::new();
@@ -371,7 +375,10 @@ mod tests {
             CapabilityValue::List(vec![CapabilityValue::Map({
                 let mut m = std::collections::BTreeMap::new();
                 m.insert("name".to_string(), CapabilityValue::Text("cuda".into()));
-                m.insert("version_constraint".to_string(), CapabilityValue::Text(">=12.0".into()));
+                m.insert(
+                    "version_constraint".to_string(),
+                    CapabilityValue::Text(">=12.0".into()),
+                );
                 m
             })]),
         );
@@ -381,7 +388,10 @@ mod tests {
         policy.available_hardware.push("cuda".into());
 
         let verdict = check_with(&entry, &policy, &VendorTable::default(), &runner);
-        assert!(matches!(verdict, CapabilityVerdict::Admitted), "got: {verdict:?}");
+        assert!(
+            matches!(verdict, CapabilityVerdict::Admitted),
+            "got: {verdict:?}"
+        );
     }
 
     #[test]

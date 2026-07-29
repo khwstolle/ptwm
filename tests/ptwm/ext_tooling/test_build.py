@@ -146,4 +146,3 @@ def test_build_rust_native_uses_plain_cargo_without_cuda_oxide(tmp_path: Path) -
         build_extension(tmp_path, release=True, flavor="native")
     cmd = runner.call_args.args[0]
     assert cmd[:2] == ["cargo", "build"], f"got: {cmd}"
-

@@ -41,8 +41,10 @@ impl CanonicalId {
         }
         let mut out = [0u8; 32];
         for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
-            let hi = hex_nibble(chunk[0]).ok_or_else(|| super::ExtensionError::InvalidRef(s.to_string()))?;
-            let lo = hex_nibble(chunk[1]).ok_or_else(|| super::ExtensionError::InvalidRef(s.to_string()))?;
+            let hi = hex_nibble(chunk[0])
+                .ok_or_else(|| super::ExtensionError::InvalidRef(s.to_string()))?;
+            let lo = hex_nibble(chunk[1])
+                .ok_or_else(|| super::ExtensionError::InvalidRef(s.to_string()))?;
             out[i] = (hi << 4) | lo;
         }
         Ok(Self(out))

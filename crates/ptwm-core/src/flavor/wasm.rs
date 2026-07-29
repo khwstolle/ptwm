@@ -1085,8 +1085,7 @@ mod tests {
         let mut store2 = ext.make_store(&HostPolicy::default()).unwrap();
         let inst2 = ext.instantiate(&mut store2).unwrap();
         let mut recon = vec![0u8; 64];
-        let m =
-            invoke_delta_scheme_decode(&inst2, &mut store2, base, &delta, &mut recon).unwrap();
+        let m = invoke_delta_scheme_decode(&inst2, &mut store2, base, &delta, &mut recon).unwrap();
         assert_eq!(&recon[..m], target);
     }
 }

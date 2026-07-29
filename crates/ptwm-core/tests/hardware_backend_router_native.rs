@@ -177,7 +177,7 @@ fn concurrent_first_access_resolves_exactly_once_and_all_threads_succeed() {
     let handles: Vec<_> = (0..16)
         .map(|i| {
             let router = std::sync::Arc::clone(&router);
-            let id = canonical_id.clone();
+            let id = canonical_id;
             std::thread::spawn(move || {
                 let backend = router
                     .get(&id)

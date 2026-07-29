@@ -6,7 +6,7 @@
 use crate::extension::{ExtensionTableEntry, capability::CapabilityValue};
 
 use super::native_deps::{
-    CommandRunner, NativeDep, NativeDepVerdict, RealCommandRunner, RunResult, VendorTable,
+    CommandRunner, NativeDep, NativeDepVerdict, RealCommandRunner, VendorTable,
     verify_native_dep_with,
 };
 
@@ -180,6 +180,7 @@ fn parse_native_dep(value: &CapabilityValue) -> Option<NativeDep> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::native_deps::RunResult;
     use super::*;
     use crate::extension::{
         Attestation, CanonicalId, CapabilityMap, ExtensionTableEntry, Kind, Lifecycle,

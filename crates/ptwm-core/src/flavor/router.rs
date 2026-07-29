@@ -469,6 +469,7 @@ impl DeltaSchemeRouter {
 /// Provides two methods: `dispatch_decode_cuda` for decoding on CUDA devices,
 /// and `cuda_stream_handle` to acquire a stream for a given device ordinal.
 pub trait DispatchedHardwareBackendCuda: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_decode_cuda(
         &self,
         state_bytes: &[u8],
@@ -488,6 +489,7 @@ struct NativeHardwareBackendCudaAdapter {
 }
 
 impl DispatchedHardwareBackendCuda for NativeHardwareBackendCudaAdapter {
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_decode_cuda(
         &self,
         state_bytes: &[u8],

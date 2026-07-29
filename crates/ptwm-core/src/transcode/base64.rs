@@ -45,7 +45,7 @@ fn decode_char(c: u8) -> Option<u32> {
 /// malformed input (bad characters, wrong length, misplaced padding).
 pub fn decode(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);

@@ -213,7 +213,7 @@ fn extract_device_ptr(capsule: &Bound<'_, PyAny>) -> PyResult<(u64, i32, usize)>
     }
 
     let elem_bits = dl_tensor.dtype.bits as u64 * dl_tensor.dtype.lanes as u64;
-    if elem_bits == 0 || elem_bits % 8 != 0 {
+    if elem_bits == 0 || !elem_bits.is_multiple_of(8) {
         return Err(to_pyerr(format!(
             "unsupported DLPack dtype: bits={} lanes={} does not divide evenly into bytes",
             dl_tensor.dtype.bits, dl_tensor.dtype.lanes

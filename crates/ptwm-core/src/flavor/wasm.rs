@@ -99,9 +99,7 @@ impl WasmExtension {
             Some(CapabilityValue::Float(f)) if f.0 > 0.0 => {
                 (f.0 * DEFAULT_MEM_LIMIT as f64) as usize
             }
-            Some(CapabilityValue::Int(i)) if *i > 0 => {
-                (*i as usize) * DEFAULT_MEM_LIMIT
-            }
+            Some(CapabilityValue::Int(i)) if *i > 0 => (*i as usize) * DEFAULT_MEM_LIMIT,
             _ => DEFAULT_MEM_LIMIT,
         };
 

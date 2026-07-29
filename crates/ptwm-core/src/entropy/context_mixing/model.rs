@@ -133,7 +133,7 @@ mod tests {
         for &byte in data {
             let mut c0: u32 = 1;
             for i in (0..8).rev() {
-                let bit = ((byte >> i) & 1) as u8;
+                let bit = (byte >> i) & 1;
                 let preds = models.predict(c0);
                 out.push(preds[0]);
                 models.update(c0, bit);

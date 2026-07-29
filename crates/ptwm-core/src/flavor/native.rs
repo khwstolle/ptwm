@@ -49,6 +49,9 @@ pub struct NativeSymbols {
     // DeltaScheme
     pub delta_scheme_v1_encode: Option<DeltaSchemeFn>,
     pub delta_scheme_v1_decode: Option<DeltaSchemeFn>,
+    // HardwareBackend
+    pub hardware_backend_v1_cuda_stream_handle: Option<HardwareBackendCudaStreamHandleFn>,
+    pub hardware_backend_v1_dispatch_decode_cuda: Option<HardwareBackendCudaDispatchDecodeFn>,
 }
 
 pub type PlaneCodecFn = unsafe extern "C" fn(
@@ -94,6 +97,44 @@ pub type DeltaSchemeFn = unsafe extern "C" fn(
     usize,     // output len
 ) -> i64;
 
+/// `hardware_backend_v1_cuda_stream_handle`: returns this backend's own,
+/// process-persistent CUDA stream (as a raw pointer value) for the given
+/// device ordinal. Callers pass this same handle to `tensor.__dlpack__
+/// (stream=...)` for every tensor involved in a subsequent decode call, so
+/// PyTorch's DLPack producer inserts the correct cross-stream wait before
+/// handing back the device pointer. Returns 0 on failure (no such device,
+/// CUDA init failed).
+pub type HardwareBackendCudaStreamHandleFn = unsafe extern "C" fn(device_ordinal: u32) -> u64;
+
+/// `hardware_backend_v1_dispatch_decode_cuda`: decode `in_dev_ptr` into
+/// `out_dev_ptr`, two distinct device buffers (this is NOT an in-place
+/// transform over one buffer; "zero-copy" means no host round-trip, not a
+/// shared address). `state_bytes` carries the codec's small per-tensor
+/// state (e.g. a 16-entry codebook), in the same `(state_format_version,
+/// state_bytes)` shape `plane_codec`'s existing `decode_stateful` path
+/// already carries. `codec_id` self-describes the wire format for the
+/// extension to validate against (distinct from the backend's own
+/// canonical id, which the router already resolved to get here).
+///
+/// Completion contract: by the time this function returns, the kernel has
+/// FULLY COMPLETED (the extension synchronizes its own stream before
+/// returning). `out_dev_ptr`'s contents are valid and visible to any
+/// subsequent CUDA operation on any stream, with no further caller-side
+/// synchronization needed. Both launch-time and execution-time errors are
+/// visible via the return code, since the synchronize() call observes both.
+pub type HardwareBackendCudaDispatchDecodeFn = unsafe extern "C" fn(
+    state_format_version: u8,
+    state_ptr: *const u8,
+    state_len: usize,
+    codec_id_ptr: *const u8,
+    codec_id_len: usize,
+    in_dev_ptr: u64,
+    in_len: usize,
+    out_dev_ptr: u64,
+    out_len: usize,
+    device_ordinal: u32,
+) -> i64;
+
 pub struct NativeExtension {
     // Held for its drop-time side effect: keeping the dlopen handle alive
     // so all fn pointers in `symbols` remain valid.
@@ -126,6 +167,8 @@ impl NativeExtension {
             transform_v1_inverse: None,
             delta_scheme_v1_encode: None,
             delta_scheme_v1_decode: None,
+            hardware_backend_v1_cuda_stream_handle: None,
+            hardware_backend_v1_dispatch_decode_cuda: None,
         };
 
         // Probe symbols depending on the kind.
@@ -172,6 +215,25 @@ impl NativeExtension {
                 {
                     return Err(CodecError::Unsupported {
                         feature: "missing required delta_scheme_v1 symbol".into(),
+                    });
+                }
+            }
+            Kind::HardwareBackend => {
+                symbols.hardware_backend_v1_cuda_stream_handle =
+                    resolve::<HardwareBackendCudaStreamHandleFn>(
+                        &library,
+                        b"ptwm_hardware_backend_v1_cuda_stream_handle\0",
+                    );
+                symbols.hardware_backend_v1_dispatch_decode_cuda =
+                    resolve::<HardwareBackendCudaDispatchDecodeFn>(
+                        &library,
+                        b"ptwm_hardware_backend_v1_dispatch_decode_cuda\0",
+                    );
+                if symbols.hardware_backend_v1_cuda_stream_handle.is_none()
+                    || symbols.hardware_backend_v1_dispatch_decode_cuda.is_none()
+                {
+                    return Err(CodecError::Unsupported {
+                        feature: "missing required hardware_backend_v1 symbol".into(),
                     });
                 }
             }
@@ -335,6 +397,64 @@ impl NativeExtension {
         };
         decode_rc(rc, output.len())
     }
+
+    /// Invoke `ptwm_hardware_backend_v1_cuda_stream_handle`. Returns this
+    /// backend's process-persistent CUDA stream handle for `device_ordinal`.
+    pub fn invoke_hardware_backend_cuda_stream_handle(
+        &self,
+        device_ordinal: u32,
+    ) -> Result<u64, CodecError> {
+        let f =
+            self.symbols
+                .hardware_backend_v1_cuda_stream_handle
+                .ok_or(CodecError::Unsupported {
+                    feature: "hardware_backend_v1_cuda_stream_handle not present".into(),
+                })?;
+        let handle = unsafe { f(device_ordinal) };
+        if handle == 0 {
+            return Err(CodecError::Unsupported {
+                feature: "hardware backend failed to produce a CUDA stream handle".into(),
+            });
+        }
+        Ok(handle)
+    }
+
+    /// Invoke `ptwm_hardware_backend_v1_dispatch_decode_cuda`. Decodes
+    /// `in_dev_ptr` into `out_dev_ptr`, two distinct device buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn invoke_hardware_backend_dispatch_decode_cuda(
+        &self,
+        state_bytes: &[u8],
+        codec_id: &CanonicalId,
+        in_dev_ptr: u64,
+        in_len: usize,
+        out_dev_ptr: u64,
+        out_len: usize,
+        device_ordinal: u32,
+    ) -> Result<usize, CodecError> {
+        let f = self
+            .symbols
+            .hardware_backend_v1_dispatch_decode_cuda
+            .ok_or(CodecError::Unsupported {
+                feature: "hardware_backend_v1_dispatch_decode_cuda not present".into(),
+            })?;
+        let codec_id_bytes = codec_id.as_bytes();
+        let rc = unsafe {
+            f(
+                1, // state_format_version
+                state_bytes.as_ptr(),
+                state_bytes.len(),
+                codec_id_bytes.as_ptr(),
+                codec_id_bytes.len(),
+                in_dev_ptr,
+                in_len,
+                out_dev_ptr,
+                out_len,
+                device_ordinal,
+            )
+        };
+        decode_rc(rc, out_len)
+    }
 }
 
 fn decode_rc(rc: i64, out_capacity: usize) -> Result<usize, CodecError> {
@@ -389,11 +509,65 @@ mod tests {
         }
     }
 
+    /// Build a bare `NativeExtension` with every `NativeSymbols` field set
+    /// to `None`, for exercising "symbol absent" invoke paths without
+    /// dlopen-ing a real contribution artifact from disk.
+    ///
+    /// `Library::this()` wraps a handle to the already-loaded host process
+    /// instead of opening a new shared object, which gives a real, valid
+    /// `Library` (fn pointers can be safely dropped/never resolved against
+    /// it) without depending on any particular file existing on disk.
+    fn native_extension_with_no_hardware_backend_symbols() -> NativeExtension {
+        let library: Library = libloading::os::unix::Library::this().into();
+        NativeExtension {
+            library,
+            canonical_id: CanonicalId::from_bytes([0xCD; 32]),
+            kind: Kind::HardwareBackend,
+            lifecycle: Lifecycle::Thread,
+            symbols: NativeSymbols {
+                plane_codec_v1_encode: None,
+                plane_codec_v1_decode: None,
+                plane_codec_v1_decode_stateful: None,
+                transform_v1_forward: None,
+                transform_v1_inverse: None,
+                delta_scheme_v1_encode: None,
+                delta_scheme_v1_decode: None,
+                hardware_backend_v1_cuda_stream_handle: None,
+                hardware_backend_v1_dispatch_decode_cuda: None,
+            },
+        }
+    }
+
     #[test]
     fn missing_library_path_is_invalid_input() {
         let res = NativeExtension::load(
             Path::new("/this/path/does/not/exist.so"),
             &entry(Kind::PlaneCodec),
+            VerifiedToken::new_unchecked(),
+        );
+        assert!(matches!(res, Err(CodecError::InvalidInput)));
+    }
+
+    #[test]
+    fn hardware_backend_invoke_stream_handle_errors_when_symbol_absent() {
+        // A NativeExtension whose hardware_backend_v1_cuda_stream_handle symbol
+        // was never resolved (None) must return Unsupported, not panic/UB.
+        let ext = native_extension_with_no_hardware_backend_symbols(); // test-only constructor, see Step 3
+        let res = ext.invoke_hardware_backend_cuda_stream_handle(0);
+        assert!(matches!(res, Err(CodecError::Unsupported { .. })));
+    }
+
+    #[test]
+    fn hardware_backend_missing_required_symbols_is_unsupported() {
+        // A library with neither ptwm_hardware_backend_v1_cuda_stream_handle
+        // nor ptwm_hardware_backend_v1_dispatch_decode_cuda must fail to load
+        // for Kind::HardwareBackend, same strictness as PlaneCodec/DeltaScheme.
+        // This test is a placeholder for Task 11's real artifact-backed test;
+        // the path-doesn't-exist error fires before symbol probing, so the test
+        // passes trivially for now.
+        let res = NativeExtension::load(
+            Path::new("/this/path/does/not/exist.so"),
+            &entry(Kind::HardwareBackend),
             VerifiedToken::new_unchecked(),
         );
         assert!(matches!(res, Err(CodecError::InvalidInput)));

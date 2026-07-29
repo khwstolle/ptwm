@@ -113,3 +113,36 @@ def test_build_raises_when_subprocess_fails(tmp_path: Path) -> None:
         run.return_value = proc
         with pytest.raises(BuildError, match="boom"):
             build_extension(tmp_path)
+
+
+def test_build_rust_native_uses_cargo_oxide_when_cuda_oxide_dependency_present(
+    tmp_path: Path,
+) -> None:
+    _write_manifest(tmp_path)
+    (tmp_path / "Cargo.toml").write_text(
+        '[package]\nname = "demo"\n\n[dependencies]\ncuda-oxide = "0.1"\n'
+    )
+    target_dir = tmp_path / "target" / "release"
+    target_dir.mkdir(parents=True)
+    (target_dir / "libdemo.so").write_bytes(b"\x7fELF fake")
+
+    with patch("ptwm.ext_tooling.build._run") as runner:
+        out = build_extension(tmp_path, release=True, flavor="native")
+    assert runner.call_count == 1
+    cmd = runner.call_args.args[0]
+    assert cmd[:3] == ["cargo", "oxide", "build"], f"got: {cmd}"
+    assert "--release" in cmd
+    assert out.name == "demo.so"
+
+
+def test_build_rust_native_uses_plain_cargo_without_cuda_oxide(tmp_path: Path) -> None:
+    _write_manifest(tmp_path)
+    (tmp_path / "Cargo.toml").write_text('[package]\nname = "demo"\n')
+    target_dir = tmp_path / "target" / "release"
+    target_dir.mkdir(parents=True)
+    (target_dir / "libdemo.so").write_bytes(b"\x7fELF fake")
+
+    with patch("ptwm.ext_tooling.build._run") as runner:
+        build_extension(tmp_path, release=True, flavor="native")
+    cmd = runner.call_args.args[0]
+    assert cmd[:2] == ["cargo", "build"], f"got: {cmd}"

@@ -97,11 +97,9 @@ impl WasmExtension {
         };
         let mem_limit = match entry.capabilities.get("mem_factor") {
             Some(CapabilityValue::Float(f)) if f.0 > 0.0 => {
-                ((f.0 * DEFAULT_MEM_LIMIT as f64) as usize).min(usize::MAX)
+                (f.0 * DEFAULT_MEM_LIMIT as f64) as usize
             }
-            Some(CapabilityValue::Int(i)) if *i > 0 => {
-                ((*i as usize) * DEFAULT_MEM_LIMIT).min(usize::MAX)
-            }
+            Some(CapabilityValue::Int(i)) if *i > 0 => (*i as usize) * DEFAULT_MEM_LIMIT,
             _ => DEFAULT_MEM_LIMIT,
         };
 
@@ -1085,8 +1083,7 @@ mod tests {
         let mut store2 = ext.make_store(&HostPolicy::default()).unwrap();
         let inst2 = ext.instantiate(&mut store2).unwrap();
         let mut recon = vec![0u8; 64];
-        let m =
-            invoke_delta_scheme_decode(&inst2, &mut store2, base, &delta, &mut recon).unwrap();
+        let m = invoke_delta_scheme_decode(&inst2, &mut store2, base, &delta, &mut recon).unwrap();
         assert_eq!(&recon[..m], target);
     }
 }

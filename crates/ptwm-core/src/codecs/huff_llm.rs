@@ -64,7 +64,7 @@ impl PlaneCodec for HuffLlm5Bit {
         _layout: &PlaneLayout,
     ) -> bool {
         // Skip tiny planes (three table headers don't amortize) and odd lengths.
-        plane.len() >= MIN_WORDS * 2 && plane.len() % 2 == 0
+        plane.len() >= MIN_WORDS * 2 && plane.len().is_multiple_of(2)
     }
 
     fn encode(
@@ -82,7 +82,7 @@ impl PlaneCodec for HuffLlm5Bit {
         // Empty or odd-length → raw store (still total). Short-circuit empty
         // before allocating `words`, since trial-encode hits this path on every
         // candidate.
-        if plane.is_empty() || plane.len() % 2 != 0 {
+        if plane.is_empty() || !plane.len().is_multiple_of(2) {
             return Ok(raw_store(plane));
         }
         let words: Vec<u16> = plane

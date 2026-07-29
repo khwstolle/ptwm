@@ -18,6 +18,7 @@ use ptwm_core::{PtwmCoreError, codec_tagged, delta, entropy};
 
 mod delta_scheme;
 mod ext;
+mod hardware;
 mod host_flavor;
 mod inspect;
 mod policy;
@@ -61,6 +62,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     ext::register(m)?;
     inspect::register(m)?;
     delta_scheme::register(m)?;
+    hardware::register(m)?;
     Ok(())
 }
 

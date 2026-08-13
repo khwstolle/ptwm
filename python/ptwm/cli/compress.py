@@ -129,6 +129,8 @@ def compress_file(
     threads: int | None = None,
     quiet: bool = False,
     codec_menu: list[CodecId] | None = None,
+    codec: str | None = None,
+    device: int | None = None,
 ) -> None:
     """Compress a single file."""
     from ptwm import (  # noqa: PLC0415
@@ -165,6 +167,8 @@ def compress_file(
             method=Method(method),
             threads=threads,
             codec_menu=codec_menu,
+            codec=codec,
+            device=device,
         )
     )
 
@@ -190,6 +194,10 @@ def compress_file(
                 test_buffer += compressed_chunk
 
     if verification:
+        # `device` is the compression-side ordinal already passed to
+        # CompressionConfig above; this round-trip check always decodes on
+        # CPU, so it is left unset on DecompressionConfig rather than
+        # passed through.
         decompressor = Decompressor(DecompressionConfig(threads=threads))
         if test:
             with full_path.open("rb") as f:
@@ -236,6 +244,8 @@ def compress_file_delta(
     is_streaming: bool = False,
     threads: int | None = None,
     codec_menu: list[CodecId] | None = None,
+    codec: str | None = None,
+    device: int | None = None,
 ) -> None:
     """Compress a file using delta compression."""
     from ptwm import (  # noqa: PLC0415
@@ -281,6 +291,8 @@ def compress_file_delta(
             method=Method(method),
             threads=threads,
             codec_menu=codec_menu,
+            codec=codec,
+            device=device,
         )
     )
 
@@ -289,6 +301,8 @@ def compress_file_delta(
     compressed_data = compressor.compress(file_data, delta_second_data=delta_file)
 
     if verification:
+        # `device` is not forwarded here either; see the note in
+        # `compress_file`.
         decompressor = Decompressor(
             DecompressionConfig(
                 delta_second_data=delta_path.read_bytes(),
@@ -328,6 +342,8 @@ def compress_safetensors_file(
     threads: int | None = None,
     quiet: bool = False,
     codec_menu: list[CodecId] | None = None,
+    codec: str | None = None,
+    device: int | None = None,
 ) -> None:
     """Compress a safetensors file."""
     import torch  # noqa: PLC0415
@@ -391,6 +407,8 @@ def compress_safetensors_file(
                         method=compression_method,
                         threads=threads,
                         codec_menu=codec_menu,
+                        codec=codec,
+                        device=device,
                     )
                 )
             compressor = compressor_cache[dtype_str]
@@ -447,6 +465,8 @@ def compress_path(
     threads: int | None = None,
     file_compression: bool = False,
     codec_menu: list[CodecId] | None = None,
+    codec: str | None = None,
+    device: int | None = None,
 ) -> None:
     """Compress all files with the given suffix in the specified path."""
     overwrite_first = True
@@ -541,10 +561,22 @@ def compress_path(
             threads,
             True,  # quiet
             codec_menu,
+            codec,
+            device,
         )
     else:
         compression_func = compress_safetensors_file
-        comp_args = (delete, True, hf_cache, method, threads, True, codec_menu)
+        comp_args = (
+            delete,
+            True,
+            hf_cache,
+            method,
+            threads,
+            True,
+            codec_menu,
+            codec,
+            device,
+        )
 
     failures: list[tuple[str, BaseException]] = []
     with ProcessPoolExecutor(max_workers=max_processes) as executor:
@@ -808,6 +840,19 @@ def add_compress_parser(subparsers):
             "Valid: identity, huffman, rans, zstd, per-group-codebook, "
             "order1-scale-ac. Ignored when --method selects a forced-codec path."
         ),
+    )
+    parser.add_argument(
+        "--codec",
+        default=None,
+        help="Select one codec explicitly, by name (e.g. zstd) or canonical id. "
+        "Skips the automatic per-plane codec search.",
+    )
+    parser.add_argument(
+        "--device",
+        type=int,
+        default=None,
+        help="CUDA device ordinal for GPU-resident codecs. Defaults to 0. "
+        "Must match the input tensor's device when that tensor is already on GPU.",
     )
     parser.add_argument(
         "--explore",
@@ -1109,6 +1154,8 @@ def handle_compress(args):
             threads=args.threads,
             file_compression=args.file_compression,
             codec_menu=codec_menu,
+            codec=args.codec,
+            device=args.device,
         )
     elif path.is_file():
         if args.delta:
@@ -1126,6 +1173,8 @@ def handle_compress(args):
                 is_streaming=args.is_streaming,
                 threads=args.threads,
                 codec_menu=codec_menu,
+                codec=args.codec,
+                device=args.device,
             )
         elif path.suffix == ".safetensors" and not args.file_compression:
             compress_safetensors_file(
@@ -1136,6 +1185,8 @@ def handle_compress(args):
                 method=args.method,
                 threads=args.threads,
                 codec_menu=codec_menu,
+                codec=args.codec,
+                device=args.device,
             )
         else:
             compress_file(
@@ -1151,6 +1202,8 @@ def handle_compress(args):
                 is_streaming=args.is_streaming,
                 threads=args.threads,
                 codec_menu=codec_menu,
+                codec=args.codec,
+                device=args.device,
             )
     elif args.hf_cache and args.model:
         compress_path(
@@ -1172,6 +1225,8 @@ def handle_compress(args):
             threads=args.threads,
             file_compression=args.file_compression,
             codec_menu=codec_menu,
+            codec=args.codec,
+            device=args.device,
         )
     else:
         print(  # noqa: T201

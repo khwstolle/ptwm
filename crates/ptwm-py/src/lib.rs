@@ -17,10 +17,12 @@ use ptwm_core::container::ContainerReader;
 use ptwm_core::{PtwmCoreError, codec_tagged, delta, entropy};
 
 mod delta_scheme;
+mod device_buffer;
 mod ext;
 mod hardware;
 mod host_flavor;
 mod inspect;
+mod plane_codec_cuda;
 mod policy;
 mod trust;
 
@@ -63,6 +65,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     inspect::register(m)?;
     delta_scheme::register(m)?;
     hardware::register(m)?;
+    plane_codec_cuda::register(m)?;
     Ok(())
 }
 

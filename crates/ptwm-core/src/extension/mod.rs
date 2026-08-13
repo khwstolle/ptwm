@@ -11,6 +11,7 @@ pub mod id;
 pub mod kind;
 pub mod lifecycle;
 pub mod manifest;
+pub mod resolve;
 pub mod table;
 
 pub use builder::ExtensionTableBuilder;
@@ -22,6 +23,7 @@ pub use id::{CanonicalId, ContributionRef};
 pub use kind::Kind;
 pub use lifecycle::Lifecycle;
 pub use manifest::{ContributionDecl, Manifest};
+pub use resolve::{ResolveError, resolve_codec_selector};
 pub use table::{Attestation, ExtensionTable, ExtensionTableEntry};
 
 /// Sentinel public key for in-tree built-ins. Built-ins are trusted by

@@ -19,6 +19,7 @@ def decompress_file(
     hf_cache: bool = False,
     threads: int | None = None,
     quiet: bool = False,
+    device: int | None = None,
 ) -> None:
     """Decompress a single file."""
     from ptwm import DecompressionConfig, Decompressor  # noqa: PLC0415
@@ -44,7 +45,7 @@ def decompress_file(
                 return
 
         output_file = decompressed_path
-        decompressor = Decompressor(DecompressionConfig(threads=threads))
+        decompressor = Decompressor(DecompressionConfig(threads=threads, device=device))
 
         with full_path.open("rb") as infile, output_file.open("wb") as outfile:
             chunk = infile.read()
@@ -74,6 +75,7 @@ def decompress_file_delta(
     force: bool = False,
     hf_cache: bool = False,
     threads: int | None = None,
+    device: int | None = None,
 ) -> None:
     """Decompress a file using delta compression."""
     from ptwm import DecompressionConfig, Decompressor  # noqa: PLC0415
@@ -113,6 +115,7 @@ def decompress_file_delta(
             DecompressionConfig(
                 delta_second_data=delta_path.read_bytes(),
                 threads=threads,
+                device=device,
             )
         )
 
@@ -142,6 +145,7 @@ def decompress_safetensors_file(
     hf_cache: bool = False,
     threads: int | None = None,
     quiet: bool = False,
+    device: int | None = None,
 ) -> None:
     """Decompress a safetensors file."""
     from safetensors import safe_open  # noqa: PLC0415
@@ -174,7 +178,7 @@ def decompress_safetensors_file(
             return
 
     tensors = {}
-    decompressor = Decompressor(DecompressionConfig(threads=threads))
+    decompressor = Decompressor(DecompressionConfig(threads=threads, device=device))
     with safe_open(filename, "pt", "cpu") as f:
         metadata_raw = f.metadata()
         compressed_metadata = get_compressed_tensors_metadata(metadata_raw)
@@ -218,6 +222,7 @@ def decompress_path(
     model: str = "",
     branch: str = "main",
     threads: int | None = None,
+    device: int | None = None,
 ) -> None:
     """Decompress every .ptwm file under ``path``."""
     overwrite_first = True
@@ -320,7 +325,9 @@ def decompress_path(
                 else decompress_file
             )
             future_to_file[
-                executor.submit(func, file, delete, True, hf_cache, threads, True)
+                executor.submit(
+                    func, file, delete, True, hf_cache, threads, True, device
+                )
             ] = file
 
         remaining_files = collections.deque(file_list[max_processes:])
@@ -338,7 +345,14 @@ def decompress_path(
                     )
                     future_to_file[
                         executor.submit(
-                            func, next_file, delete, True, hf_cache, threads, True
+                            func,
+                            next_file,
+                            delete,
+                            True,
+                            hf_cache,
+                            threads,
+                            True,
+                            device,
                         )
                     ] = next_file
 
@@ -369,6 +383,13 @@ def add_decompress_parser(subparsers):
         type=int,
         default=None,
         help="The amount of threads to be used.",
+    )
+    parser.add_argument(
+        "--device",
+        type=int,
+        default=None,
+        help="CUDA device ordinal for GPU-resident codecs. Defaults to 0. "
+        "Must match the input tensor's device when that tensor is already on GPU.",
     )
     parser.add_argument(
         "--max_processes",
@@ -434,6 +455,7 @@ def handle_decompress(args):
             model=args.model,
             branch=args.model_branch,
             threads=args.threads,
+            device=args.device,
         )
     elif path.is_file():
         if args.delta:
@@ -444,6 +466,7 @@ def handle_decompress(args):
                 force=args.force,
                 hf_cache=args.hf_cache,
                 threads=args.threads,
+                device=args.device,
             )
         elif path.name.endswith(".ptwm.safetensors"):
             decompress_safetensors_file(
@@ -452,6 +475,7 @@ def handle_decompress(args):
                 force=args.force,
                 hf_cache=args.hf_cache,
                 threads=args.threads,
+                device=args.device,
             )
         else:
             decompress_file(
@@ -460,6 +484,7 @@ def handle_decompress(args):
                 force=args.force,
                 hf_cache=args.hf_cache,
                 threads=args.threads,
+                device=args.device,
             )
     else:
         print(f"{RED}Error: Path '{path_str}' not found.{RESET}", file=sys.stderr)  # noqa: T201

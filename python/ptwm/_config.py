@@ -85,6 +85,8 @@ class CompressionConfig:
     falsify ablation measurements. Ignored when ``method`` selects a forced-
     codec path (ZSTD / RANS / IDENTITY).
     """
+    codec: str | None = None
+    device: int | None = None
 
     @classmethod
     def from_resolved_policy(
@@ -160,3 +162,5 @@ class DecompressionConfig:
     interrogated (e.g. listing tensor names).  When ``False`` (the default),
     opening such a container raises ``ValueError``.
     """
+    codec: str | None = None
+    device: int | None = None

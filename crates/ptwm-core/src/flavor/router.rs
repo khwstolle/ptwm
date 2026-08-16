@@ -707,6 +707,244 @@ impl HardwareBackendRouter {
     }
 }
 
+// ── PlaneCodec CUDA adapter ─────────────────────────────────────────────────
+
+/// A plane codec that operates on CUDA device pointers.
+///
+/// Distinct from [`DispatchedPlaneCodec`], whose buffers are host memory.
+/// Implementors move no data across the host boundary: both input and
+/// output stay device-resident.
+pub trait DispatchedPlaneCodecCuda: Send + Sync {
+    fn cuda_stream_handle(&self, device_ordinal: u32) -> u64;
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_cuda(
+        &self,
+        state_bytes: &[u8],
+        codec_id: &CanonicalId,
+        in_dev_ptr: u64,
+        in_len: usize,
+        out_dev_ptr: u64,
+        out_cap: usize,
+        device_ordinal: u32,
+    ) -> Result<usize, CodecError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_cuda(
+        &self,
+        state_bytes: &[u8],
+        codec_id: &CanonicalId,
+        in_dev_ptr: u64,
+        in_len: usize,
+        out_dev_ptr: u64,
+        out_cap: usize,
+        device_ordinal: u32,
+    ) -> Result<usize, CodecError>;
+}
+
+pub struct NativePlaneCodecCudaAdapter {
+    inner: Arc<NativeExtension>,
+}
+
+impl NativePlaneCodecCudaAdapter {
+    pub fn new(inner: Arc<NativeExtension>) -> Self {
+        Self { inner }
+    }
+}
+
+impl DispatchedPlaneCodecCuda for NativePlaneCodecCudaAdapter {
+    fn cuda_stream_handle(&self, device_ordinal: u32) -> u64 {
+        self.inner.plane_codec_cuda_stream_handle(device_ordinal)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_cuda(
+        &self,
+        state_bytes: &[u8],
+        codec_id: &CanonicalId,
+        in_dev_ptr: u64,
+        in_len: usize,
+        out_dev_ptr: u64,
+        out_cap: usize,
+        device_ordinal: u32,
+    ) -> Result<usize, CodecError> {
+        self.inner.invoke_plane_codec_encode_cuda(
+            state_bytes,
+            codec_id,
+            in_dev_ptr,
+            in_len,
+            out_dev_ptr,
+            out_cap,
+            device_ordinal,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_cuda(
+        &self,
+        state_bytes: &[u8],
+        codec_id: &CanonicalId,
+        in_dev_ptr: u64,
+        in_len: usize,
+        out_dev_ptr: u64,
+        out_cap: usize,
+        device_ordinal: u32,
+    ) -> Result<usize, CodecError> {
+        self.inner.invoke_plane_codec_decode_cuda(
+            state_bytes,
+            codec_id,
+            in_dev_ptr,
+            in_len,
+            out_dev_ptr,
+            out_cap,
+            device_ordinal,
+        )
+    }
+}
+
+/// Resolves a `CanonicalId` to a `Box<dyn DispatchedPlaneCodecCuda>`.
+///
+/// Same shape as [`HardwareBackendRouter`]: a `Mutex<HashMap<..>>` cache, the
+/// same `new` / `new_with_policy` constructor split, and the same
+/// `hardware_class`-presence precondition gated through [`check`] against
+/// `self.policy` before any native load is attempted. See
+/// [`HardwareBackendRouter::resolve`]'s doc comment for the full reasoning
+/// behind that precondition; it applies here unchanged.
+///
+/// It differs from [`HardwareBackendRouter`] in two ways. First, it caches
+/// `Arc<dyn DispatchedPlaneCodecCuda>` and constructs
+/// [`NativePlaneCodecCudaAdapter`] rather than
+/// `NativeHardwareBackendCudaAdapter`. Second, a `plane_codec` contribution
+/// that resolves to a real installed manifest entry but has no loadable
+/// native artifact reports a fixed, non-formatted message
+/// ("plane_codec CUDA dispatch requires the native flavor") rather than one
+/// naming the canonical id and bundle directory: a WASM contribution cannot
+/// hold device pointers (WASM's linear address space is 32-bit), so this
+/// router is native-only by construction, exactly like
+/// [`HardwareBackendRouter`].
+pub struct PlaneCodecCudaRouter {
+    installed: Vec<DiscoveredContribution>,
+    policy: HostPolicy,
+    cache: Mutex<HashMap<CanonicalId, Arc<dyn DispatchedPlaneCodecCuda>>>,
+}
+
+impl std::fmt::Debug for PlaneCodecCudaRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlaneCodecCudaRouter")
+            .field("installed_count", &self.installed.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PlaneCodecCudaRouter {
+    /// Create a new router with the given set of discovered installed
+    /// extensions, gated by the default (empty-`available_hardware`)
+    /// [`HostPolicy`]. Pass an empty `Vec` to get `Unsupported` for every
+    /// id (there are no built-in `plane_codec` CUDA contributions).
+    ///
+    /// As with [`HardwareBackendRouter::new`], this constructor's
+    /// default-deny behavior stays fixed for every existing caller: it
+    /// never admits a `hardware_class`-declaring contribution. A caller
+    /// that has independently confirmed CUDA availability on the host
+    /// uses [`Self::new_with_policy`] instead.
+    pub fn new(installed: Vec<DiscoveredContribution>) -> Self {
+        Self {
+            installed,
+            policy: HostPolicy::default(),
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Create a new router with the given set of discovered installed
+    /// extensions, gated by a caller-supplied [`HostPolicy`] instead of
+    /// the default.
+    pub fn new_with_policy(installed: Vec<DiscoveredContribution>, policy: HostPolicy) -> Self {
+        Self {
+            installed,
+            policy,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Resolve `canonical_id` to a `DispatchedPlaneCodecCuda`.
+    pub fn get(
+        &self,
+        canonical_id: &CanonicalId,
+    ) -> Result<Arc<dyn DispatchedPlaneCodecCuda>, CodecError> {
+        {
+            let cache = self.cache.lock().unwrap();
+            if let Some(codec) = cache.get(canonical_id) {
+                return Ok(Arc::clone(codec));
+            }
+        }
+
+        let codec = self.resolve(canonical_id)?;
+        let arc = Arc::from(codec);
+        {
+            let mut cache = self.cache.lock().unwrap();
+            cache.insert(*canonical_id, Arc::clone(&arc));
+        }
+        Ok(arc)
+    }
+
+    /// Look up `canonical_id`, gate it through a `hardware_class`
+    /// precondition and [`check`], and dlopen the native artifact if
+    /// admitted. Mirrors [`HardwareBackendRouter::resolve`] exactly up to
+    /// the native-load step; see that method's doc comment for why the
+    /// `hardware_class`-presence check runs before [`check`] itself.
+    fn resolve(
+        &self,
+        canonical_id: &CanonicalId,
+    ) -> Result<Box<dyn DispatchedPlaneCodecCuda>, CodecError> {
+        let Some(install) = find_install(canonical_id, &self.installed) else {
+            return Err(CodecError::Unsupported {
+                feature: format!(
+                    "no plane_codec CUDA contribution registered for canonical id {canonical_id}"
+                ),
+            });
+        };
+        let bundle_dir = &install.bundle_dir;
+        let entry = manifest_entry_for(install, canonical_id)?;
+
+        // Same precondition as HardwareBackendRouter::resolve: check()'s
+        // hardware_class rule only denies a *declared* mismatched class,
+        // so omission must be enforced here, before check() runs.
+        if !matches!(
+            entry.capabilities.get("hardware_class"),
+            Some(CapabilityValue::Text(_))
+        ) {
+            return Err(CodecError::Unsupported {
+                feature: "plane_codec CUDA contribution must declare hardware_class as a \
+                          capability"
+                    .into(),
+            });
+        }
+
+        // Deny before dlopen, not after: see self.policy in
+        // Self::new / Self::new_with_policy.
+        match check(&entry, &self.policy, &VendorTable::default()) {
+            CapabilityVerdict::Denied { reason } => {
+                return Err(CodecError::Unsupported {
+                    feature: format!("plane_codec CUDA capability check denied: {reason}"),
+                });
+            }
+            CapabilityVerdict::Admitted => {}
+        }
+
+        if let Ok(native_path) = find_native_path(bundle_dir) {
+            let token = VerifiedToken::new_unchecked();
+            let ext = NativeExtension::load(&native_path, &entry, token)?;
+            return Ok(Box::new(NativePlaneCodecCudaAdapter::new(Arc::new(ext))));
+        }
+
+        // A WASM contribution cannot hold device pointers: this router is
+        // native-only by construction, same as HardwareBackendRouter.
+        Err(CodecError::Unsupported {
+            feature: "plane_codec CUDA dispatch requires the native flavor".into(),
+        })
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Find the `DiscoveredContribution` whose manifest declares a contribution
@@ -1120,6 +1358,134 @@ mod tests {
                 assert!(feature.contains("hardware_class"), "got: {feature}");
             }
             Err(other) => panic!("expected denial for missing hardware_class, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn native_adapter_implements_the_cuda_plane_codec_trait() {
+        fn assert_impl<T: DispatchedPlaneCodecCuda>() {}
+        assert_impl::<NativePlaneCodecCudaAdapter>();
+    }
+
+    #[test]
+    fn cuda_plane_codec_router_denies_when_policy_lacks_cuda() {
+        // Default policy declares no available hardware, so a contribution
+        // requiring hardware_class = "cuda" must not resolve.
+        let router = PlaneCodecCudaRouter::new(Vec::new());
+        let id = crate::extension::builtin_canonical_id("identity");
+        assert!(router.get(&id).is_err());
+    }
+
+    /// Build a `DiscoveredContribution` declaring a single `plane_codec`
+    /// contribution with the given `hardware_class` capability, rooted at
+    /// `bundle_dir` (which need not exist on disk for capability-check
+    /// tests: the check must run, and deny, before any filesystem access
+    /// is attempted).
+    fn discovered_plane_codec_cuda_contribution(
+        hardware_class: &str,
+        bundle_dir: &str,
+    ) -> (DiscoveredContribution, CanonicalId) {
+        let id_bytes = [0xDEu8; 32];
+        let id = CanonicalId::from_bytes(id_bytes);
+        let id_hex: String = id_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+        let mut caps = CapabilityMap::new();
+        caps.set(
+            "hardware_class",
+            CapabilityValue::Text(hardware_class.to_string()),
+        );
+
+        let manifest = Manifest {
+            bundle: BundleHeader {
+                name: "test-plane-codec-cuda".into(),
+                version: "0.1.0".into(),
+                author_pubkey: "ed25519:00".into(),
+                description: None,
+            },
+            contributions: vec![ContributionDecl {
+                id: format!("blake3:{id_hex}"),
+                label: "io.example.plane_codec_cuda".into(),
+                kind: Kind::PlaneCodec,
+                abi_version: 1,
+                lifecycle: Lifecycle::Process,
+                flavors: vec!["native".into()],
+                capabilities: caps,
+                install_hint: None,
+            }],
+        };
+
+        let install = DiscoveredContribution {
+            manifest,
+            manifest_path: PathBuf::from(bundle_dir).join("manifest.toml"),
+            bundle_dir: PathBuf::from(bundle_dir),
+            installed_flavors: crate::discovery::FLAVOR_NATIVE,
+        };
+
+        (install, id)
+    }
+
+    #[test]
+    fn cuda_plane_codec_router_denies_by_capability_not_by_absence() {
+        // The preceding test passes for the wrong reason: with an empty
+        // `installed` list the identity codec is never registered, so it
+        // fails via the "not found" branch without ever reaching the
+        // capability-policy check. This test closes that gap: an *installed*
+        // contribution that declares hardware_class = "cuda" must be denied
+        // by the capability check specifically (against HostPolicy::default(),
+        // whose available_hardware is empty), not by "not found". A nonexistent
+        // bundle_dir is used so a filesystem error cannot masquerade as the
+        // intended denial.
+        let (install, id) =
+            discovered_plane_codec_cuda_contribution("cuda", "/this/bundle/dir/does/not/exist");
+        let router = PlaneCodecCudaRouter::new(vec![install]);
+        let res = router.get(&id);
+        match res {
+            Ok(_) => panic!("expected capability denial, got Ok"),
+            Err(CodecError::Unsupported { feature }) => {
+                assert!(
+                    feature.contains("capability check denied"),
+                    "expected a capability-check denial, got: {feature}"
+                );
+                assert!(
+                    !feature.contains("no plane_codec CUDA contribution registered"),
+                    "denial should not be the 'not found' branch, got: {feature}"
+                );
+            }
+            Err(other) => panic!("expected capability denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cuda_plane_codec_router_new_with_policy_admits_the_case_default_denies() {
+        // Same fixture, but with hardware_class = "cpu" and a policy that
+        // explicitly lists "cpu" in available_hardware: admission must
+        // clear the capability check and fail only afterward, at the
+        // native-artifact-not-found step (there is nothing to dlopen at
+        // the nonexistent bundle_dir), and the fixed native-flavor-only
+        // message is what should surface — proving the WASM/native
+        // fallback branch, not the capability gate, produced the denial.
+        let (install, id) =
+            discovered_plane_codec_cuda_contribution("cpu", "/this/bundle/dir/does/not/exist");
+        let policy = HostPolicy {
+            available_hardware: vec!["cpu".into()],
+            ..HostPolicy::default()
+        };
+        let router = PlaneCodecCudaRouter::new_with_policy(vec![install], policy);
+        let res = router.get(&id);
+        match res {
+            Ok(_) => panic!("expected a native-flavor-required error, got Ok"),
+            Err(CodecError::Unsupported { feature }) => {
+                assert!(
+                    !feature.contains("capability check denied"),
+                    "capability check should have admitted this contribution, got: {feature}"
+                );
+                assert_eq!(
+                    feature, "plane_codec CUDA dispatch requires the native flavor",
+                    "expected the fixed native-flavor-required message once past capability \
+                     admission"
+                );
+            }
+            Err(other) => panic!("expected Unsupported, got {other:?}"),
         }
     }
 

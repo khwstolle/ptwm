@@ -83,6 +83,29 @@ class Compressor:
         once; the reference's BLAKE3 digest is recorded as a Dependency so the
         decoder can verify that the caller supplied the matching reference.
         """
+        if isinstance(data, torch.Tensor) and data.device.type == "cuda":
+            if (
+                self.config.device is not None
+                and self.config.device != data.device.index
+            ):
+                msg = (
+                    f"device mismatch: config.device={self.config.device} but the "
+                    f"input tensor is on cuda:{data.device.index}. Move the tensor "
+                    f"or change config.device; ptwm will not relocate it implicitly."
+                )
+                raise ValueError(msg)
+
+        if self.config.codec is not None:
+            msg = (
+                f"CompressionConfig.codec={self.config.codec!r} is set, but "
+                "explicit per-codec dispatch is not wired through "
+                "Compressor.compress() yet: the automatic per-plane codec "
+                "search always runs regardless of this value, so setting it "
+                "would silently do nothing. Leave codec unset until explicit "
+                "dispatch lands."
+            )
+            raise CompressionMethodNotSupportedError(msg)
+
         if (
             self.config.delta_compressed_type is not None
             and self.config.delta_compressed_type != 0

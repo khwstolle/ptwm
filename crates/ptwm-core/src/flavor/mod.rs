@@ -22,7 +22,8 @@ pub use native::{
 };
 pub use router::{
     DeltaSchemeRouter, DispatchedDeltaScheme, DispatchedHardwareBackendCuda, DispatchedPlaneCodec,
-    HardwareBackendRouter, PlaneCodecRouter,
+    DispatchedPlaneCodecCuda, HardwareBackendRouter, NativePlaneCodecCudaAdapter,
+    PlaneCodecCudaRouter, PlaneCodecRouter,
 };
 pub use third_party::ThirdPartyPlaneCodec;
 pub use wasm::{

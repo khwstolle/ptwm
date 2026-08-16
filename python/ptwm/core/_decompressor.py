@@ -52,6 +52,26 @@ class Decompressor:
         match, and the decoded bytes are XOR-ed with it to recover the
         original tensor before any format reconstruction.
         """
+        if self.config.codec is not None:
+            msg = (
+                f"DecompressionConfig.codec={self.config.codec!r} is set, but "
+                "explicit per-codec dispatch is not wired through "
+                "Decompressor.decompress() yet: decoding always dispatches on "
+                "the codec recorded in the container header regardless of "
+                "this value, so setting it would silently do nothing. Leave "
+                "codec unset until explicit dispatch lands."
+            )
+            raise ValueError(msg)
+        if self.config.device is not None:
+            msg = (
+                f"DecompressionConfig.device={self.config.device} is set, but "
+                "GPU-resident decode dispatch is not wired through "
+                "Decompressor.decompress() yet: decoding always runs on CPU "
+                "regardless of this value, so setting it would silently do "
+                "nothing. Leave device unset until explicit dispatch lands."
+            )
+            raise ValueError(msg)
+
         mv_data = memoryview(data)
         magic = b"\x89PTWM"
         if len(mv_data) < len(magic):

@@ -146,12 +146,17 @@ fn legacy_plane_layout(layout: Layout) -> PlaneLayout {
     }
 }
 
-/// Build a default source `PlaneDescriptor` keyed on dtype code. The
-/// `element_width` follows the canonical mapping used elsewhere in the
-/// crate (see `transforms::source::bytes_per_element` and the byte-/word-
-/// aware transforms). `length_bytes` is the raw byte count;
-/// `Layout::Rows{row_len}` applies when `shape` is supplied, using the
-/// row-major last dimension.
+/// Build a default source `PlaneDescriptor` keyed on dtype code.
+///
+/// `element_width` and `is_nibble_packed` come from `transforms::source`,
+/// which owns the dtype-code mapping. This function used to inline its own
+/// copy of that match. The copy drifted: it kept packed FP4 in the byte
+/// catch-all, so every plane reaching the trial encode was byte-width and
+/// not nibble-packed, and `PerGroupCodebook` could accept none of them.
+/// Call the mapping, do not restate it.
+///
+/// `length_bytes` is the raw byte count; `Layout::Rows{row_len}` applies
+/// when `shape` is supplied, using the row-major last dimension.
 ///
 /// Public so the PyO3 binding (`ptwm-py`) can build the same source
 /// descriptor without duplicating the dtype-code → element-width mapping.
@@ -160,16 +165,7 @@ pub fn source_descriptor_for(
     raw_byte_count: u64,
     shape: Option<&[u64]>,
 ) -> PlaneDescriptor {
-    let element_width = match dtype_code {
-        // FP16 / BF16 / int16 / uint16
-        0x0002 | 0x000F | 0x0007 | 0x0008 => ElementWidth::Word2,
-        // FP32 / int32 / uint32
-        0x0003 | 0x0009 | 0x000A => ElementWidth::Word4,
-        // FP64 / int64 / uint64
-        0x0004 | 0x000B | 0x000C => ElementWidth::Word8,
-        // int8 / uint8 / FP8 variants — and the catch-all
-        _ => ElementWidth::Byte,
-    };
+    let element_width = crate::transforms::source::element_width_for(dtype_code);
     let layout = match shape {
         Some(s) if !s.is_empty() => match u32::try_from(*s.last().unwrap()) {
             Ok(row_len) => Layout::rows(row_len).unwrap_or(Layout::Flat),
@@ -191,7 +187,7 @@ pub fn source_descriptor_for(
         layout,
         derives_from_tensor: None,
         residual_of: None,
-        is_nibble_packed: false,
+        is_nibble_packed: crate::transforms::source::is_nibble_packed_dtype(dtype_code),
         vendor_bytes: vec![],
     }
 }

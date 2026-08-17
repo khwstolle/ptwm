@@ -13,7 +13,7 @@ use crate::types::role::Role;
 /// Chain-internal code for `Float4E2M1FNx2`: two fp4 values share a byte.
 const DTYPE_FP4_E2M1FN_X2: u16 = 0x001F;
 
-fn element_width_for(dtype_code: u16) -> ElementWidth {
+pub fn element_width_for(dtype_code: u16) -> ElementWidth {
     match dtype_code {
         // FP16 / BF16 / int16 / uint16
         0x0002 | 0x000F | 0x0007 | 0x0008 => ElementWidth::Word2,
@@ -34,7 +34,7 @@ fn element_width_for(dtype_code: u16) -> ElementWidth {
 /// an element is, this says that elements share a byte. Codecs that read
 /// packed nibbles (`PerGroupCodebook`) require both, and transforms that
 /// cannot handle sharing (`BurrowsWheeler`, `IndexPack`) reject on this one.
-fn is_nibble_packed_dtype(dtype_code: u16) -> bool {
+pub fn is_nibble_packed_dtype(dtype_code: u16) -> bool {
     dtype_code == DTYPE_FP4_E2M1FN_X2
 }
 

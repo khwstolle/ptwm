@@ -26,47 +26,6 @@ pub fn histograms(nibbles: &[u8]) -> Vec<[u32; ALPHABET]> {
     out
 }
 
-/// Expand a nibble-packed plane to one nibble per byte, low nibble first.
-///
-/// The codec's internals model a nibble alphabet and work on this expanded
-/// form. The planes the dispatcher hands it are packed two values per byte,
-/// which is exactly what `is_nibble_packed` on the descriptor asserts, and
-/// what `accepts` requires. Converting at the `PlaneCodec` boundary keeps
-/// the two representations from being confused: reading a packed plane as
-/// though it were already expanded silently drops every high nibble.
-pub(crate) fn unpack_nibbles(packed: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(packed.len() * 2);
-    for &b in packed {
-        out.push(b & 0x0F);
-        out.push((b >> 4) & 0x0F);
-    }
-    out
-}
-
-/// Inverse of [`unpack_nibbles`]. Requires an even nibble count.
-///
-/// The only caller decodes exactly `n_assignments * GROUP_SIZE` nibbles and
-/// `GROUP_SIZE` is even, so an odd count cannot arise today. Asserted
-/// anyway, because the way it would fail is expensive to diagnose:
-/// `chunks_exact` drops a trailing nibble without complaint, the plane
-/// returns one byte short, and the container rejects it as a CRC mismatch
-/// with nothing pointing back here. Working out that a checksum failure
-/// meant mishandled nibbles is what the packed-versus-expanded confusion in
-/// this file already cost once.
-fn pack_nibbles(nibbles: &[u8]) -> Vec<u8> {
-    assert!(
-        nibbles.len().is_multiple_of(2),
-        "pack_nibbles: {} nibbles is odd; the trailing nibble would be dropped \
-         and surface later as a container integrity failure",
-        nibbles.len()
-    );
-    let mut out = Vec::with_capacity(nibbles.len() / 2);
-    for pair in nibbles.chunks_exact(2) {
-        out.push((pair[0] & 0x0F) | ((pair[1] & 0x0F) << 4));
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,10 +405,28 @@ impl PlaneCodec for PerGroupCodebook {
         CodecId::PerGroupCodebook
     }
 
+    /// Accept expanded FP4 value planes whose length divides into whole
+    /// groups.
+    ///
+    /// The codec models one nibble per byte, and `GROUP_SIZE` of 32 is one
+    /// MXFP4 block: the unit that shares a scale, and therefore the unit
+    /// worth giving its own codebook. `MxFp4Deinterleave` produces exactly
+    /// that, 32 single-nibble slots per block.
+    ///
+    /// Two exclusions are deliberate. A *packed* plane, two values per
+    /// byte, is declined rather than misread: reading one would take low
+    /// nibbles only and return them with the high half zeroed, silently
+    /// losing half the data. Such a plane must be deinterleaved first. And
+    /// a length that is not a whole number of groups is declined here
+    /// rather than failing inside `encode`, because dispatch drops the
+    /// whole candidate chain when a codec errors and packed FP4 has only
+    /// one chain to drop. Declining keeps an `encode` error meaning what it
+    /// should: an invariant was violated, not merely an unsuitable input.
     fn accepts(&self, descriptor: &PlaneDescriptor) -> bool {
-        descriptor.is_nibble_packed
+        !descriptor.is_nibble_packed
             && matches!(descriptor.role, Role::Value { .. })
             && descriptor.element_width == ElementWidth::Nibble
+            && (descriptor.length_bytes as usize).is_multiple_of(GROUP_SIZE)
     }
 
     fn priority_for(&self, descriptor: &PlaneDescriptor) -> i8 {
@@ -466,22 +443,17 @@ impl PlaneCodec for PerGroupCodebook {
         shared_state: Option<&[u8]>,
         _layout: &PlaneLayout,
     ) -> Result<Encoded, PtwmCoreError> {
-        // `plane` is nibble-packed: two values per byte. Expand before
-        // modelling, and count groups in nibbles rather than bytes.
-        let nibbles = unpack_nibbles(plane);
-        if !nibbles.len().is_multiple_of(GROUP_SIZE) {
+        if !plane.len().is_multiple_of(GROUP_SIZE) {
             return Err(PtwmCoreError::CodecDecode {
                 codec: "PerGroupCodebook",
                 msg: format!(
-                    "encode: plane holds {} nibbles ({} bytes), not a multiple of \
-                     GROUP_SIZE {GROUP_SIZE}",
-                    nibbles.len(),
+                    "encode: plane length {} not a multiple of GROUP_SIZE {GROUP_SIZE}",
                     plane.len(),
                 ),
             });
         }
 
-        let hists = histograms(&nibbles);
+        let hists = histograms(plane);
 
         // Either consume provided shared state or fit a per-tensor codebook.
         let (state, inline_state_bytes): (StateV0, Vec<u8>) = match shared_state {
@@ -524,8 +496,8 @@ impl PlaneCodec for PerGroupCodebook {
 
         // Range-coded per-nibble payload
         let mut enc = RangeEncoder::new();
-        for (i, &nib) in nibbles.iter().enumerate() {
-            let sym = nib as usize;
+        for (i, &nib_byte) in plane.iter().enumerate() {
+            let sym = (nib_byte & 0x0F) as usize;
             let g = i / GROUP_SIZE;
             let k = assignments[g] as usize;
             let counts = &state.codebook[k];
@@ -567,27 +539,21 @@ impl PlaneCodec for PerGroupCodebook {
             });
         }
         let n_assignments = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
-        // `decoded_len` comes from the trusted spec/plane-record path and is
-        // a byte count; groups are counted in nibbles, two per byte. A
+        // `decoded_len` comes from the trusted spec/plane-record path; a
         // mismatch here is corruption, not a soft failure.
-        let decoded_nibbles = decoded_len * 2;
-        if !decoded_nibbles.is_multiple_of(GROUP_SIZE) {
+        if !decoded_len.is_multiple_of(GROUP_SIZE) {
             return Err(PtwmCoreError::CodecDecode {
                 codec: "PerGroupCodebook",
-                msg: format!(
-                    "decoded_len {decoded_len} bytes = {decoded_nibbles} nibbles, \
-                     not divisible by GROUP_SIZE {GROUP_SIZE}"
-                ),
+                msg: format!("decoded_len {decoded_len} not divisible by GROUP_SIZE {GROUP_SIZE}"),
             });
         }
-        let expected_assignments = decoded_nibbles / GROUP_SIZE;
+        let expected_assignments = decoded_len / GROUP_SIZE;
         if n_assignments != expected_assignments {
             return Err(PtwmCoreError::CodecDecode {
                 codec: "PerGroupCodebook",
                 msg: format!(
-                    "payload claims {n_assignments} groups (={} nibbles), \
-                     plane expects {expected_assignments} (={decoded_nibbles} nibbles, \
-                     {decoded_len} bytes)",
+                    "payload claims {n_assignments} groups (={} bytes), \
+                     plane expects {expected_assignments} (={decoded_len} bytes)",
                     n_assignments * GROUP_SIZE
                 ),
             });
@@ -657,11 +623,7 @@ impl PlaneCodec for PerGroupCodebook {
             })?;
             out.push(sym as u8);
         }
-        // Re-pack to the plane's on-the-wire form. Returning the expanded
-        // nibbles here is what made this codec lossy: it produced one byte
-        // per nibble with the high half zeroed, which round-tripped only
-        // for input whose high nibbles were already zero.
-        Ok(pack_nibbles(&out))
+        Ok(out)
     }
 }
 
@@ -718,70 +680,6 @@ mod codec_tests {
             )
             .unwrap();
         assert_eq!(dec, b);
-    }
-
-    /// A genuinely packed plane: both nibbles of every byte carry data.
-    ///
-    /// The other roundtrip tests here build one nibble per byte, so their
-    /// high halves are all zero and they pass whether or not the codec
-    /// preserves them. That is why this codec shipped dropping every high
-    /// nibble without any test noticing.
-    fn build_packed_plane(n_bytes: usize, seed: u64) -> Vec<u8> {
-        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-        let mut out = Vec::with_capacity(n_bytes);
-        for _ in 0..n_bytes {
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            // Skew toward a few values so the codebook has structure to find,
-            // but keep both halves populated.
-            let lo = (s % 16) as u8;
-            let hi = ((s >> 8) % 16) as u8;
-            out.push(lo | (hi << 4));
-        }
-        out
-    }
-
-    #[test]
-    fn codec_roundtrip_preserves_both_nibbles_of_every_byte() {
-        let c = PerGroupCodebook;
-        // GROUP_SIZE nibbles per group, two nibbles per byte.
-        let plane = build_packed_plane(64 * GROUP_SIZE / 2, 7);
-        assert!(
-            plane.iter().any(|b| b & 0xF0 != 0),
-            "fixture must exercise high nibbles"
-        );
-        let enc = c.encode(&plane, None, &PlaneLayout::Flat).unwrap();
-        let dec = c
-            .decode(
-                enc.state_format_version,
-                &enc.state_bytes,
-                &enc.payload,
-                &PlaneLayout::Flat,
-                plane.len(),
-            )
-            .unwrap();
-        assert_eq!(
-            dec.len(),
-            plane.len(),
-            "decoded length must match the plane"
-        );
-        assert_eq!(dec, plane, "codec must be lossless over both nibbles");
-    }
-
-    #[test]
-    fn nibble_pack_unpack_is_an_identity() {
-        let plane = build_packed_plane(256, 3);
-        assert_eq!(pack_nibbles(&unpack_nibbles(&plane)), plane);
-    }
-
-    #[test]
-    #[should_panic(expected = "is odd")]
-    fn packing_an_odd_nibble_count_is_caught_rather_than_truncated() {
-        // Unreachable from `decode`, whose nibble count is always a multiple
-        // of GROUP_SIZE. Pinned so a future caller learns it here rather than
-        // from a container integrity failure three layers away.
-        pack_nibbles(&[1, 2, 3]);
     }
 
     #[test]
@@ -913,20 +811,7 @@ mod capability_tests {
     }
 
     #[test]
-    fn pgc_accepts_nibble_packed_value_nibble() {
-        let c = PerGroupCodebook;
-        let d = descriptor(
-            Role::Value {
-                format: ValueFormat::Fp4E2m1,
-            },
-            ElementWidth::Nibble,
-            true,
-        );
-        assert!(c.accepts(&d));
-    }
-
-    #[test]
-    fn pgc_rejects_not_nibble_packed() {
+    fn pgc_accepts_expanded_value_nibble() {
         let c = PerGroupCodebook;
         let d = descriptor(
             Role::Value {
@@ -934,6 +819,19 @@ mod capability_tests {
             },
             ElementWidth::Nibble,
             false,
+        );
+        assert!(c.accepts(&d));
+    }
+
+    #[test]
+    fn pgc_rejects_packed_plane() {
+        let c = PerGroupCodebook;
+        let d = descriptor(
+            Role::Value {
+                format: ValueFormat::Fp4E2m1,
+            },
+            ElementWidth::Nibble,
+            true,
         );
         assert!(!c.accepts(&d));
     }
@@ -946,7 +844,7 @@ mod capability_tests {
                 format: ScaleFormat::E4M3,
             },
             ElementWidth::Nibble,
-            true,
+            false,
         );
         assert!(!c.accepts(&d));
     }
@@ -959,7 +857,7 @@ mod capability_tests {
                 format: ValueFormat::Fp4E2m1,
             },
             ElementWidth::Byte,
-            true,
+            false,
         );
         assert!(!c.accepts(&d));
     }
@@ -972,7 +870,7 @@ mod capability_tests {
                 format: ValueFormat::Fp4E2m1,
             },
             ElementWidth::Nibble,
-            true,
+            false,
         );
         assert_eq!(c.priority_for(&d), 10);
     }
@@ -985,8 +883,131 @@ mod capability_tests {
                 format: ScaleFormat::E4M3,
             },
             ElementWidth::Nibble,
-            true,
+            false,
         );
         assert_eq!(c.priority_for(&d), i8::MIN);
+    }
+}
+
+/// End-to-end coverage for the producer this codec is actually built for.
+///
+/// The suite previously exercised the codec only on hand-built planes. It
+/// never drove the op that supplies it in practice, which is how a
+/// descriptor mismatch between the two survived: `MxFp4Deinterleave`
+/// labelled its output nibble-packed while emitting one nibble per byte,
+/// and the codec's own contract expects the expanded form.
+#[cfg(test)]
+mod deinterleave_integration_tests {
+    use super::*;
+    use crate::transforms::mxfp4_deinterleave::MxFp4Deinterleave;
+    use crate::transforms::op::{Op, Plane};
+    use crate::types::descriptor::{Layout, PlaneDescriptor};
+    use crate::types::role::Role;
+
+    const BLOCK_BYTES: usize = 17;
+
+    /// OCP MXFP4 wire bytes: 16 packed-nibble bytes then one E8M0 scale.
+    fn mxfp4_blocks(n_blocks: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut out = Vec::with_capacity(n_blocks * BLOCK_BYTES);
+        for b in 0..n_blocks {
+            for _ in 0..16 {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                // Skewed within a block, varying across blocks, so a
+                // per-block codebook has structure to find.
+                let lo = (s % 4 + (b as u64 % 3) * 4) as u8 & 0x0F;
+                let hi = ((s >> 8) % 4 + (b as u64 % 3) * 4) as u8 & 0x0F;
+                out.push(lo | (hi << 4));
+            }
+            out.push(0x80 | (b as u8 & 0x0F));
+        }
+        out
+    }
+
+    fn raw_descriptor(len: usize) -> PlaneDescriptor {
+        PlaneDescriptor {
+            role: Role::Raw,
+            element_width: ElementWidth::Byte,
+            length_bytes: len as u64,
+            layout: Layout::Flat,
+            derives_from_tensor: None,
+            residual_of: None,
+            is_nibble_packed: false,
+            vendor_bytes: vec![],
+        }
+    }
+
+    #[test]
+    fn codec_accepts_and_round_trips_the_deinterleaved_value_plane() {
+        let n_blocks = 8;
+        let raw = mxfp4_blocks(n_blocks, 11);
+        let op = MxFp4Deinterleave::new(32).unwrap();
+
+        let descs = op
+            .propagate_descriptors(&[raw_descriptor(raw.len())])
+            .unwrap();
+        let value_desc = descs[0].clone();
+
+        // One group per MXFP4 block is the whole premise of the codec.
+        assert_eq!(value_desc.length_bytes as usize, n_blocks * GROUP_SIZE);
+
+        let c = PerGroupCodebook;
+        assert!(
+            c.accepts(&value_desc),
+            "the codec must accept the plane its own producer emits: {value_desc:?}"
+        );
+
+        let planes = op
+            .forward(&[Plane::new(raw.clone(), raw_descriptor(raw.len())).unwrap()])
+            .unwrap();
+        let value_plane = planes[0].bytes.to_vec();
+        assert_eq!(value_plane.len(), n_blocks * GROUP_SIZE);
+        assert!(
+            value_plane.iter().all(|&b| b <= 0x0F),
+            "the value plane is one nibble per byte, so no byte exceeds 0x0F"
+        );
+
+        let enc = c.encode(&value_plane, None, &PlaneLayout::Flat).unwrap();
+        let dec = c
+            .decode(
+                enc.state_format_version,
+                &enc.state_bytes,
+                &enc.payload,
+                &PlaneLayout::Flat,
+                value_plane.len(),
+            )
+            .unwrap();
+        assert_eq!(
+            dec, value_plane,
+            "codec must be lossless on its own producer"
+        );
+    }
+
+    #[test]
+    fn codec_declines_a_genuinely_packed_plane_instead_of_halving_it() {
+        // Two values per byte. Reading this as one-nibble-per-byte would
+        // drop every high nibble, which is exactly the silent loss the
+        // `accepts` guard exists to prevent.
+        let mut d = raw_descriptor(64);
+        d.role = Role::Value {
+            format: crate::types::role::ValueFormat::Fp4E2m1,
+        };
+        d.element_width = ElementWidth::Nibble;
+        d.is_nibble_packed = true;
+        assert!(!PerGroupCodebook.accepts(&d));
+    }
+
+    #[test]
+    fn codec_declines_a_length_that_is_not_whole_groups() {
+        // Declined rather than failed in `encode`: packed FP4 has one
+        // candidate chain, and a codec error drops the chain entirely.
+        let mut d = raw_descriptor(GROUP_SIZE + 1);
+        d.role = Role::Value {
+            format: crate::types::role::ValueFormat::Fp4E2m1,
+        };
+        d.element_width = ElementWidth::Nibble;
+        assert!(!PerGroupCodebook.accepts(&d));
     }
 }

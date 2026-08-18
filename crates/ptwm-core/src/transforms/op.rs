@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use crate::error::PtwmCoreError;
-use crate::types::descriptor::{ElementWidth, PlaneDescriptor};
+use crate::types::descriptor::PlaneDescriptor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
@@ -114,9 +114,8 @@ pub struct Plane {
 
 impl Plane {
     /// Construct a `Plane` after validating that `bytes.len()` matches
-    /// `descriptor.length_bytes`. Expects one nibble-per-byte slot when
-    /// `descriptor.element_width == Nibble` and `is_nibble_packed` is
-    /// false; nibble-packed planes use half-byte storage.
+    /// `descriptor.length_bytes`, which is a storage byte count whether or
+    /// not the plane is nibble-packed.
     pub fn new(bytes: Vec<u8>, descriptor: PlaneDescriptor) -> Result<Self, PtwmCoreError> {
         let expected = expected_byte_len(&descriptor);
         if bytes.len() as u64 != expected {
@@ -145,13 +144,16 @@ impl Plane {
 }
 
 /// Expected byte length for a plane's storage given its descriptor.
+///
+/// `length_bytes` is a storage count for every producer, so this is the
+/// identity. It used to halve the value for nibble-packed planes, reading
+/// the field as a count of values instead, which made it the third of three
+/// disagreeing conventions: `Source` reports storage bytes,
+/// `MxFp4Deinterleave` reports one slot per value, and this halved whatever
+/// it was given. A plane built from `source_descriptor_for` was rejected as
+/// twice its expected size. One convention, applied everywhere.
 fn expected_byte_len(descriptor: &PlaneDescriptor) -> u64 {
-    if descriptor.is_nibble_packed && descriptor.element_width == ElementWidth::Nibble {
-        // Two nibbles per byte; round up so an odd element count still fits.
-        descriptor.length_bytes.div_ceil(2)
-    } else {
-        descriptor.length_bytes
-    }
+    descriptor.length_bytes
 }
 
 /// Pure-function trait every op implements.
@@ -180,6 +182,7 @@ pub trait Op {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::descriptor::ElementWidth;
 
     #[test]
     fn op_id_roundtrip() {
@@ -265,7 +268,11 @@ mod tests {
             is_nibble_packed: true,
             vendor_bytes: vec![],
         };
-        assert!(Plane::new(vec![0; 3], desc.clone()).is_ok());
-        assert!(Plane::new(vec![0; 2], desc).is_err());
+        // `length_bytes` is storage, packed or not, so a packed plane is
+        // sized like any other. This used to expect 3 bytes for the same
+        // descriptor, reading the field as a count of values; a plane built
+        // by `source_descriptor_for` was then rejected as twice its size.
+        assert!(Plane::new(vec![0; 5], desc.clone()).is_ok());
+        assert!(Plane::new(vec![0; 3], desc).is_err());
     }
 }

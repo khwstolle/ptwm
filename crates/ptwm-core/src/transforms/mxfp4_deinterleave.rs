@@ -95,7 +95,15 @@ impl Op for MxFp4Deinterleave {
                 layout: value_layout,
                 derives_from_tensor: inp.derives_from_tensor,
                 residual_of: None,
-                is_nibble_packed: true,
+                // One nibble per byte: `forward` pushes each input byte's
+                // low and high halves as separate slots, so nothing shares
+                // a byte here. The flag means "two values share a byte",
+                // which describes this op's *input*; `ElementWidth::Nibble`
+                // already says these are 4-bit values. Claiming both left
+                // every consumer to choose between reading the plane as
+                // packed, which drops half the data, and reading it as
+                // expanded, which contradicted the flag.
+                is_nibble_packed: false,
                 vendor_bytes: vec![],
             },
             // Plane 1: SCALE — one E8M0 byte per block.
@@ -300,7 +308,8 @@ mod tests {
             }
         );
         assert_eq!(outs[0].element_width, ElementWidth::Nibble);
-        assert!(outs[0].is_nibble_packed);
+        // One nibble per byte: nothing shares a byte in this op's output.
+        assert!(!outs[0].is_nibble_packed);
         assert_eq!(outs[0].length_bytes, 32); // BLOCK_VALUES
     }
 

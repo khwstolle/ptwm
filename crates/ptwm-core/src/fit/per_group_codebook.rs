@@ -36,12 +36,7 @@ pub fn fit(planes_value: &[&[u8]]) -> Result<Option<SharedStateEntry>, PtwmCoreE
     }
     let mut all_hists: Vec<[u32; pgc::ALPHABET]> = Vec::new();
     for plane in planes_value {
-        // The planes are nibble-packed, two values per byte, and
-        // `histograms` models one nibble per byte. Expand first, exactly as
-        // the codec's own `encode` does: reading a packed plane directly
-        // would fit the codebook on the low nibbles alone and cut every
-        // group boundary at 32 bytes instead of 32 nibbles.
-        all_hists.extend(pgc::histograms(&pgc::unpack_nibbles(plane)));
+        all_hists.extend(pgc::histograms(plane));
     }
     let fit_hists = stride_sample(&all_hists, FIT_HIST_SAMPLE_CAP);
     let cb = pgc::fit_codebook_multi_seed(
@@ -87,24 +82,6 @@ mod tests {
         assert_eq!(e.codec_id, CodecId::PerGroupCodebook);
         assert_eq!(e.state_bytes.len(), pgc::K * pgc::ALPHABET);
         assert_eq!(e.name, "per_group_codebook");
-    }
-
-    #[test]
-    fn fit_reads_the_high_nibble_of_every_byte() {
-        // Two planes with identical low nibbles and different high nibbles.
-        // Fitting on the packed bytes as though they were one nibble per
-        // byte would ignore the high halves and return the same codebook
-        // for both.
-        let low: Vec<u8> = (0..1024u32).map(|i| (i % 7) as u8).collect();
-        let a: Vec<u8> = low.iter().map(|&b| b | (0x1 << 4)).collect();
-        let b: Vec<u8> = low
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| v | (((i % 13) as u8) << 4))
-            .collect();
-        let sa = fit(&[&a]).unwrap().unwrap().state_bytes;
-        let sb = fit(&[&b]).unwrap().unwrap().state_bytes;
-        assert_ne!(sa, sb, "codebook must depend on the high nibbles too");
     }
 
     #[test]

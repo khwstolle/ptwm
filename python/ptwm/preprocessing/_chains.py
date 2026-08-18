@@ -92,7 +92,7 @@ _CHAIN_DTYPE: dict[int, int] = {
     23: 0x000B,  # Long (alias for Int64)
     29: 0x0010,  # Float8E4M3FN
     30: 0x0011,  # Float8E5M2
-    31: 0x001F,  # Float4E2M1FNx2 (packed fp4, 1 byte/elem in Rust fallthrough)
+    31: 0x001F,  # Float4E2M1FNx2 (packed fp4: nibble width, 1 byte/elem)
 }
 
 

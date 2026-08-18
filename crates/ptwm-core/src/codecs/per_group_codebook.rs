@@ -405,10 +405,28 @@ impl PlaneCodec for PerGroupCodebook {
         CodecId::PerGroupCodebook
     }
 
+    /// Accept expanded FP4 value planes whose length divides into whole
+    /// groups.
+    ///
+    /// The codec models one nibble per byte, and `GROUP_SIZE` of 32 is one
+    /// MXFP4 block: the unit that shares a scale, and therefore the unit
+    /// worth giving its own codebook. `MxFp4Deinterleave` produces exactly
+    /// that, 32 single-nibble slots per block.
+    ///
+    /// Two exclusions are deliberate. A *packed* plane, two values per
+    /// byte, is declined rather than misread: reading one would take low
+    /// nibbles only and return them with the high half zeroed, silently
+    /// losing half the data. Such a plane must be deinterleaved first. And
+    /// a length that is not a whole number of groups is declined here
+    /// rather than failing inside `encode`, because dispatch drops the
+    /// whole candidate chain when a codec errors and packed FP4 has only
+    /// one chain to drop. Declining keeps an `encode` error meaning what it
+    /// should: an invariant was violated, not merely an unsuitable input.
     fn accepts(&self, descriptor: &PlaneDescriptor) -> bool {
-        descriptor.is_nibble_packed
+        !descriptor.is_nibble_packed
             && matches!(descriptor.role, Role::Value { .. })
             && descriptor.element_width == ElementWidth::Nibble
+            && (descriptor.length_bytes as usize).is_multiple_of(GROUP_SIZE)
     }
 
     fn priority_for(&self, descriptor: &PlaneDescriptor) -> i8 {
@@ -793,20 +811,7 @@ mod capability_tests {
     }
 
     #[test]
-    fn pgc_accepts_nibble_packed_value_nibble() {
-        let c = PerGroupCodebook;
-        let d = descriptor(
-            Role::Value {
-                format: ValueFormat::Fp4E2m1,
-            },
-            ElementWidth::Nibble,
-            true,
-        );
-        assert!(c.accepts(&d));
-    }
-
-    #[test]
-    fn pgc_rejects_not_nibble_packed() {
+    fn pgc_accepts_expanded_value_nibble() {
         let c = PerGroupCodebook;
         let d = descriptor(
             Role::Value {
@@ -814,6 +819,19 @@ mod capability_tests {
             },
             ElementWidth::Nibble,
             false,
+        );
+        assert!(c.accepts(&d));
+    }
+
+    #[test]
+    fn pgc_rejects_packed_plane() {
+        let c = PerGroupCodebook;
+        let d = descriptor(
+            Role::Value {
+                format: ValueFormat::Fp4E2m1,
+            },
+            ElementWidth::Nibble,
+            true,
         );
         assert!(!c.accepts(&d));
     }
@@ -826,7 +844,7 @@ mod capability_tests {
                 format: ScaleFormat::E4M3,
             },
             ElementWidth::Nibble,
-            true,
+            false,
         );
         assert!(!c.accepts(&d));
     }
@@ -839,7 +857,7 @@ mod capability_tests {
                 format: ValueFormat::Fp4E2m1,
             },
             ElementWidth::Byte,
-            true,
+            false,
         );
         assert!(!c.accepts(&d));
     }
@@ -852,7 +870,7 @@ mod capability_tests {
                 format: ValueFormat::Fp4E2m1,
             },
             ElementWidth::Nibble,
-            true,
+            false,
         );
         assert_eq!(c.priority_for(&d), 10);
     }
@@ -865,8 +883,131 @@ mod capability_tests {
                 format: ScaleFormat::E4M3,
             },
             ElementWidth::Nibble,
-            true,
+            false,
         );
         assert_eq!(c.priority_for(&d), i8::MIN);
+    }
+}
+
+/// End-to-end coverage for the producer this codec is actually built for.
+///
+/// The suite previously exercised the codec only on hand-built planes. It
+/// never drove the op that supplies it in practice, which is how a
+/// descriptor mismatch between the two survived: `MxFp4Deinterleave`
+/// labelled its output nibble-packed while emitting one nibble per byte,
+/// and the codec's own contract expects the expanded form.
+#[cfg(test)]
+mod deinterleave_integration_tests {
+    use super::*;
+    use crate::transforms::mxfp4_deinterleave::MxFp4Deinterleave;
+    use crate::transforms::op::{Op, Plane};
+    use crate::types::descriptor::{Layout, PlaneDescriptor};
+    use crate::types::role::Role;
+
+    const BLOCK_BYTES: usize = 17;
+
+    /// OCP MXFP4 wire bytes: 16 packed-nibble bytes then one E8M0 scale.
+    fn mxfp4_blocks(n_blocks: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut out = Vec::with_capacity(n_blocks * BLOCK_BYTES);
+        for b in 0..n_blocks {
+            for _ in 0..16 {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                // Skewed within a block, varying across blocks, so a
+                // per-block codebook has structure to find.
+                let lo = (s % 4 + (b as u64 % 3) * 4) as u8 & 0x0F;
+                let hi = ((s >> 8) % 4 + (b as u64 % 3) * 4) as u8 & 0x0F;
+                out.push(lo | (hi << 4));
+            }
+            out.push(0x80 | (b as u8 & 0x0F));
+        }
+        out
+    }
+
+    fn raw_descriptor(len: usize) -> PlaneDescriptor {
+        PlaneDescriptor {
+            role: Role::Raw,
+            element_width: ElementWidth::Byte,
+            length_bytes: len as u64,
+            layout: Layout::Flat,
+            derives_from_tensor: None,
+            residual_of: None,
+            is_nibble_packed: false,
+            vendor_bytes: vec![],
+        }
+    }
+
+    #[test]
+    fn codec_accepts_and_round_trips_the_deinterleaved_value_plane() {
+        let n_blocks = 8;
+        let raw = mxfp4_blocks(n_blocks, 11);
+        let op = MxFp4Deinterleave::new(32).unwrap();
+
+        let descs = op
+            .propagate_descriptors(&[raw_descriptor(raw.len())])
+            .unwrap();
+        let value_desc = descs[0].clone();
+
+        // One group per MXFP4 block is the whole premise of the codec.
+        assert_eq!(value_desc.length_bytes as usize, n_blocks * GROUP_SIZE);
+
+        let c = PerGroupCodebook;
+        assert!(
+            c.accepts(&value_desc),
+            "the codec must accept the plane its own producer emits: {value_desc:?}"
+        );
+
+        let planes = op
+            .forward(&[Plane::new(raw.clone(), raw_descriptor(raw.len())).unwrap()])
+            .unwrap();
+        let value_plane = planes[0].bytes.to_vec();
+        assert_eq!(value_plane.len(), n_blocks * GROUP_SIZE);
+        assert!(
+            value_plane.iter().all(|&b| b <= 0x0F),
+            "the value plane is one nibble per byte, so no byte exceeds 0x0F"
+        );
+
+        let enc = c.encode(&value_plane, None, &PlaneLayout::Flat).unwrap();
+        let dec = c
+            .decode(
+                enc.state_format_version,
+                &enc.state_bytes,
+                &enc.payload,
+                &PlaneLayout::Flat,
+                value_plane.len(),
+            )
+            .unwrap();
+        assert_eq!(
+            dec, value_plane,
+            "codec must be lossless on its own producer"
+        );
+    }
+
+    #[test]
+    fn codec_declines_a_genuinely_packed_plane_instead_of_halving_it() {
+        // Two values per byte. Reading this as one-nibble-per-byte would
+        // drop every high nibble, which is exactly the silent loss the
+        // `accepts` guard exists to prevent.
+        let mut d = raw_descriptor(64);
+        d.role = Role::Value {
+            format: crate::types::role::ValueFormat::Fp4E2m1,
+        };
+        d.element_width = ElementWidth::Nibble;
+        d.is_nibble_packed = true;
+        assert!(!PerGroupCodebook.accepts(&d));
+    }
+
+    #[test]
+    fn codec_declines_a_length_that_is_not_whole_groups() {
+        // Declined rather than failed in `encode`: packed FP4 has one
+        // candidate chain, and a codec error drops the chain entirely.
+        let mut d = raw_descriptor(GROUP_SIZE + 1);
+        d.role = Role::Value {
+            format: crate::types::role::ValueFormat::Fp4E2m1,
+        };
+        d.element_width = ElementWidth::Nibble;
+        assert!(!PerGroupCodebook.accepts(&d));
     }
 }

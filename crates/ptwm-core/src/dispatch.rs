@@ -125,21 +125,21 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_nibble_value_packed_returns_pgc_first() {
+    fn dispatch_expanded_nibble_value_returns_pgc_first() {
         let d = descriptor(
             Role::Value {
                 format: ValueFormat::Fp4E2m1,
             },
             ElementWidth::Nibble,
             Layout::Flat,
-            true, // is_nibble_packed
+            false, // expanded: one nibble per byte, which is what PGC models
         );
         let result = dispatch(&d);
         assert!(!result.is_empty());
         assert_eq!(
             result[0],
             CodecId::PerGroupCodebook,
-            "PGC must be first for nibble-packed Value + Nibble; got {:?}",
+            "PGC must be first for expanded Value + Nibble; got {:?}",
             result
         );
         assert!(result.contains(&CodecId::Huffman));

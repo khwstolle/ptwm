@@ -146,12 +146,17 @@ fn legacy_plane_layout(layout: Layout) -> PlaneLayout {
     }
 }
 
-/// Build a default source `PlaneDescriptor` keyed on dtype code. The
-/// `element_width` follows the canonical mapping used elsewhere in the
-/// crate (see `transforms::source::bytes_per_element` and the byte-/word-
-/// aware transforms). `length_bytes` is the raw byte count;
-/// `Layout::Rows{row_len}` applies when `shape` is supplied, using the
-/// row-major last dimension.
+/// Build a default source `PlaneDescriptor` keyed on dtype code.
+///
+/// `element_width` and `is_nibble_packed` come from `transforms::source`,
+/// which owns the dtype-code mapping. This function used to inline its own
+/// copy of that match. The copy drifted: it kept packed FP4 in the byte
+/// catch-all, so every plane reaching the trial encode was byte-width and
+/// not nibble-packed, and `PerGroupCodebook` could accept none of them.
+/// Call the mapping, do not restate it.
+///
+/// `length_bytes` is the raw byte count; `Layout::Rows{row_len}` applies
+/// when `shape` is supplied, using the row-major last dimension.
 ///
 /// Public so the PyO3 binding (`ptwm-py`) can build the same source
 /// descriptor without duplicating the dtype-code → element-width mapping.
@@ -160,16 +165,7 @@ pub fn source_descriptor_for(
     raw_byte_count: u64,
     shape: Option<&[u64]>,
 ) -> PlaneDescriptor {
-    let element_width = match dtype_code {
-        // FP16 / BF16 / int16 / uint16
-        0x0002 | 0x000F | 0x0007 | 0x0008 => ElementWidth::Word2,
-        // FP32 / int32 / uint32
-        0x0003 | 0x0009 | 0x000A => ElementWidth::Word4,
-        // FP64 / int64 / uint64
-        0x0004 | 0x000B | 0x000C => ElementWidth::Word8,
-        // int8 / uint8 / FP8 variants — and the catch-all
-        _ => ElementWidth::Byte,
-    };
+    let element_width = crate::transforms::source::element_width_for(dtype_code);
     let layout = match shape {
         Some(s) if !s.is_empty() => match u32::try_from(*s.last().unwrap()) {
             Ok(row_len) => Layout::rows(row_len).unwrap_or(Layout::Flat),
@@ -191,7 +187,7 @@ pub fn source_descriptor_for(
         layout,
         derives_from_tensor: None,
         residual_of: None,
-        is_nibble_packed: false,
+        is_nibble_packed: crate::transforms::source::is_nibble_packed_dtype(dtype_code),
         vendor_bytes: vec![],
     }
 }
@@ -1685,5 +1681,50 @@ mod tests {
             assert_eq!(rec.chain_ref, 0);
             assert!(rec.inline_chain.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod source_descriptor_agreement_tests {
+    use super::*;
+    use crate::transforms::op::Op;
+    use crate::transforms::source::Source;
+
+    /// The compress side builds the source descriptor from the raw byte
+    /// count; the decompress side rebuilds it from the chain's Source node
+    /// (shape + dtype code). The two must agree on `length_bytes` for every
+    /// dtype, or a plane decodes at the wrong length.
+    fn assert_paths_agree(dtype_code: u16, shape: &[u64], raw_len: u64) {
+        let from_compressor = source_descriptor_for(dtype_code, raw_len, Some(shape));
+        let src = Source {
+            shape: shape.iter().map(|&d| d as u32).collect(),
+            dtype_code,
+        };
+        let from_chain = &src.propagate_descriptors(&[]).unwrap()[0];
+        assert_eq!(
+            from_compressor.length_bytes, from_chain.length_bytes,
+            "dtype 0x{dtype_code:04X}: compress path says {} bytes, decompress path says {}",
+            from_compressor.length_bytes, from_chain.length_bytes
+        );
+        assert_eq!(from_compressor.element_width, from_chain.element_width);
+        assert_eq!(
+            from_compressor.is_nibble_packed,
+            from_chain.is_nibble_packed
+        );
+    }
+
+    #[test]
+    fn packed_fp4_source_descriptor_agrees_across_both_paths() {
+        // A packed-FP4 tensor's shape counts packed bytes (one byte per
+        // element, two fp4 values), matching `Dtype::element_size` and the
+        // shape a torch `float4_e2m1fn_x2` tensor reports.
+        assert_paths_agree(0x001F, &[128, 128], 128 * 128);
+    }
+
+    #[test]
+    fn byte_and_word_source_descriptors_agree_across_both_paths() {
+        assert_paths_agree(0x0006, &[10, 10], 100);
+        assert_paths_agree(0x0002, &[10, 10], 200);
+        assert_paths_agree(0x0003, &[10, 10], 400);
     }
 }

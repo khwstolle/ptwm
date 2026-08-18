@@ -12,7 +12,7 @@ const DTYPE_FP4_E2M1FN_X2: u16 = 0x001F;
 /// Element width inferred from a chain-internal dtype code. The chain's
 /// Source params use a different code space than `Dtype::from_code` (the
 /// public registry); see `_CHAIN_DTYPE` in
-/// `python/weights/preprocessing/_chains.py`. This is the one owner of the
+/// `python/ptwm/preprocessing/_chains.py`. This is the one owner of the
 /// mapping: `compressor::source_descriptor_for` calls it rather than
 /// restating it.
 pub fn element_width_for(dtype_code: u16) -> ElementWidth {

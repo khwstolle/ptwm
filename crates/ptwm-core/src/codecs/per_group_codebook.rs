@@ -54,7 +54,7 @@ pub(crate) fn unpack_nibbles(packed: &[u8]) -> Vec<u8> {
 /// meant mishandled nibbles is what the packed-versus-expanded confusion in
 /// this file already cost once.
 fn pack_nibbles(nibbles: &[u8]) -> Vec<u8> {
-    debug_assert!(
+    assert!(
         nibbles.len().is_multiple_of(2),
         "pack_nibbles: {} nibbles is odd; the trailing nibble would be dropped \
          and surface later as a container integrity failure",

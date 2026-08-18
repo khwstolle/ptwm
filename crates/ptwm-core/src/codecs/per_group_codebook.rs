@@ -43,9 +43,23 @@ pub(crate) fn unpack_nibbles(packed: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Inverse of [`unpack_nibbles`]. Requires an even nibble count, which
-/// `GROUP_SIZE` alignment guarantees.
+/// Inverse of [`unpack_nibbles`]. Requires an even nibble count.
+///
+/// The only caller decodes exactly `n_assignments * GROUP_SIZE` nibbles and
+/// `GROUP_SIZE` is even, so an odd count cannot arise today. Asserted
+/// anyway, because the way it would fail is expensive to diagnose:
+/// `chunks_exact` drops a trailing nibble without complaint, the plane
+/// returns one byte short, and the container rejects it as a CRC mismatch
+/// with nothing pointing back here. Working out that a checksum failure
+/// meant mishandled nibbles is what the packed-versus-expanded confusion in
+/// this file already cost once.
 fn pack_nibbles(nibbles: &[u8]) -> Vec<u8> {
+    debug_assert!(
+        nibbles.len().is_multiple_of(2),
+        "pack_nibbles: {} nibbles is odd; the trailing nibble would be dropped \
+         and surface later as a container integrity failure",
+        nibbles.len()
+    );
     let mut out = Vec::with_capacity(nibbles.len() / 2);
     for pair in nibbles.chunks_exact(2) {
         out.push((pair[0] & 0x0F) | ((pair[1] & 0x0F) << 4));
@@ -759,6 +773,15 @@ mod codec_tests {
     fn nibble_pack_unpack_is_an_identity() {
         let plane = build_packed_plane(256, 3);
         assert_eq!(pack_nibbles(&unpack_nibbles(&plane)), plane);
+    }
+
+    #[test]
+    #[should_panic(expected = "is odd")]
+    fn packing_an_odd_nibble_count_is_caught_rather_than_truncated() {
+        // Unreachable from `decode`, whose nibble count is always a multiple
+        // of GROUP_SIZE. Pinned so a future caller learns it here rather than
+        // from a container integrity failure three layers away.
+        pack_nibbles(&[1, 2, 3]);
     }
 
     #[test]

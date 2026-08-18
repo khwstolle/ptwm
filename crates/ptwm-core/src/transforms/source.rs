@@ -5,14 +5,16 @@ use crate::transforms::op::{Op, OpId, Plane};
 use crate::types::descriptor::{ElementWidth, Layout, PlaneDescriptor};
 use crate::types::role::Role;
 
+/// Chain-internal code for `Float4E2M1FNx2`: two fp4 values share a byte,
+/// and one element of this dtype *is* that byte.
+const DTYPE_FP4_E2M1FN_X2: u16 = 0x001F;
+
 /// Element width inferred from a chain-internal dtype code. The chain's
 /// Source params use a different code space than `Dtype::from_code` (the
 /// public registry); see `_CHAIN_DTYPE` in
-/// `python/weights/preprocessing/_chains.py` and the parallel match in
-/// `compressor::source_descriptor_for`.
-/// Chain-internal code for `Float4E2M1FNx2`: two fp4 values share a byte.
-const DTYPE_FP4_E2M1FN_X2: u16 = 0x001F;
-
+/// `python/weights/preprocessing/_chains.py`. This is the one owner of the
+/// mapping: `compressor::source_descriptor_for` calls it rather than
+/// restating it.
 pub fn element_width_for(dtype_code: u16) -> ElementWidth {
     match dtype_code {
         // FP16 / BF16 / int16 / uint16
@@ -40,12 +42,17 @@ pub fn is_nibble_packed_dtype(dtype_code: u16) -> bool {
 
 /// Storage bytes for `n_elements` of a chain-internal dtype.
 ///
-/// Accumulates in bits so sub-byte widths survive. Dividing
-/// bits-per-element by 8 first floors a nibble to zero, which silently
-/// yields a zero-length descriptor rather than a wrong-but-visible one.
+/// A packed dtype's shape counts storage units, not values: one
+/// `Float4E2M1FNx2` element is one byte carrying two fp4 values, which is
+/// what `Dtype::element_size` reports and what a packed tensor's own shape
+/// counts. Element width describes the *value* width for such a dtype, so
+/// deriving the byte count from it would halve the length and leave the
+/// decompressor rebuilding every packed plane at half its size.
 fn storage_bytes(dtype_code: u16, n_elements: u64) -> u64 {
-    let bits = n_elements * element_width_for(dtype_code).bits_per_element() as u64;
-    bits.div_ceil(8)
+    if is_nibble_packed_dtype(dtype_code) {
+        return n_elements;
+    }
+    n_elements * (element_width_for(dtype_code).bits_per_element() as u64 / 8)
 }
 
 /// Mandatory entry node of every PPG chain. Takes no inputs (the runtime
@@ -324,19 +331,21 @@ mod tests {
         let d = &src.propagate_descriptors(&[]).unwrap()[0];
         assert_eq!(d.element_width, ElementWidth::Nibble);
         assert!(d.is_nibble_packed);
-        // 8192 fp4 values occupy 4096 bytes, not 8192.
-        assert_eq!(d.length_bytes, 64 * 128 / 2);
+        // A packed tensor's shape counts packed bytes, so 8192 elements
+        // occupy 8192 bytes and carry 16384 fp4 values. Halving here would
+        // disagree with the raw byte count the compressor is handed.
+        assert_eq!(d.length_bytes, 64 * 128);
     }
 
     #[test]
-    fn odd_element_count_at_nibble_width_rounds_up_to_whole_bytes() {
+    fn packed_fp4_length_holds_for_an_odd_element_count() {
         let src = Source {
             shape: vec![7],
             dtype_code: 0x001F,
         };
         let d = &src.propagate_descriptors(&[]).unwrap()[0];
-        // 7 nibbles need 4 bytes; the trailing nibble still costs one.
-        assert_eq!(d.length_bytes, 4);
+        assert_eq!(d.length_bytes, 7);
+        assert!(d.is_nibble_packed);
     }
 
     #[test]

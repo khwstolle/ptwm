@@ -1683,3 +1683,48 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod source_descriptor_agreement_tests {
+    use super::*;
+    use crate::transforms::op::Op;
+    use crate::transforms::source::Source;
+
+    /// The compress side builds the source descriptor from the raw byte
+    /// count; the decompress side rebuilds it from the chain's Source node
+    /// (shape + dtype code). The two must agree on `length_bytes` for every
+    /// dtype, or a plane decodes at the wrong length.
+    fn assert_paths_agree(dtype_code: u16, shape: &[u64], raw_len: u64) {
+        let from_compressor = source_descriptor_for(dtype_code, raw_len, Some(shape));
+        let src = Source {
+            shape: shape.iter().map(|&d| d as u32).collect(),
+            dtype_code,
+        };
+        let from_chain = &src.propagate_descriptors(&[]).unwrap()[0];
+        assert_eq!(
+            from_compressor.length_bytes, from_chain.length_bytes,
+            "dtype 0x{dtype_code:04X}: compress path says {} bytes, decompress path says {}",
+            from_compressor.length_bytes, from_chain.length_bytes
+        );
+        assert_eq!(from_compressor.element_width, from_chain.element_width);
+        assert_eq!(
+            from_compressor.is_nibble_packed,
+            from_chain.is_nibble_packed
+        );
+    }
+
+    #[test]
+    fn packed_fp4_source_descriptor_agrees_across_both_paths() {
+        // A packed-FP4 tensor's shape counts packed bytes (one byte per
+        // element, two fp4 values), matching `Dtype::element_size` and the
+        // shape a torch `float4_e2m1fn_x2` tensor reports.
+        assert_paths_agree(0x001F, &[128, 128], 128 * 128);
+    }
+
+    #[test]
+    fn byte_and_word_source_descriptors_agree_across_both_paths() {
+        assert_paths_agree(0x0006, &[10, 10], 100);
+        assert_paths_agree(0x0002, &[10, 10], 200);
+        assert_paths_agree(0x0003, &[10, 10], 400);
+    }
+}

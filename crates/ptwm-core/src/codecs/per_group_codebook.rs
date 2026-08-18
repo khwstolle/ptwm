@@ -34,7 +34,7 @@ pub fn histograms(nibbles: &[u8]) -> Vec<[u32; ALPHABET]> {
 /// what `accepts` requires. Converting at the `PlaneCodec` boundary keeps
 /// the two representations from being confused: reading a packed plane as
 /// though it were already expanded silently drops every high nibble.
-fn unpack_nibbles(packed: &[u8]) -> Vec<u8> {
+pub(crate) fn unpack_nibbles(packed: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(packed.len() * 2);
     for &b in packed {
         out.push(b & 0x0F);

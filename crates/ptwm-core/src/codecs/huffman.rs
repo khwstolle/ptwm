@@ -57,10 +57,10 @@ impl PlaneCodec for Huffman {
         }
 
         let mut buf = vec![0u8; huffman_output_bound(plane.len())];
-        match huffman::compress_outcome(&mut buf, plane)? {
-            CompressOutcome::Encoded(n) => {
+        let outcome = huffman::compress_outcome(&mut buf, plane)?;
+        match (outcome, u32::try_from(plane.len())) {
+            (CompressOutcome::Encoded(n), Ok(orig_len)) => {
                 // TAG_HUF | orig_len (4 bytes LE) | huffman-encoded bytes
-                let orig_len = plane.len() as u32;
                 let mut payload = Vec::with_capacity(1 + 4 + n);
                 payload.push(TAG_HUF);
                 payload.extend_from_slice(&orig_len.to_le_bytes());
@@ -71,9 +71,10 @@ impl PlaneCodec for Huffman {
                     payload,
                 })
             }
-            _outcome => {
+            _ => {
                 // NotBeneficial / Incompressible / DstTooSmall /
-                // LenOverflow → store raw
+                // LenOverflow, or a plane longer than the u32 length
+                // prefix → store raw
                 let mut payload = Vec::with_capacity(1 + plane.len());
                 payload.push(TAG_RAW);
                 payload.extend_from_slice(plane);

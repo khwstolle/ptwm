@@ -4,6 +4,7 @@ pub mod fpc;
 pub mod huff_llm;
 pub mod huffman;
 pub mod identity;
+pub(crate) mod length_prefix;
 pub mod neural_predictor;
 pub mod order1_arithmetic;
 pub mod order1_scale_ac;

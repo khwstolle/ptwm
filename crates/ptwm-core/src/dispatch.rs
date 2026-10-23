@@ -99,10 +99,9 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_e8m0_scale_byte_rows_excludes_o1sac() {
-        // uint8 weight_scale planes (MXFP4 E8M0 block scales) must not
-        // surface Order1ScaleAC in the dispatch menu — the codec is FP8-only
-        // by design.
+    fn dispatch_e8m0_scale_byte_rows_includes_o1sac() {
+        // uint8 weight_scale planes (MXFP4 E8M0 block scales) reach
+        // Order1ScaleAC alongside the generic coders.
         let d = descriptor(
             Role::Scale {
                 format: ScaleFormat::E8M0,
@@ -113,8 +112,8 @@ mod tests {
         );
         let result = dispatch(&d);
         assert!(
-            !result.contains(&CodecId::Order1ScaleAC),
-            "O1SAC must not appear for E8M0 scales; got {:?}",
+            result.contains(&CodecId::Order1ScaleAC),
+            "O1SAC must appear for E8M0 scales; got {:?}",
             result
         );
         // Standard codecs still present.

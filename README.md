@@ -314,8 +314,8 @@ fields; see its docstring for the full list.
 | `bfloat16` / `float16` | Bit reorder + 2-plane byte split | Exponent → plane 1 |
 | `float8_e4m3fn` / `float8_e5m2` | Bit reorder + 2-plane nibble split | Exponent → high nibble |
 | `float4_e2m1fn_x2` (weight nibbles) | Passthrough, per-plane trial-encode | `PerGroupCodebook` competes against Huffman / rANS on the nibble-packed byte stream |
-| MXFP4 scale (`uint8`, E8M0) | Passthrough, per-plane trial-encode | Pure 8-bit exponent with no row structure to exploit; compresses to ≈ 0.16 of original via the generic codec menu |
-| NVFP4 scale (FP8-E4M3) | `Order1ScaleAC` (per-row lag-1 arithmetic coding) | Mantissa bits give exploitable row autocorrelation that E8M0 lacks |
+| MXFP4 scale (`uint8`, E8M0) | `Order1ScaleAC` (per-row lag-1 arithmetic coding), per-plane trial-encode | Rows are autocorrelated: on gpt-oss-20b the entropy given the previous scale in the row is 1.20 bits, against 1.89 bits unconditioned |
+| NVFP4 scale (FP8-E4M3) | `Order1ScaleAC` (per-row lag-1 arithmetic coding) | Mantissa bits give exploitable row autocorrelation |
 | `int8`, `uint8`, `int16`, `int32`, `int64`, `bool` | Single stream | No byte split or bit reorder yet; whatever wins per-plane trial-encode on the raw bytes |
 
 MXFP4 / NVFP4 tensors are compressed as a pair: the packed FP4 weight

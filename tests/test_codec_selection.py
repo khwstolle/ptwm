@@ -1,6 +1,5 @@
 import pytest
 import torch
-
 from ptwm import CompressionConfig, Compressor
 
 

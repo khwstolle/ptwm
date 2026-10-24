@@ -453,16 +453,19 @@ impl PlaneCodec for Order1ScaleAC {
 
     fn accepts(&self, descriptor: &PlaneDescriptor) -> bool {
         // O1SAC requires byte-width Scale or GlobalScale planes with row layout
-        // AND an FP8 scale format (E4M3 or E5M2). The codec models per-row
-        // lag-1 PMFs over scale bytes — a structure that exists in FP8 scale
-        // distributions (mantissa bits give a continuous distribution with
-        // exploitable autocorrelation) but not in E8M0 scales, which are pure
-        // 8-bit exponents (no sign, no mantissa) used by MXFP4 block scales.
-        // Allow-listing E4M3/E5M2 keeps the codec inside its design domain;
-        // future scale formats need explicit vetting before being admitted.
+        // and a vetted scale format. The codec models per-row lag-1 PMFs over
+        // scale bytes. FP8 scales (E4M3, E5M2) carry that structure, and so do
+        // MXFP4's E8M0 block scales: across gpt-oss-20b's 597M E8M0 scales the
+        // entropy conditioned on the previous scale in the row is 1.20
+        // bits against 1.89 bits unconditioned. Trial encoding still picks the
+        // smallest codec per plane. Future scale formats need the same vetting
+        // before being admitted.
         let role_ok = match descriptor.role {
             Role::Scale { format } | Role::GlobalScale { format } => {
-                matches!(format, ScaleFormat::E4M3 | ScaleFormat::E5M2)
+                matches!(
+                    format,
+                    ScaleFormat::E4M3 | ScaleFormat::E5M2 | ScaleFormat::E8M0
+                )
             }
             _ => false,
         };
@@ -1081,10 +1084,8 @@ mod capability_tests {
     }
 
     #[test]
-    fn o1sac_rejects_e8m0_scale() {
-        // E8M0 (MXFP4 block scale) is a pure 8-bit exponent — structurally
-        // different from FP8 scales (E4M3 / E5M2) and outside O1SAC's design
-        // domain.
+    fn o1sac_accepts_e8m0_scale() {
+        // E8M0 (MXFP4 block scale) rows are autocorrelated like FP8 scale rows.
         let c = Order1ScaleAC;
         let d = descriptor(
             Role::Scale {
@@ -1094,11 +1095,11 @@ mod capability_tests {
             Layout::Rows { row_len: 32 },
             false,
         );
-        assert!(!c.accepts(&d));
+        assert!(c.accepts(&d));
     }
 
     #[test]
-    fn o1sac_rejects_e8m0_global_scale() {
+    fn o1sac_accepts_e8m0_global_scale() {
         let c = Order1ScaleAC;
         let d = descriptor(
             Role::GlobalScale {
@@ -1108,7 +1109,7 @@ mod capability_tests {
             Layout::Rows { row_len: 16 },
             false,
         );
-        assert!(!c.accepts(&d));
+        assert!(c.accepts(&d));
     }
 
     #[test]

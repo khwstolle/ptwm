@@ -6,6 +6,7 @@
 //! tANS can't shrink is stored verbatim and decode stays self-describing.
 
 use crate::codec::{CodecId, Encoded, PlaneCodec};
+use crate::codecs::length_prefix;
 use crate::entropy::tans;
 use crate::error::PtwmCoreError;
 use crate::layout::PlaneLayout;
@@ -60,7 +61,9 @@ impl PlaneCodec for Tans {
         // that case store the plane verbatim under TAG_RAW.
         let mut scratch = vec![0u8; plane.len()];
         let encoded_len = tans::compress(&mut scratch, plane)?;
-        if encoded_len == 0 {
+        // Also store the plane raw when the decoder would refuse the
+        // declared length.
+        if encoded_len == 0 || !length_prefix::accepted(plane.len(), encoded_len) {
             let mut payload = Vec::with_capacity(1 + plane.len());
             payload.push(TAG_RAW);
             payload.extend_from_slice(plane);
@@ -111,11 +114,9 @@ impl PlaneCodec for Tans {
                 }
                 let orig_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
                 let encoded = &rest[4..];
-                // Absolute size cap (not a ratio cap): tANS reaches very
-                // high ratios on near-degenerate distributions, so bound the
-                // allocation by an implausible-size guard rather than ratio.
-                const MAX_ORIG_LEN: usize = 1 << 30; // 1 GiB
-                if orig_len > MAX_ORIG_LEN {
+                // Defend against headers that would drive a multi-GiB
+                // allocation; the encoder applies the same rule.
+                if !length_prefix::accepted(orig_len, encoded.len()) {
                     return Err(PtwmCoreError::CodecDecode {
                         codec: "tans",
                         msg: format!(
@@ -232,5 +233,31 @@ mod tests {
     fn decode_rejects_empty_payload() {
         let r = Tans.decode(0, &[], &[], &PlaneLayout::Flat, 0);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn decode_rejects_a_short_payload_declaring_a_large_plane() {
+        let mut payload = vec![TAG_TANS];
+        payload.extend_from_slice(&length_prefix::SHORT_BODY_DECLARED_LEN.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 64]);
+        let err = Tans
+            .decode(0, &[], &payload, &PlaneLayout::Flat, 0)
+            .unwrap_err();
+        assert!(err.to_string().contains("implausible orig_len"), "{err}");
+    }
+
+    #[test]
+    #[ignore = "allocates about 4 GiB; run with --ignored"]
+    fn roundtrip_above_the_ratio_free_length() {
+        let data = length_prefix::skewed_bytes(length_prefix::RATIO_FREE_LEN + 4097);
+        let enc = Tans.encode(&data, None, &PlaneLayout::Flat).unwrap();
+        assert_eq!(
+            enc.payload[0], TAG_TANS,
+            "plane must be tANS-coded, not raw"
+        );
+        let dec = Tans
+            .decode(0, &enc.state_bytes, &enc.payload, &PlaneLayout::Flat, 0)
+            .unwrap();
+        assert!(dec == data);
     }
 }

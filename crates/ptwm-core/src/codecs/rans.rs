@@ -6,6 +6,7 @@
 
 use crate::codec::{CodecId, Encoded, PlaneCodec};
 use crate::codec_tagged::{rans_decode, rans_encode};
+use crate::codecs::length_prefix;
 use crate::error::PtwmCoreError;
 use crate::layout::PlaneLayout;
 use crate::types::descriptor::PlaneDescriptor;
@@ -63,7 +64,11 @@ impl PlaneCodec for Rans {
         // decode entry point needs, since PlaneCodec.decode has no
         // expected_len.
         let inner_tag = *tagged.first().unwrap_or(&0u8);
-        if inner_tag == 0 {
+        // tagged[1..] is the rANS-encoded bytes. Store the plane raw when
+        // rans_encode fell back, or when the decoder would refuse the
+        // declared length.
+        let encoded = &tagged[1..];
+        if inner_tag == 0 || !length_prefix::accepted(plane.len(), encoded.len()) {
             // raw fallback: drop the inner tagged framing and re-wrap.
             let mut payload = Vec::with_capacity(1 + plane.len());
             payload.push(TAG_RAW);
@@ -74,9 +79,10 @@ impl PlaneCodec for Rans {
                 payload,
             });
         }
-        // tagged[1..] is the rANS-encoded bytes.
-        let encoded = &tagged[1..];
-        let orig_len = plane.len() as u32;
+        let orig_len = u32::try_from(plane.len()).map_err(|_| PtwmCoreError::CodecEncode {
+            codec: "rans",
+            msg: "plane length exceeds u32::MAX".into(),
+        })?;
         let mut payload = Vec::with_capacity(1 + 4 + encoded.len());
         payload.push(TAG_RANS);
         payload.extend_from_slice(&orig_len.to_le_bytes());
@@ -113,14 +119,9 @@ impl PlaneCodec for Rans {
                 }
                 let orig_len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
                 let encoded = &rest[4..];
-                // Absolute cap to defend against adversarial headers that
-                // would drive a multi-GiB allocation. Bounded by size, not
-                // compression ratio: rANS reaches arbitrarily high ratios
-                // on near-degenerate distributions (an all-zero 64 KiB
-                // byte plane encodes to ~30 bytes), so a ratio cap rejects
-                // legitimate inputs.
-                const MAX_ORIG_LEN: usize = 1 << 30; // 1 GiB
-                if orig_len > MAX_ORIG_LEN {
+                // Defend against headers that would drive a multi-GiB
+                // allocation; the encoder applies the same rule.
+                if !length_prefix::accepted(orig_len, encoded.len()) {
                     return Err(PtwmCoreError::CodecDecode {
                         codec: "rans",
                         msg: format!(
@@ -244,5 +245,31 @@ mod tests {
         let c = Rans;
         let result = c.encode(&[0u8; 32], Some(&[1, 2, 3]), &PlaneLayout::Flat);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rans_rejects_a_short_payload_declaring_a_large_plane() {
+        let mut payload = vec![TAG_RANS];
+        payload.extend_from_slice(&length_prefix::SHORT_BODY_DECLARED_LEN.to_le_bytes());
+        payload.extend_from_slice(&[0u8; 64]);
+        let err = Rans
+            .decode(0, &[], &payload, &PlaneLayout::Flat, 0)
+            .unwrap_err();
+        assert!(err.to_string().contains("implausible orig_len"), "{err}");
+    }
+
+    #[test]
+    #[ignore = "allocates about 4 GiB; run with --ignored"]
+    fn rans_roundtrip_above_the_ratio_free_length() {
+        let data = length_prefix::skewed_bytes(length_prefix::RATIO_FREE_LEN + 4097);
+        let enc = Rans.encode(&data, None, &PlaneLayout::Flat).unwrap();
+        assert_eq!(
+            enc.payload[0], TAG_RANS,
+            "plane must be rANS-coded, not raw"
+        );
+        let dec = Rans
+            .decode(0, &enc.state_bytes, &enc.payload, &PlaneLayout::Flat, 0)
+            .unwrap();
+        assert!(dec == data);
     }
 }

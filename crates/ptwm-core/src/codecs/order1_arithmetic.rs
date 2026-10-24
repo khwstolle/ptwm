@@ -72,7 +72,11 @@ impl PlaneCodec for Order1Arithmetic {
             });
         }
         let mut model = Order1Static::fit(plane);
-        let payload = frame_payload(plane.len(), &encode_bytes(&mut model, plane));
+        let payload = frame_payload(
+            plane.len(),
+            &encode_bytes(&mut model, plane),
+            "order1_arithmetic",
+        )?;
         Ok(Encoded {
             state_bytes: model.serialize(),
             state_format_version: STATE_FORMAT_VERSION,

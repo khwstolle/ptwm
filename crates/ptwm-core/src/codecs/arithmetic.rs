@@ -5,6 +5,7 @@
 //! planes).
 
 use crate::codec::{CodecId, Encoded, PlaneCodec};
+use crate::codecs::length_prefix;
 use crate::entropy::arithmetic::{
     Order0Adaptive, Order0Static, Order1Adaptive, decode_bytes, encode_bytes,
 };
@@ -12,22 +13,35 @@ use crate::error::PtwmCoreError;
 use crate::layout::PlaneLayout;
 use crate::types::descriptor::PlaneDescriptor;
 
-/// Absolute cap on the framed decoded length, mirroring `rans.rs`. Guards a
-/// hostile length prefix from driving a multi-GiB decode loop.
-const MAX_DECODED_LEN: usize = 1 << 30; // 1 GiB
-
 /// Prepend the true decoded length (u32 LE) so decode is self-delimiting.
+///
+/// Fails when the decoder would refuse the length (see
+/// [`length_prefix::accepted`]); these coders have no raw fallback.
 ///
 /// The container's `decode` receives a `decoded_len` derived from the
 /// *source-tensor* descriptor, which for byte-split planes is larger than the
 /// actual plane length. Self-delimiting codecs (Huffman, rANS, …) ignore that
 /// argument and recover the length from their own payload; the arithmetic
 /// coders do the same here rather than trusting `decoded_len`.
-pub(crate) fn frame_payload(decoded_len: usize, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn frame_payload(
+    decoded_len: usize,
+    payload: &[u8],
+    codec: &'static str,
+) -> Result<Vec<u8>, PtwmCoreError> {
+    if !length_prefix::accepted(decoded_len, payload.len()) {
+        return Err(PtwmCoreError::CodecEncode {
+            codec,
+            msg: format!(
+                "decoded length {decoded_len} with {} encoded bytes exceeds the length-prefix limit",
+                payload.len()
+            ),
+        });
+    }
     let mut out = Vec::with_capacity(4 + payload.len());
+    // `accepted` guarantees the length fits the u32 prefix.
     out.extend_from_slice(&(decoded_len as u32).to_le_bytes());
     out.extend_from_slice(payload);
-    out
+    Ok(out)
 }
 
 /// Inverse of [`frame_payload`]: read the length prefix and return the rest.
@@ -42,13 +56,15 @@ pub(crate) fn unframe_payload<'a>(
         });
     }
     let n = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
-    if n > MAX_DECODED_LEN {
+    let body = &payload[4..];
+    // Guards a hostile length prefix from driving a multi-GiB decode loop.
+    if !length_prefix::accepted(n, body.len()) {
         return Err(PtwmCoreError::CodecDecode {
             codec,
             msg: format!("implausible decoded length {n}"),
         });
     }
-    Ok((n, &payload[4..]))
+    Ok((n, body))
 }
 
 /// Order-0 arithmetic coder with a serialized normalized table.
@@ -85,7 +101,11 @@ impl PlaneCodec for ArithmeticO0 {
             });
         }
         let mut model = Order0Static::fit(plane);
-        let payload = frame_payload(plane.len(), &encode_bytes(&mut model, plane));
+        let payload = frame_payload(
+            plane.len(),
+            &encode_bytes(&mut model, plane),
+            "arithmetic_o0",
+        )?;
         Ok(Encoded {
             state_bytes: model.serialize(),
             state_format_version: 1,
@@ -156,7 +176,8 @@ impl PlaneCodec for ArithmeticO0Adaptive {
         let payload = frame_payload(
             plane.len(),
             &encode_bytes(&mut Order0Adaptive::new(), plane),
-        );
+            "arithmetic_o0_adaptive",
+        )?;
         Ok(Encoded {
             state_bytes: Vec::new(),
             state_format_version: 0,
@@ -229,7 +250,8 @@ impl PlaneCodec for ArithmeticO1 {
         let payload = frame_payload(
             plane.len(),
             &encode_bytes(&mut Order1Adaptive::new(), plane),
-        );
+            "arithmetic_o1",
+        )?;
         Ok(Encoded {
             state_bytes: Vec::new(),
             state_format_version: 0,
@@ -434,5 +456,22 @@ mod tests {
             ac_total <= huff_total,
             "arithmetic O0 ({ac_total}) must not exceed Huffman ({huff_total}) on a structured plane",
         );
+    }
+
+    #[test]
+    fn unframe_rejects_a_short_payload_declaring_a_large_plane() {
+        let mut payload = length_prefix::SHORT_BODY_DECLARED_LEN
+            .to_le_bytes()
+            .to_vec();
+        payload.extend_from_slice(&[0u8; 64]);
+        assert!(unframe_payload(&payload, "arithmetic_o0").is_err());
+    }
+
+    #[test]
+    fn frame_and_unframe_agree_on_the_length() {
+        let framed = frame_payload(5, &[1, 2, 3], "arithmetic_o0").unwrap();
+        let (n, body) = unframe_payload(&framed, "arithmetic_o0").unwrap();
+        assert_eq!((n, body), (5, &[1u8, 2, 3][..]));
+        assert!(frame_payload(length_prefix::RATIO_FREE_LEN + 1, &[0], "arithmetic_o0").is_err());
     }
 }

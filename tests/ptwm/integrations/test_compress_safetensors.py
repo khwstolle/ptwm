@@ -160,12 +160,12 @@ def test_nvfp4_hf_quant_classifier_round_trip(tmp_path):
 
 
 def test_scale_block_tensor_uses_order1_scale_ac(tmp_path):
-    """uint8 weight_scale (E8M0 MXFP4 block scale) must not be encoded with O1SAC.
+    """uint8 weight_scale (E8M0 MXFP4 block scale) reaches Order1ScaleAC.
 
-    Order1ScaleAC is FP8-only by design (E4M3 / E5M2). E8M0 is a pure 8-bit
-    exponent — structurally different — and is excluded at the
-    ``Order1ScaleAC::accepts()`` gate. The effective menu for an E8M0 plane is
-    therefore {Huffman, Rans, Zstd}; trial-encode picks the smallest.
+    E8M0 scale rows are autocorrelated like FP8 scale rows, so
+    ``Order1ScaleAC::accepts()`` admits them. The effective menu for an E8M0
+    plane is {Huffman, Rans, Zstd, Order1ScaleAC}; trial-encode picks the
+    smallest.
     """
     # Use a larger fixture so the plane exceeds the O1SAC minimum threshold
     # (4 096 bytes). out_features=128, in_features=512 → n_groups=32,
@@ -183,8 +183,9 @@ def test_scale_block_tensor_uses_order1_scale_ac(tmp_path):
     base = "model.layers.0.self_attn.q_proj"
     scale_codecs = _codec_ids_for_tensor(blob, f"{base}.weight_scale")
     assert scale_codecs, "weight_scale has no planes in container"
-    # O1SAC is filtered for PlaneRole::Value planes; effective menu is {Huffman, Rans, Zstd}.
-    _effective_menu = frozenset({_CODEC_HUFFMAN, _CODEC_RANS, _CODEC_ZSTD})
+    _effective_menu = frozenset(
+        {_CODEC_HUFFMAN, _CODEC_RANS, _CODEC_ZSTD, _CODEC_ORDER1_SCALE_AC}
+    )
     assert all(c in _effective_menu for c in scale_codecs), (
         f"expected all planes of weight_scale to use a hint-menu codec "
         f"({[hex(c) for c in sorted(_effective_menu)]}), "
@@ -225,9 +226,9 @@ def test_mxfp4_heuristic_scale_tensor_uses_order1_scale_ac(tmp_path):
     Use 128 × 512 = 65 536 bytes for the scale plane (well above the
     4 096-byte O1SAC threshold).
 
-    Order1ScaleAC is FP8-only by design; E8M0 (uint8 MXFP4 block scale) is
-    excluded at the ``accepts()`` gate. Trial-encode picks from the effective
-    menu {Huffman, Rans, Zstd}.
+    E8M0 (uint8 MXFP4 block scale) reaches Order1ScaleAC alongside the
+    generic coders; trial-encode picks from the effective menu
+    {Huffman, Rans, Zstd, Order1ScaleAC}.
     """
     from ptwm.classify import HeuristicClassifier
 
@@ -250,8 +251,9 @@ def test_mxfp4_heuristic_scale_tensor_uses_order1_scale_ac(tmp_path):
     blob = _ptwm_blob(out_dir)
     scale_codecs = _codec_ids_for_tensor(blob, "block.weight_scale")
     assert scale_codecs, "weight_scale has no planes in container"
-    # O1SAC is filtered for PlaneRole::Value planes; effective menu is {Huffman, Rans, Zstd}.
-    _effective_menu = frozenset({_CODEC_HUFFMAN, _CODEC_RANS, _CODEC_ZSTD})
+    _effective_menu = frozenset(
+        {_CODEC_HUFFMAN, _CODEC_RANS, _CODEC_ZSTD, _CODEC_ORDER1_SCALE_AC}
+    )
     assert all(c in _effective_menu for c in scale_codecs), (
         f"expected hint-menu codec on weight_scale "
         f"({[hex(c) for c in sorted(_effective_menu)]}), "

@@ -739,11 +739,12 @@ wheels = [
 
 [[package]]
 name = "ptwm"
-version = "1.0.0"
+version = "1.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate", marker = "sys_platform == 'linux'" },
     { name = "cbor2", marker = "sys_platform == 'linux'" },
+    { name = "tomli-w", marker = "sys_platform == 'linux'" },
     { name = "torch", marker = "sys_platform == 'linux'" },
     { name = "xxhash", marker = "sys_platform == 'linux'" },
 ]
@@ -751,7 +752,6 @@ dependencies = [
 [package.optional-dependencies]
 ext-dev = [
     { name = "blake3", marker = "sys_platform == 'linux'" },
-    { name = "tomli-w", marker = "sys_platform == 'linux'" },
     { name = "wasmtime", marker = "sys_platform == 'linux'" },
     { name = "zstandard", marker = "sys_platform == 'linux'" },
 ]
@@ -803,7 +803,7 @@ requires-dist = [
     { name = "blake3", marker = "extra == 'ext-dev'", specifier = ">=0.4" },
     { name = "cbor2", specifier = ">=5.9.0" },
     { name = "lmdb", marker = "extra == 'lmdb'", specifier = ">=1.4" },
-    { name = "tomli-w", marker = "extra == 'ext-dev'", specifier = ">=1.0.0" },
+    { name = "tomli-w", specifier = ">=1.0.0" },
     { name = "torch", specifier = ">=2.6.0" },
     { name = "wasmtime", marker = "extra == 'ext-dev'", specifier = ">=26" },
     { name = "webdataset", marker = "extra == 'webdataset'", specifier = ">=0.2" },

@@ -7,7 +7,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 
 authors = [{ "name" = "Kurt H. W. Stolle", "email" = "kurt@computer.org" }]
-version = "1.0.1"
+version = "1.1.0"
 keywords = [
   "ptwm",
   "compression",
@@ -36,11 +36,11 @@ classifiers = [
   "Topic :: System :: Archiving :: Compression",
 ]
 dependencies = [
-    "accelerate>=1.13.0",
-    "cbor2>=5.9.0",
-    "tomli-w>=1.0.0",
-    "torch>=2.6.0",
-    "xxhash>=3.7.0",
+  "accelerate>=1.13.0",
+  "cbor2>=5.9.0",
+  "tomli-w>=1.0.0",
+  "torch>=2.6.0",
+  "xxhash>=3.7.0",
 ]
 
 [project.optional-dependencies]
@@ -89,18 +89,9 @@ dev = [
   "zstandard>=0.22",
   "lmdb>=1.4",
 ]
-integration = [
-  "transformers>=4.45.2",
-]
-ext-dev = [
-  "blake3>=0.4",
-  "tomli-w>=1.0.0",
-  "wasmtime>=26",
-  "zstandard>=0.22",
-]
-docs = [
-  "griffe>=1.7.0",
-]
+integration = ["transformers>=4.45.2"]
+ext-dev = ["blake3>=0.4", "tomli-w>=1.0.0", "wasmtime>=26", "zstandard>=0.22"]
+docs = ["griffe>=1.7.0"]
 
 [tool.coverage.run]
 branch = true
@@ -273,22 +264,22 @@ convention = "numpy"
   "SIM103",
 ]
 "docs/benchmarks/**" = [
-  "T201",     # print is the output mechanism for benchmark scripts
+  "T201",    # print is the output mechanism for benchmark scripts
   "D",
   "ANN",
   "E501",
-  "ARG",      # PyTorch hook signatures (module, input, output) leave args unused
-  "EM",       # f-string exception messages are fine in throwaway probes
-  "F841",     # exploratory scripts accumulate unused locals
+  "ARG",     # PyTorch hook signatures (module, input, output) leave args unused
+  "EM",      # f-string exception messages are fine in throwaway probes
+  "F841",    # exploratory scripts accumulate unused locals
   "B904",
-  "BLE001",   # broad except around optional codec calls is intentional
+  "BLE001",  # broad except around optional codec calls is intentional
   "PTH",
-  "PLR2004",  # magic numbers (shapes, thresholds) are inherent to probes
-  "PLC0415",  # deferred heavy imports (torch/transformers) inside funcs
+  "PLR2004", # magic numbers (shapes, thresholds) are inherent to probes
+  "PLC0415", # deferred heavy imports (torch/transformers) inside funcs
   "PLW",
   "C",
   "SIM",
-  "NPY002",   # legacy numpy RNG is fine for probes
+  "NPY002",  # legacy numpy RNG is fine for probes
 ]
 "examples/**" = [
   "T201",
@@ -303,17 +294,31 @@ convention = "numpy"
 "python/ptwm/cli/compress.py" = ["T201", "EM102", "E501"]
 "python/ptwm/cli/chains.py" = ["T201", "EM102", "E501", "PLC0415", "ARG001"]
 "python/ptwm/cli/trust.py" = ["T201", "EM102", "E501", "ARG001", "PTH110"]
-"python/ptwm/cli/policy.py" = ["T201", "EM102", "E501", "ARG001", "PTH110", "BLE001"]
-"python/ptwm/cli/ext.py" = ["T201", "EM102", "E501", "ARG001", "PTH110", "BLE001", "PLR1714", "PLC0415"]
+"python/ptwm/cli/policy.py" = [
+  "T201",
+  "EM102",
+  "E501",
+  "ARG001",
+  "PTH110",
+  "BLE001",
+]
+"python/ptwm/cli/ext.py" = [
+  "T201",
+  "EM102",
+  "E501",
+  "ARG001",
+  "PTH110",
+  "BLE001",
+  "PLR1714",
+  "PLC0415",
+]
 "python/ptwm/ext_tooling/pack.py" = ["PLC0415"]
 "python/ptwm/ext_tooling/sign.py" = ["PLC0415"]
 "python/ptwm/cli/bench.py" = ["T201", "EM102", "E501", "ARG001"]
 "python/ptwm/core/_compressor.py" = ["ARG002", "E501"]
 "python/ptwm/core/_decompressor.py" = ["E501"]
 "python/ptwm/core/_header.py" = ["E501", "B904"]
-"python/ptwm/integrations/_hf.py" = [
-  "PLC0415",
-]
+"python/ptwm/integrations/_hf.py" = ["PLC0415"]
 "python/ptwm/integrations/_safetensors.py" = ["PLC0415", "PYI036"]
 "python/ptwm/utils/_patch.py" = ["E501"]
 

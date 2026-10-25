@@ -1,12 +1,9 @@
 [workspace]
 resolver = "2"
-members = [
-    "crates/ptwm-core",
-    "crates/ptwm-py",
-]
+members = ["crates/ptwm-core", "crates/ptwm-py"]
 
 [workspace.package]
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.87"
 license = "MIT"

@@ -48,11 +48,19 @@ pub fn is_nibble_packed_dtype(dtype_code: u16) -> bool {
 /// counts. Element width describes the *value* width for such a dtype, so
 /// deriving the byte count from it would halve the length and leave the
 /// decompressor rebuilding every packed plane at half its size.
-fn storage_bytes(dtype_code: u16, n_elements: u64) -> u64 {
+///
+/// Returns `None` when the byte count does not fit in `u64`.
+pub fn storage_bytes(dtype_code: u16, n_elements: u64) -> Option<u64> {
+    n_elements.checked_mul(storage_bytes_per_element(dtype_code))
+}
+
+/// Storage bytes of one element of a chain-internal dtype. Packed FP4 is
+/// one byte per element (two values).
+pub fn storage_bytes_per_element(dtype_code: u16) -> u64 {
     if is_nibble_packed_dtype(dtype_code) {
-        return n_elements;
+        return 1;
     }
-    n_elements * (element_width_for(dtype_code).bits_per_element() as u64 / 8)
+    element_width_for(dtype_code).bits_per_element() as u64 / 8
 }
 
 /// Mandatory entry node of every PPG chain. Takes no inputs (the runtime
@@ -89,17 +97,34 @@ impl Source {
     }
 
     /// Build the `PlaneDescriptor` for the raw tensor plane this source emits.
-    fn output_descriptor(&self) -> PlaneDescriptor {
-        // product() on an empty iterator yields 1 (multiplicative
-        // identity), so an empty shape represents a scalar (1 element).
-        let n_elements: u64 = self.shape.iter().map(|&d| d as u64).product();
-        let length_bytes = storage_bytes(self.dtype_code, n_elements);
+    ///
+    /// The element count and byte length use checked arithmetic: a shape
+    /// read from a corrupt file can hold up to 255 dimensions of `u32::MAX`,
+    /// which overflows `u64`.
+    fn output_descriptor(&self) -> Result<PlaneDescriptor, PtwmCoreError> {
+        // An empty shape represents a scalar (1 element).
+        let n_elements = self
+            .shape
+            .iter()
+            .try_fold(1u64, |acc, &d| acc.checked_mul(d as u64))
+            .ok_or_else(|| {
+                PtwmCoreError::InvalidContainer(format!(
+                    "Source: element count of shape {:?} overflows u64",
+                    self.shape
+                ))
+            })?;
+        let length_bytes = storage_bytes(self.dtype_code, n_elements).ok_or_else(|| {
+            PtwmCoreError::InvalidContainer(format!(
+                "Source: byte length of {n_elements} elements of dtype {:#06x} overflows u64",
+                self.dtype_code
+            ))
+        })?;
         let layout = if let Some(&last) = self.shape.last() {
             Layout::Rows { row_len: last }
         } else {
             Layout::Flat
         };
-        PlaneDescriptor {
+        Ok(PlaneDescriptor {
             role: Role::Raw,
             element_width: element_width_for(self.dtype_code),
             length_bytes,
@@ -108,7 +133,7 @@ impl Source {
             residual_of: None,
             is_nibble_packed: is_nibble_packed_dtype(self.dtype_code),
             vendor_bytes: vec![],
-        }
+        })
     }
 }
 
@@ -129,7 +154,7 @@ impl Op for Source {
                 self.shape.len()
             )));
         }
-        Ok(vec![self.output_descriptor()])
+        Ok(vec![self.output_descriptor()?])
     }
 
     fn forward(&self, inputs: &[Plane]) -> Result<Vec<Plane>, PtwmCoreError> {
@@ -361,5 +386,23 @@ mod tests {
             assert_eq!(d.length_bytes, 100 * per_elem, "dtype 0x{dtype_code:04X}");
             assert!(!d.is_nibble_packed, "dtype 0x{dtype_code:04X}");
         }
+    }
+
+    #[test]
+    fn overflowing_shape_is_an_error_not_a_panic() {
+        // 3 × u32::MAX elements overflow u64 in the product.
+        let src = Source {
+            shape: vec![u32::MAX; 3],
+            dtype_code: 0x0004,
+        };
+        let err = src.propagate_descriptors(&[]).unwrap_err().to_string();
+        assert!(err.contains("overflows u64"), "{err}");
+        // The element count fits but the fp64 byte count does not.
+        let src = Source {
+            shape: vec![u32::MAX, u32::MAX, 2],
+            dtype_code: 0x0004,
+        };
+        let err = src.propagate_descriptors(&[]).unwrap_err().to_string();
+        assert!(err.contains("overflows u64"), "{err}");
     }
 }

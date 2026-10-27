@@ -68,9 +68,17 @@ values. Adding an eighteenth is a wire-format change. The current
 catalogue covers:
 
 The control ops `Source` and `Terminal` mark chain boundaries. The
-source carries the input dtype and tensor shape. Each terminal
-carries the role bytes that the codec dispatcher uses to score
-candidate codecs.
+source carries a chain-internal dtype code and a shape that counts
+elements of that dtype. The shape's element count times the dtype's
+storage size must equal the tensor's raw byte count: the decoder
+derives every plane descriptor from the Source alone, by walking
+`propagate_descriptors` through the chain without touching tensor
+bytes. Writers skip candidate chains whose Source declares another
+size. Readers of the legacy container still accept files whose Source
+overstates the size by up to 8× (byte input written by v1.1 and
+earlier) or understates it (byte passthrough over an element shape).
+Each terminal carries the role bytes that the codec dispatcher uses
+to score candidate codecs.
 
 The bit reorder family (`BitReorderIeee16`, `BitReorderIeee32`,
 `BitReorderFp8E4M3`, `BitReorderFp8E5M2`) does the per-element bit

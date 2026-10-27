@@ -658,11 +658,19 @@ fn p4_bytes() -> Vec<u8> {
 /// The P4 fixture: fp32 from `Format.BYTE` input. The v1.1 Python path
 /// builds the chain with `chain_shape = [len(bytes)]`, so the fp32 Source
 /// declares four times the real byte count.
+///
+/// The writer now skips chains whose Source does not declare the raw byte
+/// count, so this compresses with the exact chain (`[len / 4]`) and then
+/// rewrites the stored Source dimension to `len(bytes)`. The encoder never
+/// read the Source size (it sizes the source plane from the raw bytes), and
+/// the dimension is a fixed-width u32, so the result is byte-identical to
+/// what v1.1 `compress_model` wrote for the overstated chain.
 fn p4_container() -> Vec<u8> {
     let bytes = p4_bytes();
+    let n = bytes.len() as u64;
     let input = InputTensor {
         name: "p4.byte.fp32".to_string(),
-        candidate_chains: vec![fp32_split_chain(&[bytes.len() as u64])],
+        candidate_chains: vec![fp32_split_chain(&[n / 4])],
         dtype_code: 1,
         // Format.BYTE
         input_format: 1,
@@ -671,7 +679,19 @@ fn p4_container() -> Vec<u8> {
         dtype_name: None,
         delta_reference_blake3: None,
     };
-    compress(&[input], main_options(None))
+    let mut blob = compress(&[input], main_options(None));
+    let exact = fp32_split_chain(&[n / 4]).nodes[0].params.clone();
+    let overstated = fp32_split_chain(&[n]).nodes[0].params.clone();
+    assert_eq!(exact.len(), overstated.len());
+    let at: Vec<usize> = blob
+        .windows(exact.len())
+        .enumerate()
+        .filter(|(_, w)| *w == exact.as_slice())
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(at.len(), 1, "Source params must occur once in the P4 blob");
+    blob[at[0]..at[0] + exact.len()].copy_from_slice(&overstated);
+    blob
 }
 
 /// The P4 tensor in the v1.1.0 table layout, built-in ids pinned to 1.1.0.

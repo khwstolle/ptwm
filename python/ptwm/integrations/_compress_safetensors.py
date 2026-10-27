@@ -26,6 +26,7 @@ from ..preprocessing._cache import (
 from ..preprocessing._chains import (
     CHAIN_BYTE_PASSTHROUGH_VALUE,
     ClassifierRole,
+    build_chain_blobs,
     chains_for,
 )
 from ..preprocessing._explorer import ExploreOptions, explore_chains
@@ -108,7 +109,7 @@ def _chain_bytes_for(
     shape: tuple[int, ...],
     explore_options: ExploreOptions | None = None,
     *,
-    raw: bytes = b"",
+    raw: bytes,
     builder_cache: dict[tuple[int, TensorRole, int], list] | None = None,
     warned_passthrough: set[tuple[int, TensorRole]] | None = None,
     use_user_cache: bool = True,
@@ -171,9 +172,10 @@ def _chain_bytes_for(
         if builder_cache is not None:
             builder_cache[cache_key] = builders
 
-    # Builders may decline a shape by returning None (e.g. spherical-normalize
-    # only accepts 2D tensors); skip those.
-    return [c.to_bytes() for b in builders if (c := b(list(shape))) is not None]
+    # Each chain's Source covers exactly len(raw) bytes in units of its own
+    # Source dtype; builders that decline the shape (e.g. spherical-normalize
+    # only accepts 2D tensors) or cannot cover the bytes are skipped.
+    return build_chain_blobs(builders, shape=list(shape), nbytes=len(raw))
 
 
 def compress_safetensors_file(

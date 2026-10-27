@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use xxhash_rust::xxh64::xxh64;
 
 use crate::chain::Chain;
-use crate::chain::runtime::{ForwardContext, forward_chain};
+use crate::chain::runtime::{ForwardContext, chain_source_descriptor, forward_chain};
 use crate::chain::validate::validate_chain;
 use crate::codec::{CodecId, StateSource, codec_for};
 use crate::codecs::order1_scale_ac;
@@ -518,9 +518,43 @@ fn pass1_select_chain(
     let mut n_failed: usize = 0;
 
     for (idx, chain) in candidates.iter().enumerate() {
+        // Decoders rebuild every plane descriptor from the chain's Source
+        // node, so a chain whose Source does not declare exactly the raw
+        // byte count would write planes the decoder sizes wrongly. Skip it
+        // like any other failing candidate.
+        let chain_src = match chain_source_descriptor(chain) {
+            Ok(d) => d,
+            Err(e) => {
+                last_err = Some(e);
+                n_failed += 1;
+                continue;
+            }
+        };
+        let declared = chain_src.length_bytes;
+        if declared != raw_bytes.len() as u64 {
+            let e = PtwmCoreError::InvalidContainer(format!(
+                "candidate chain {idx} Source declares {declared} bytes, tensor has {}",
+                raw_bytes.len()
+            ));
+            tracing::warn!("pass1_select_chain: {e}; skipping and trying remaining candidates");
+            last_err = Some(e);
+            n_failed += 1;
+            continue;
+        }
+        // `source_descriptor` derives the element width from the record's
+        // dtype code, which is in the public `Dtype` code space, while the
+        // decoder derives it from the chain's Source node, which uses the
+        // chain-internal code space (fp32 is 1 in one and 0x0003 in the
+        // other). Take the width and packing from the chain so encode-time
+        // and decode-time descriptors agree. The layout stays as given: the
+        // record's shape decides it, and changing it would change the
+        // legacy writer's output.
+        let mut forward_source = source_descriptor.clone();
+        forward_source.element_width = chain_src.element_width;
+        forward_source.is_nibble_packed = chain_src.is_nibble_packed;
         let ctx = ForwardContext {
             source_bytes: raw_bytes,
-            source_descriptor: source_descriptor.clone(),
+            source_descriptor: forward_source,
             deps: &[],
         };
         let fwd = match forward_chain(chain, &ctx) {
@@ -1398,6 +1432,99 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(decoded, fwd.terminal_planes[i].0.bytes.as_ref());
+        }
+    }
+
+    #[test]
+    fn candidate_with_mis_sized_source_is_skipped() {
+        let raw: Vec<u8> = (0..256u32).map(|i| (i % 7) as u8).collect();
+        let opts = || CompressorOptions {
+            method_hint: 1,
+            emit_payload_hash: true,
+            emit_plane_crc: true,
+            forced_codec: None,
+            allow_codec_ids: None,
+            chunk_size: None,
+        };
+        let input = |chains: Vec<Chain>| InputTensor {
+            name: "t".into(),
+            candidate_chains: chains,
+            dtype_code: 0x0005,
+            input_format: 0,
+            raw_bytes: &raw,
+            shape: None,
+            dtype_name: None,
+            delta_reference_blake3: None,
+        };
+
+        // The first candidate declares 4× the raw size (the old Python
+        // byte-input bug); the writer must pick the exact one.
+        let mut buf: Vec<u8> = Vec::new();
+        let picked = compress_model(
+            Cursor::new(&mut buf),
+            &[input(vec![
+                passthrough_value_chain(raw.len() as u32 * 4),
+                passthrough_value_chain(raw.len() as u32),
+            ])],
+            opts(),
+        )
+        .unwrap();
+        assert_eq!(picked, vec![0]);
+        let reader = ContainerReader::open(&buf).unwrap();
+        assert_eq!(reader.chain_registry.chains.len(), 1);
+        assert_eq!(
+            reader.chain_registry.chains[0].1,
+            passthrough_value_chain(raw.len() as u32)
+        );
+        assert_eq!(reader.decode_tensor("t").unwrap(), raw);
+
+        // With only mis-sized candidates (over- and understated), compression
+        // fails and names the mismatch.
+        let mut buf: Vec<u8> = Vec::new();
+        let err = compress_model(
+            Cursor::new(&mut buf),
+            &[input(vec![
+                passthrough_value_chain(raw.len() as u32 * 4),
+                passthrough_value_chain(raw.len() as u32 / 2),
+            ])],
+            opts(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("all 2 candidate chains failed"), "{err}");
+        assert!(
+            err.contains("Source declares 128 bytes, tensor has 256"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn encode_descriptors_take_element_width_from_the_chain() {
+        // The record's dtype code (fp16 is 4 in the public code space) maps
+        // to Word8 in the chain-internal space; the chain's Source says
+        // Word2. Encode-time planes must carry the chain's width, as the
+        // decoder rebuilds them from the chain.
+        let n = 64u32;
+        let raw: Vec<u8> = (0..n)
+            .flat_map(|i| (0x3800u16 | i as u16).to_le_bytes())
+            .collect();
+        let chain = fp16_split_chain(n);
+        let outcome = pass1_select_chain(
+            std::slice::from_ref(&chain),
+            &raw,
+            &source_descriptor_for(4, raw.len() as u64, None),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let decoded = crate::chain::runtime::propagate_terminal_descriptors(&chain).unwrap();
+        assert_eq!(outcome.terminals.len(), decoded.len());
+        for ((plane, _), want) in outcome.terminals.iter().zip(&decoded) {
+            assert_eq!(plane.descriptor.element_width, want.element_width);
+            assert_eq!(plane.descriptor.is_nibble_packed, want.is_nibble_packed);
+            assert_eq!(plane.descriptor.length_bytes, want.length_bytes);
         }
     }
 

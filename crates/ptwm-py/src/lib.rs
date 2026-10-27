@@ -60,6 +60,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_builtin_canonical_id, m)?)?;
     m.add_function(wrap_pyfunction!(py_write_chain_blob, m)?)?;
     m.add_function(wrap_pyfunction!(py_chain_blob_info, m)?)?;
+    m.add_function(wrap_pyfunction!(py_chain_source_byte_len, m)?)?;
     trust::register(m)?;
     policy::register(m)?;
     host_flavor::register(m)?;
@@ -950,6 +951,19 @@ fn py_chain_blob_info(blob: &[u8]) -> PyResult<(usize, Vec<(u16, u16)>)> {
     }
 
     Ok((et_size, table))
+}
+
+/// Byte count the Source node of a chain blob declares (shape × dtype
+/// storage size). Writers require it to equal the tensor's raw byte count;
+/// tests use it to check the Python chain builders against the Rust rule.
+#[pyfunction]
+#[pyo3(name = "chain_source_byte_len")]
+fn py_chain_source_byte_len(blob: &[u8]) -> PyResult<u64> {
+    let (chain, _) = ptwm_core::chain::wire::read_chain_blob(blob)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let desc = ptwm_core::chain::runtime::chain_source_descriptor(&chain)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(desc.length_bytes)
 }
 
 /// Parse a chain from the **legacy wire format**, where node op-ids were

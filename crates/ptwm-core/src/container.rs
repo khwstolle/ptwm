@@ -1219,7 +1219,10 @@ impl<'a> ContainerReader<'a> {
         &self,
         rec: &crate::tensor_record::TensorRecord,
     ) -> Result<Vec<u8>, PtwmCoreError> {
-        use crate::chain::runtime::{InverseContext, chain_terminal_descriptors, inverse_chain};
+        use crate::chain::runtime::{
+            InverseContext, chain_source_descriptor, inverse_chain, max_plane_len,
+            propagate_terminal_descriptors_bounded,
+        };
         use crate::chain::validate::validate_chain;
         use crate::codec::codec_for;
         use crate::tensor_record::{CHAIN_REF_INLINE_BIT, TENSOR_FLAG_PAYLOAD_HASH};
@@ -1253,10 +1256,27 @@ impl<'a> ContainerReader<'a> {
         })?;
         validate_chain(chain, n_dependencies)?;
 
-        // Discover the descriptor of every terminal by walking the chain
-        // forward symbolically (no source bytes needed). This is a pure
-        // function of the chain structure — see `chain_terminal_descriptors`.
-        let term_descriptors = chain_terminal_descriptors(chain)?;
+        // Bound the chain by the record's `orig_size` before any plane is
+        // sized from it. The Source may overstate the raw size by up to 8×:
+        // the Python byte-input path wrote such chains before the P4 fix,
+        // and those files must keep decoding. A Source declaring more is
+        // corrupt; rejecting it here keeps codecs from pre-allocating
+        // gigabytes for a small tensor.
+        let source_desc = chain_source_descriptor(chain)?;
+        let max_source = rec.orig_size.saturating_mul(8);
+        if source_desc.length_bytes > max_source {
+            return Err(PtwmCoreError::InvalidContainer(format!(
+                "decode_tensor: chain Source declares {} bytes for a {}-byte tensor \
+                 (at most {max_source} accepted)",
+                source_desc.length_bytes, rec.orig_size
+            )));
+        }
+        let plane_bound = max_plane_len(rec.orig_size);
+
+        // Discover the descriptor of every terminal by walking the chain's
+        // descriptors symbolically (no source bytes, no plane buffers). Every
+        // node's output is bounded by `plane_bound`.
+        let term_descriptors = propagate_terminal_descriptors_bounded(chain, plane_bound)?;
         if term_descriptors.len() != rec.terminals.len() {
             return Err(PtwmCoreError::InvalidContainer(format!(
                 "decode_tensor: chain has {} terminals but record has {} planes",
@@ -1349,7 +1369,19 @@ impl<'a> ContainerReader<'a> {
                 // own state, so decode them across the rayon pool and
                 // concatenate in order. (The encoder frames chunks sequentially,
                 // so the offsets are contiguous.)
-                let total: usize = chunks.iter().map(|e| e.decoded_size as usize).sum();
+                // The chunk table is file data: bound every decoded size and
+                // their sum before any chunk is decoded or allocated.
+                let total = chunks
+                    .iter()
+                    .try_fold(0u64, |acc, e| acc.checked_add(u64::from(e.decoded_size)))
+                    .filter(|&t| t <= plane_bound)
+                    .ok_or_else(|| {
+                        PtwmCoreError::InvalidContainer(format!(
+                            "chunk table decodes to more than {plane_bound} bytes for a \
+                             {}-byte tensor",
+                            rec.orig_size
+                        ))
+                    })? as usize;
                 let decoded_chunks: Vec<Vec<u8>> = chunks
                     .par_iter()
                     .enumerate()
@@ -1461,8 +1493,11 @@ impl<'a> ContainerReader<'a> {
                         ));
                     }
                 };
-                // Decoded length comes from the propagated terminal descriptor.
-                let decoded_len = descriptor.length_bytes as usize;
+                // Decoded length comes from the propagated terminal descriptor,
+                // which `plane_bound` already limits.
+                let decoded_len = usize::try_from(descriptor.length_bytes).map_err(|_| {
+                    PtwmCoreError::InvalidContainer("plane length overflows usize".into())
+                })?;
                 codec.decode(
                     state_version,
                     &state_bytes,
@@ -1471,6 +1506,19 @@ impl<'a> ContainerReader<'a> {
                     decoded_len,
                 )?
             };
+            // Self-delimiting codecs may return a length other than the
+            // descriptor's: older files carry Sources that overstate (Python
+            // byte input) or understate (byte passthrough over an element
+            // shape) the raw size. Bound the result by `orig_size` instead;
+            // the length check after `inverse_chain` and the payload hash
+            // cover the rest.
+            if plane_bytes.len() as u64 > plane_bound {
+                return Err(PtwmCoreError::InvalidContainer(format!(
+                    "decoded plane is {} bytes, bound is {plane_bound} for a {}-byte tensor",
+                    plane_bytes.len(),
+                    rec.orig_size
+                )));
+            }
 
             // Plane CRC enforcement (when emitted by writer).
             if let Some(expected_crc) = plane_rec.crc32 {
@@ -1494,6 +1542,13 @@ impl<'a> ContainerReader<'a> {
             deps: &[],
         };
         let source_plane = inverse_chain(chain, &inv_ctx)?;
+        if source_plane.bytes.len() as u64 != rec.orig_size {
+            return Err(PtwmCoreError::InvalidContainer(format!(
+                "decode_tensor: chain decoded {} bytes, record says {}",
+                source_plane.bytes.len(),
+                rec.orig_size
+            )));
+        }
         let raw: Vec<u8> = source_plane.bytes.as_ref().to_vec();
 
         // Tensor-level payload hash validation.
@@ -3103,5 +3158,181 @@ label = "test-author"
             decoded, original_bytes,
             "round_trip_with_builtin_via_router: bit-exact roundtrip failed"
         );
+    }
+
+    // ── Decode bounds (P5) ───────────────────────────────────────────────
+
+    /// Compress `raw` through a passthrough chain with the Identity codec
+    /// (so plane bytes equal tensor bytes), then rewrite the container with
+    /// the record's chain inline and `edit` applied to the record.
+    fn identity_container_with(
+        raw: &[u8],
+        chunk_size: Option<u32>,
+        edit: impl FnOnce(&mut TensorRecord),
+    ) -> Vec<u8> {
+        use crate::compressor::{CompressorOptions, InputTensor, compress_model};
+        use crate::tensor_record::{CHAIN_REF_INLINE_BIT, parse_tensor_record};
+        use std::io::Cursor;
+
+        let chain = v3_passthrough_chain(raw.len() as u32);
+        let inputs = vec![InputTensor {
+            name: "t".into(),
+            candidate_chains: vec![chain.clone()],
+            dtype_code: 0x0005,
+            input_format: 0,
+            raw_bytes: raw,
+            shape: None,
+            dtype_name: None,
+            delta_reference_blake3: None,
+        }];
+        let mut buf: Vec<u8> = Vec::new();
+        compress_model(
+            Cursor::new(&mut buf),
+            &inputs,
+            CompressorOptions {
+                method_hint: 1,
+                emit_payload_hash: false,
+                emit_plane_crc: false,
+                forced_codec: Some(CodecId::Identity),
+                allow_codec_ids: None,
+                chunk_size,
+            },
+        )
+        .unwrap();
+        let reader = ContainerReader::open(&buf).unwrap();
+        assert_eq!(reader.decode_tensor("t").unwrap(), raw);
+        let (mut rec, _) =
+            parse_tensor_record(reader.get_tensor_record_bytes("t").unwrap()).unwrap();
+        rec.chain_ref = CHAIN_REF_INLINE_BIT;
+        rec.inline_chain = Some(chain);
+        edit(&mut rec);
+
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut w = ContainerWriter::new(std::io::Cursor::new(&mut out)).unwrap();
+            w.set_extension_table(reader.extension_table.clone());
+            w.append_tensor(&rec).unwrap();
+            w.finalize().unwrap();
+        }
+        out
+    }
+
+    fn set_source_shape(rec: &mut TensorRecord, dims: &[u32], dtype_code: u16) {
+        let mut params = vec![dims.len() as u8];
+        for d in dims {
+            params.extend_from_slice(&d.to_le_bytes());
+        }
+        params.extend_from_slice(&dtype_code.to_le_bytes());
+        rec.inline_chain.as_mut().unwrap().nodes[0].params = params;
+    }
+
+    #[test]
+    fn rewritten_identity_container_still_decodes() {
+        let raw: Vec<u8> = (0..64u8).collect();
+        let buf = identity_container_with(&raw, None, |_| {});
+        assert_eq!(
+            ContainerReader::open(&buf)
+                .unwrap()
+                .decode_tensor("t")
+                .unwrap(),
+            raw
+        );
+    }
+
+    #[test]
+    fn huge_source_fails_fast_without_allocating() {
+        // A 16-byte tensor whose chain declares [1<<20, 1<<20] fp32 (4 TiB),
+        // and one that declares 4 GiB: both fail before any plane buffer is
+        // sized from the chain.
+        let raw = vec![7u8; 16];
+        for (dims, dtype) in [
+            (vec![1u32 << 20, 1 << 20], 0x0003u16),
+            (vec![u32::MAX], 0x0005),
+        ] {
+            let buf =
+                identity_container_with(&raw, None, |rec| set_source_shape(rec, &dims, dtype));
+            let reader = ContainerReader::open(&buf).unwrap();
+            let t0 = std::time::Instant::now();
+            let err = reader.decode_tensor("t").unwrap_err().to_string();
+            assert!(err.contains("Source declares"), "{err}");
+            assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn overstated_source_within_8x_still_decodes() {
+        // Files written by the Python byte-input path before the P4 fix
+        // declare fp32 elements for a byte count: 4× the raw size.
+        let raw: Vec<u8> = (0..64u8).collect();
+        let buf = identity_container_with(&raw, None, |rec| set_source_shape(rec, &[64], 0x0003));
+        assert_eq!(
+            ContainerReader::open(&buf)
+                .unwrap()
+                .decode_tensor("t")
+                .unwrap(),
+            raw
+        );
+        // Above 8× is rejected.
+        let buf = identity_container_with(&raw, None, |rec| set_source_shape(rec, &[129], 0x0003));
+        let err = ContainerReader::open(&buf)
+            .unwrap()
+            .decode_tensor("t")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Source declares"), "{err}");
+    }
+
+    #[test]
+    fn understated_source_still_decodes() {
+        // Byte passthrough over an element shape (Python fallback for dtypes
+        // without a production chain) declares fewer bytes than the tensor.
+        let raw: Vec<u8> = (0..64u8).collect();
+        let buf = identity_container_with(&raw, None, |rec| set_source_shape(rec, &[16], 0x0005));
+        assert_eq!(
+            ContainerReader::open(&buf)
+                .unwrap()
+                .decode_tensor("t")
+                .unwrap(),
+            raw
+        );
+    }
+
+    #[test]
+    fn decoded_length_must_equal_orig_size() {
+        let raw: Vec<u8> = (0..64u8).collect();
+        let buf = identity_container_with(&raw, None, |rec| rec.orig_size = 63);
+        let err = ContainerReader::open(&buf)
+            .unwrap()
+            .decode_tensor("t")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("record says 63"), "{err}");
+    }
+
+    #[test]
+    fn chunk_table_beyond_bound_is_rejected_before_decode() {
+        let raw: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+        let clean = identity_container_with(&raw, Some(256), |rec| {
+            assert!(rec.terminals[0].chunk_table.is_some());
+        });
+        assert_eq!(
+            ContainerReader::open(&clean)
+                .unwrap()
+                .decode_tensor("t")
+                .unwrap(),
+            raw
+        );
+        // One chunk claims u32::MAX decoded bytes for a 2 KiB tensor.
+        let buf = identity_container_with(&raw, Some(256), |rec| {
+            rec.terminals[0].chunk_table.as_mut().unwrap()[0].decoded_size = u32::MAX;
+        });
+        let t0 = std::time::Instant::now();
+        let err = ContainerReader::open(&buf)
+            .unwrap()
+            .decode_tensor("t")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("chunk table decodes to more than"), "{err}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
     }
 }

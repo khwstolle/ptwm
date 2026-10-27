@@ -16,16 +16,20 @@ This module provides:
   ``list[ChainBuilder]`` table
 * :func:`chains_for` — thin wrapper over :data:`PRODUCTION_CHAINS`.
 
-Chain builders are callables ``(shape: list[int]) -> Chain``. The compressor
-driver calls them per-tensor so each chain instance carries the tensor's
-concrete shape in its Source node params, which the decoder's placeholder-
-forward descriptor recovery path requires.
+Chain builders are callables ``(shape: list[int]) -> Chain``. The shape
+counts elements of the builder's *Source dtype*, and the shape's element
+count times that dtype's storage size must equal the raw byte count of the
+tensor: the decoder rebuilds every plane descriptor from the Source node
+alone, and the Rust writer skips any candidate chain whose Source declares
+another size. Call builders through :func:`build_chain_blobs`, which derives
+that shape from the tensor shape and byte count.
 """
 
 from __future__ import annotations
 
+import math
 import struct
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 
@@ -94,6 +98,31 @@ _CHAIN_DTYPE: dict[int, int] = {
     30: 0x0011,  # Float8E5M2
     31: 0x001F,  # Float4E2M1FNx2 (packed fp4: nibble width, 1 byte/elem)
 }
+
+
+# Storage bytes per element of a chain-internal dtype. Mirrors
+# ``storage_bytes_per_element`` in crates/ptwm-core/src/transforms/source.rs:
+# 16-bit, 32-bit and 64-bit codes; everything else, packed FP4 (0x001F, one
+# byte holds two values) included, is one byte.
+_CHAIN_STORAGE_BYTES: dict[int, int] = {
+    0x0002: 2,
+    0x000F: 2,
+    0x0007: 2,
+    0x0008: 2,
+    0x0003: 4,
+    0x0009: 4,
+    0x000A: 4,
+    0x0004: 8,
+    0x000B: 8,
+    0x000C: 8,
+}
+
+_MAX_SOURCE_DIM = 0xFFFF_FFFF
+
+
+def chain_storage_bytes(internal_dtype: int) -> int:
+    """Storage bytes of one element of chain-internal dtype ``internal_dtype``."""
+    return _CHAIN_STORAGE_BYTES.get(internal_dtype, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +992,94 @@ CHAIN_FP16_HUFF_LLM_RAW: ChainBuilder = _make_huff_llm_raw_chain(_DT.FLOAT16.cod
 
 
 # ---------------------------------------------------------------------------
+# Source shape derivation
+# ---------------------------------------------------------------------------
+
+
+def _source_dtype(chain: Chain) -> int:
+    """Chain-internal dtype code of the chain's Source node (its last 2 bytes)."""
+    params = chain.nodes[0].params
+    return struct.unpack("<H", params[-2:])[0]
+
+
+def source_shape_for(
+    shape: Sequence[int] | None, nbytes: int, storage: int
+) -> list[int] | None:
+    """Shape, in elements of ``storage`` bytes each, that covers ``nbytes``.
+
+    - ``shape is None`` (flat byte input): ``[nbytes // storage]``.
+    - The shape already covers ``nbytes``: the shape, unchanged.
+    - Otherwise the last dimension is rescaled so that the rank stays the
+      same and the leading dimensions still count rows; a scalar becomes
+      ``[nbytes // storage]``.
+
+    Returns ``None`` when no such shape exists (the byte count does not
+    divide into whole elements or rows) or a dimension exceeds ``u32``.
+    """
+    dims = None if shape is None else [int(d) for d in shape]
+    if dims is not None and math.prod(dims) * storage == nbytes:
+        out = dims
+    elif not dims:
+        if nbytes % storage:
+            return None
+        out = [nbytes // storage]
+    else:
+        rows = math.prod(dims[:-1])
+        if rows == 0 or nbytes % rows or (nbytes // rows) % storage:
+            return None
+        out = [*dims[:-1], nbytes // rows // storage]
+    if any(d > _MAX_SOURCE_DIM for d in out):
+        return None
+    return out
+
+
+def build_chain_blobs(
+    builders: Sequence[ChainBuilder],
+    *,
+    shape: Sequence[int] | None,
+    nbytes: int,
+) -> list[bytes]:
+    """Build every candidate chain for a tensor and serialise it.
+
+    ``shape`` is the tensor shape in elements of the tensor's own dtype, or
+    ``None`` for flat byte input; ``nbytes`` is the raw byte count. Each
+    builder's Source shape is derived from these so that it counts elements
+    of the builder's own Source dtype and covers exactly ``nbytes`` (see
+    :func:`source_shape_for`). A builder is skipped when it declines the
+    shape (returns ``None``) or when no Source shape fits the byte count,
+    for example 4094 bytes for an fp32 chain.
+
+    When no builder remains, the result is the byte passthrough chain over
+    all ``nbytes``, which fits any buffer.
+    """
+    probe_shape = list(shape) if shape is not None else [nbytes]
+    blobs: list[bytes] = []
+    for builder in builders:
+        chain = builder(probe_shape)
+        if chain is None:
+            continue
+        storage = chain_storage_bytes(_source_dtype(chain))
+        src_shape = source_shape_for(shape, nbytes, storage)
+        if src_shape is None:
+            continue
+        if src_shape != probe_shape:
+            chain = builder(src_shape)
+            if chain is None:
+                continue
+        blobs.append(chain.to_bytes())
+    if not blobs:
+        src_shape = source_shape_for(shape, nbytes, 1)
+        if src_shape is None:
+            src_shape = [nbytes]
+        chain = CHAIN_BYTE_PASSTHROUGH_VALUE(src_shape)
+        if chain is None:  # pragma: no cover - the passthrough never declines
+            msg = "byte passthrough chain declined its shape"
+            raise RuntimeError(msg)
+        blobs.append(chain.to_bytes())
+    return blobs
+
+
+# ---------------------------------------------------------------------------
 # Production chains table
 # ---------------------------------------------------------------------------
 
@@ -1073,5 +1190,8 @@ __all__ = [
     "ClassifierRole",
     "PRODUCTION_CHAINS",
     "TerminalRef",
+    "build_chain_blobs",
+    "chain_storage_bytes",
     "chains_for",
+    "source_shape_for",
 ]

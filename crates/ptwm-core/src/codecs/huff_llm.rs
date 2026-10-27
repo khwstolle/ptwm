@@ -36,14 +36,15 @@ impl PlaneCodec for HuffLlm5Bit {
     }
 
     fn accepts(&self, descriptor: &PlaneDescriptor) -> bool {
-        // Gate on the *role*, not `element_width`. `source_descriptor_for`
-        // derives `element_width` from a chain-internal dtype namespace, but
-        // production passes *external* dtype codes, so a raw fp16/bf16 source
-        // plane reaches a codec mislabeled (bf16 -> Byte, fp16 -> Word8 via a
-        // namespace collision). `Role::Raw` is stamped reliably by
-        // `source_descriptor_for` and preserved through the terminal re-tag,
-        // and the codec reads raw 16-bit LE words directly (it never relied on
-        // `element_width` for correctness). Only terminal planes are
+        // Gate on the *role*, not `element_width`. The compressor now takes
+        // the source plane's width from the chain's Source node, so encode
+        // and decode agree on it, but files written before that carried
+        // planes whose width came from the public dtype code (bf16 -> Byte,
+        // fp16 -> Word8), and the codec must keep accepting the same planes.
+        // `Role::Raw` is stamped reliably by the Source and preserved
+        // through the terminal re-tag, and the codec reads raw 16-bit LE
+        // words directly (it never relied on `element_width` for
+        // correctness). Only terminal planes are
         // trial-encoded. The huff_llm raw chain is the only one terminating on
         // the *un-transformed* source plane, but the spherical_normalize and
         // alpha_stable_normalize chains also expose `Role::Raw` terminals

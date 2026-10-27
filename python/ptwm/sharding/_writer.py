@@ -8,8 +8,8 @@ from typing import Any
 
 from .. import _rust
 from ..preprocessing._chains import (
-    CHAIN_BYTE_PASSTHROUGH_VALUE,
     ClassifierRole,
+    build_chain_blobs,
     chains_for,
 )
 from ..utils import DType
@@ -17,14 +17,19 @@ from ..utils import DType
 __all__ = ["write_ptwm_shard", "compress_ptwm_blob"]
 
 
-def _default_chain_bytes(dtype_code: int, shape: tuple[int, ...]) -> list[bytes]:
-    """Return chain bytes for ``(dtype_code, STANDARD)``; fallback to passthrough."""
-    builders = chains_for(dtype_code, ClassifierRole.STANDARD)
-    if not builders:
-        builders = [CHAIN_BYTE_PASSTHROUGH_VALUE]
-    # Builders may decline a shape by returning None (e.g. spherical-normalize
-    # only accepts 2D tensors); skip those.
-    return [c.to_bytes() for b in builders if (c := b(list(shape))) is not None]
+def _default_chain_bytes(
+    dtype_code: int, shape: tuple[int, ...], nbytes: int
+) -> list[bytes]:
+    """Return chain bytes for ``(dtype_code, STANDARD)``; fallback to passthrough.
+
+    Each chain's Source covers exactly ``nbytes`` (see
+    :func:`~ptwm.preprocessing._chains.build_chain_blobs`).
+    """
+    return build_chain_blobs(
+        chains_for(dtype_code, ClassifierRole.STANDARD),
+        shape=list(shape),
+        nbytes=nbytes,
+    )
 
 
 def compress_ptwm_blob(
@@ -59,7 +64,7 @@ def compress_ptwm_blob(
                 None,  # delta_ref_blake3
             )
         )
-        auto_chains.append(_default_chain_bytes(int(dt.code), shape))
+        auto_chains.append(_default_chain_bytes(int(dt.code), shape, len(raw)))
 
     effective_chains = (
         chains_per_tensor if chains_per_tensor is not None else auto_chains

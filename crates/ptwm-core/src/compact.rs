@@ -51,8 +51,10 @@
 //! unknown flag bits, and an incompatible layout gets a new magic.
 
 use crate::chain::Chain;
-use crate::chain::dispatch::op_from_id;
-use crate::chain::runtime::{InverseContext, chain_terminal_descriptors, inverse_chain};
+use crate::chain::runtime::{
+    InverseContext, chain_source_descriptor, inverse_chain, max_plane_len,
+    propagate_terminal_descriptors_bounded,
+};
 use crate::chain::validate::validate_chain;
 use crate::chain::wire::{read_chain, write_chain};
 use crate::codec::{CodecId, StateSource, codec_for};
@@ -378,31 +380,18 @@ fn decode_body(
     let (chain, consumed) = read_chain(r.rest(), &table)?;
     r.pos += consumed;
     validate_chain(&chain, 0)?;
-    // `chain_terminal_descriptors` runs the chain forward on a zero buffer
-    // of the size the Source node declares, and codecs pre-allocate the
-    // plane lengths that follow from it. Bound the declared size by the
-    // frame's `orig_size` first, so a corrupt chain cannot request gigabytes
-    // for a small tensor. The factor covers a source declared in elements of
-    // up to 8 bytes for byte input; the constant covers block padding.
-    let max_len = orig_size.saturating_mul(8).saturating_add(4096);
-    let first = chain
-        .nodes
-        .first()
-        .ok_or_else(|| bad("chain has no nodes"))?;
-    if first.op != OpId::Source {
-        return Err(bad("chain node 0 is not Source"));
-    }
-    let source = op_from_id(OpId::Source, &first.params)?.propagate_descriptors(&[])?;
-    if source.iter().any(|d| d.length_bytes > max_len) {
+    // Writers check that the chain's Source declares exactly the raw byte
+    // count, so a frame whose Source disagrees with `orig_size` is corrupt.
+    // Checking before the descriptor walk keeps a corrupt chain from sizing
+    // planes (and codec allocations) beyond the tensor.
+    let source = chain_source_descriptor(&chain)?;
+    if source.length_bytes != orig_size {
         return Err(bad(&format!(
-            "chain declares a source larger than {max_len} bytes for a \
-             {orig_size}-byte tensor"
+            "chain Source declares {} bytes, header says {orig_size}",
+            source.length_bytes
         )));
     }
-    let descriptors = chain_terminal_descriptors(&chain)?;
-    if descriptors.iter().any(|d| d.length_bytes > max_len) {
-        return Err(bad("chain declares a plane larger than its bound"));
-    }
+    let descriptors = propagate_terminal_descriptors_bounded(&chain, max_plane_len(orig_size))?;
 
     let mut terminal_planes: Vec<Plane> = Vec::with_capacity(descriptors.len());
     for descriptor in descriptors {
@@ -432,11 +421,15 @@ fn decode_body(
         let layout = legacy_plane_layout(descriptor.layout);
         let decoded_len = usize::try_from(descriptor.length_bytes)
             .map_err(|_| bad("plane length overflows usize"))?;
-        // Self-delimiting codecs may return a length other than the chain
-        // descriptor's (the descriptor can overstate it for byte input with a
-        // multi-byte dtype). The container reader accepts this too; the
-        // `orig_size` check and the payload hash below cover the result.
         let bytes = codec.decode(state_version, state, payload, &layout, decoded_len)?;
+        // The Source is exact, so every plane decodes to its descriptor's
+        // length.
+        if bytes.len() != decoded_len {
+            return Err(bad(&format!(
+                "plane decoded to {} bytes, chain says {decoded_len}",
+                bytes.len()
+            )));
+        }
         if let Some(expected) = crc
             && crc32fast::hash(&bytes) != expected
         {
@@ -732,8 +725,30 @@ mod tests {
         b[at + 1..at + 5].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
         let t0 = std::time::Instant::now();
         let err = decode_compact(&b).unwrap_err().to_string();
-        assert!(err.contains("source larger than"), "{err}");
+        assert!(err.contains("Source declares"), "{err}");
         assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn source_must_declare_orig_size_exactly() {
+        // Unlike legacy containers, compact frames carry no files written
+        // before the writer check, so any Source size other than
+        // `orig_size` is corrupt, overstated or understated.
+        let raw: Vec<u8> = (0..3000u32).map(|i| (i % 5) as u8).collect();
+        let blob = compress_compact(&input(&raw, None, None), &opts(false, false))
+            .unwrap()
+            .unwrap();
+        let needle: Vec<u8> = [&[1u8][..], &3000u32.to_le_bytes()].concat();
+        let at = blob
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
+            .unwrap();
+        for dim in [3001u32, 1500, 6000] {
+            let mut b = blob.clone();
+            b[at + 1..at + 5].copy_from_slice(&dim.to_le_bytes());
+            let err = decode_compact(&b).unwrap_err().to_string();
+            assert!(err.contains("Source declares"), "{dim}: {err}");
+        }
     }
 
     #[test]

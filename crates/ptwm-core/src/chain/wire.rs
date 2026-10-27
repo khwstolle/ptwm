@@ -351,19 +351,10 @@ pub fn write_chain_blob(chain: &Chain) -> Result<Vec<u8>, PtwmCoreError> {
 ///
 /// Returns `(chain, bytes_consumed)`.
 pub fn read_chain_blob(blob: &[u8]) -> Result<(Chain, usize), PtwmCoreError> {
-    // Read the local extension table.
-    let inline_table = ExtensionTable::from_bytes(blob)
+    // Read the local extension table; the chain starts where the parse
+    // stopped.
+    let (inline_table, et_consumed) = ExtensionTable::from_bytes_prefix(blob)
         .map_err(|e| PtwmCoreError::InvalidContainer(format!("chain blob et: {e}")))?;
-    // Measure how many bytes the table occupies by re-serializing it.
-    let et_bytes = inline_table
-        .to_bytes()
-        .map_err(|e| PtwmCoreError::InvalidContainer(format!("chain blob et re-ser: {e}")))?;
-    let et_consumed = et_bytes.len();
-    if blob.len() < et_consumed {
-        return Err(PtwmCoreError::InvalidContainer(
-            "chain blob: buffer shorter than extension table".into(),
-        ));
-    }
     let (chain, chain_consumed) = read_chain(&blob[et_consumed..], &inline_table)?;
     Ok((chain, et_consumed + chain_consumed))
 }
@@ -450,6 +441,46 @@ mod tests {
         let (decoded, n) = read_chain(&buf, &table).unwrap();
         assert_eq!(n, buf.len());
         assert_eq!(decoded, chain);
+    }
+
+    /// Pad the capability CBOR of the blob's first table entry with one
+    /// trailing byte. The CBOR parser ignores it, so the table re-serializes
+    /// one byte shorter than it was read.
+    fn pad_first_capability_blob(blob: &[u8]) -> Vec<u8> {
+        let label_len = u16::from_le_bytes([blob[36], blob[37]]) as usize;
+        let cap_len_pos = 4 + 32 + 2 + label_len + 2 + 2 + 1 + 1;
+        let cap_len =
+            u32::from_le_bytes(blob[cap_len_pos..cap_len_pos + 4].try_into().unwrap()) as usize;
+        let cap_end = cap_len_pos + 4 + cap_len;
+        let mut out = blob[..cap_len_pos].to_vec();
+        out.extend_from_slice(&(cap_len as u32 + 1).to_le_bytes());
+        out.extend_from_slice(&blob[cap_len_pos + 4..cap_end]);
+        out.push(0x00);
+        out.extend_from_slice(&blob[cap_end..]);
+        out
+    }
+
+    #[test]
+    fn read_chain_blob_counts_consumed_bytes_from_the_parse() {
+        let chain = Chain {
+            nodes: vec![ChainNode {
+                op: OpId::Source,
+                params: make_source_params(),
+            }],
+            edges: vec![],
+            terminals: vec![],
+        };
+        let blob = write_chain_blob(&chain).unwrap();
+        let padded = pad_first_capability_blob(&blob);
+        assert_eq!(padded.len(), blob.len() + 1);
+        // The padded table re-serializes to the original length, so a
+        // re-serialization count would be one byte short.
+        let (table, used) = ExtensionTable::from_bytes_prefix(&padded).unwrap();
+        assert_eq!(table.to_bytes().unwrap().len() + 1, used);
+
+        let (decoded, consumed) = read_chain_blob(&padded).unwrap();
+        assert_eq!(decoded, chain);
+        assert_eq!(consumed, padded.len());
     }
 
     #[test]

@@ -300,9 +300,11 @@ def decode_model(blob: bytes, skip_missing: bool = False) -> list[tuple[str, byt
 
 
 @translate_errors
-def decode_tensor_shape(blob: bytes, name: str) -> tuple[list[int], str] | None:
+def decode_tensor_shape(
+    blob: bytes, name: str, skip_missing: bool = False
+) -> tuple[list[int], str] | None:
     """Return ``(shape, dtype_name)`` for a tensor, or ``None``."""
-    return _ext.decode_tensor_shape(blob, name)
+    return _ext.decode_tensor_shape(blob, name, skip_missing)
 
 
 @translate_errors
@@ -325,14 +327,14 @@ def list_tensor_names(blob: bytes, skip_missing: bool = False) -> list[str]:
 
 @translate_errors
 def list_plane_summaries(
-    blob: bytes,
+    blob: bytes, skip_missing: bool = False
 ) -> list[tuple[str, int, int, int, int, int]]:
     """Return per-plane summaries for every tensor in a container.
 
     Each entry: ``(tensor_name, plane_index, role, codec_id,
     state_source, payload_len)``.
     """
-    return list(_ext.list_plane_summaries(blob))
+    return list(_ext.list_plane_summaries(blob, skip_missing))
 
 
 @translate_errors

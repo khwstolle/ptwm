@@ -743,17 +743,24 @@ fn list_tensor_names(
 /// Decode the shape-metadata map for a v3 tensor, if present.
 ///
 /// Returns ``(shape, dtype_name)`` or ``None`` when no CBOR shape metadata.
+/// `skip_missing` has the same semantics as for :func:`decode_tensor`.
 #[pyfunction]
+#[pyo3(signature = (blob, name, skip_missing = false))]
 fn decode_tensor_shape(
     py: Python<'_>,
     blob: &Bound<'_, pyo3::types::PyBytes>,
     name: &str,
+    skip_missing: bool,
 ) -> PyResult<Option<(Vec<u64>, String)>> {
     let data: Vec<u8> = blob.as_bytes().to_vec();
     let name_owned = name.to_string();
     let got = py
         .allow_threads(|| -> Result<Option<(Vec<u64>, String)>, PtwmCoreError> {
-            let reader = ContainerReader::open(&data)?;
+            let reader = if skip_missing {
+                ContainerReader::open_partial(&data)?
+            } else {
+                ContainerReader::open(&data)?
+            };
             reader.tensor_shape(&name_owned)
         })
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -764,10 +771,13 @@ fn decode_tensor_shape(
 ///
 /// Returns a list of (tensor_name, plane_index, role, codec_id,
 /// state_source, payload_len) tuples — one row per plane.
+/// `skip_missing` has the same semantics as for :func:`decode_tensor`.
 #[pyfunction]
+#[pyo3(signature = (blob, skip_missing = false))]
 fn list_plane_summaries(
     py: Python<'_>,
     blob: &Bound<'_, pyo3::types::PyBytes>,
+    skip_missing: bool,
 ) -> PyResult<Vec<(String, u32, u8, u16, u8, u64)>> {
     use ptwm_core::tensor_record::parse_tensor_record;
 
@@ -775,7 +785,11 @@ fn list_plane_summaries(
     let summaries = py
         .allow_threads(
             || -> Result<Vec<(String, u32, u8, u16, u8, u64)>, PtwmCoreError> {
-                let reader = ContainerReader::open(&data)?;
+                let reader = if skip_missing {
+                    ContainerReader::open_partial(&data)?
+                } else {
+                    ContainerReader::open(&data)?
+                };
                 let names = reader.tensor_names()?;
                 let mut out = Vec::new();
                 for name in names {
@@ -920,13 +934,10 @@ fn py_chain_blob_info(blob: &[u8]) -> PyResult<(usize, Vec<(u16, u16)>)> {
     use ptwm_core::extension::dispatch::{BuiltinKind, dispatch_builtin};
     use ptwm_core::extension::table::ExtensionTable;
 
-    // Parse the extension table.
-    let inline_table = ExtensionTable::from_bytes(blob)
+    // Parse the extension table; its size is the parse position, not the
+    // length of a re-serialization.
+    let (inline_table, et_size) = ExtensionTable::from_bytes_prefix(blob)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("chain blob et: {e}")))?;
-    let et_bytes = inline_table
-        .to_bytes()
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("chain blob et ser: {e}")))?;
-    let et_size = et_bytes.len();
 
     // Build (table_idx, op_id) pairs for every entry that resolves to an op.
     let mut table: Vec<(u16, u16)> = Vec::with_capacity(inline_table.entries.len());

@@ -7,7 +7,7 @@ use rayon::prelude::*;
 
 use xxhash_rust::xxh64::xxh64;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::chain::Chain;
 use crate::chain::wire::{read_chain, write_chain};
@@ -21,6 +21,14 @@ use crate::prelude::{PreludeEntry, parse_prelude, write_prelude};
 use crate::tensor_record::{TensorRecord, write_tensor_record};
 
 // ── Chain registry ────────────────────────────────────────────────────────────
+
+/// Largest registry chain id. A tensor record addresses a registry chain
+/// through the low 15 bits of `chain_ref`; the high bit marks an inline chain.
+pub const MAX_CHAIN_ID: u16 = 0x7FFF;
+
+/// Largest number of chains a registry can hold: one per id in
+/// `0..=MAX_CHAIN_ID`.
+pub const MAX_REGISTRY_CHAINS: usize = MAX_CHAIN_ID as usize + 1;
 
 /// In-memory chain registry section.
 ///
@@ -52,10 +60,15 @@ impl ChainRegistry {
         builder: &mut ExtensionTableBuilder,
         out: &mut Vec<u8>,
     ) -> Result<(), PtwmCoreError> {
-        if self.chains.len() > u16::MAX as usize {
+        if self.chains.len() > MAX_REGISTRY_CHAINS {
             return Err(PtwmCoreError::InvalidContainer(format!(
-                "ChainRegistry: {} chains exceeds u16::MAX",
+                "ChainRegistry: {} chains exceeds the limit of {MAX_REGISTRY_CHAINS}",
                 self.chains.len()
+            )));
+        }
+        if let Some((id, _)) = self.chains.iter().find(|(id, _)| *id > MAX_CHAIN_ID) {
+            return Err(PtwmCoreError::InvalidContainer(format!(
+                "ChainRegistry: chain_id {id:#06x} does not fit in the 15-bit chain_ref"
             )));
         }
         out.extend_from_slice(&(self.chains.len() as u16).to_le_bytes());
@@ -76,7 +89,8 @@ impl ChainRegistry {
         }
         let num_chains = u16::from_le_bytes(buf[..2].try_into().unwrap()) as usize;
         let mut pos = 2usize;
-        let mut chains = Vec::with_capacity(num_chains);
+        // Each entry takes at least its 2-byte chain_id.
+        let mut chains = Vec::with_capacity(num_chains.min((buf.len() - 2) / 2));
         for i in 0..num_chains {
             if pos + 2 > buf.len() {
                 return Err(PtwmCoreError::InvalidContainer(format!(
@@ -208,6 +222,8 @@ pub struct ContainerWriter<W: Write + Seek> {
     finalized: bool,
     /// Total byte count of the prelude + chain-registry section.
     prelude_section_len: u64,
+    /// Names appended so far. A container holds each name at most once.
+    names: HashSet<String>,
 }
 
 impl<W: Write + Seek> ContainerWriter<W> {
@@ -242,6 +258,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
             prelude_written: false,
             finalized: false,
             prelude_section_len: 0,
+            names: HashSet::new(),
         })
     }
 
@@ -417,6 +434,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
         if self.finalized {
             return Err(PtwmCoreError::InvalidContainer("already finalized".into()));
         }
+        self.check_new_name(&record.name)?;
 
         // On first tensor: flush prelude and record tensors_start_pos.
         if !self.prelude_written {
@@ -442,7 +460,20 @@ impl<W: Write + Seek> ContainerWriter<W> {
             tensor_offset,
             tensor_len,
         });
+        self.names.insert(record.name.clone());
 
+        Ok(())
+    }
+
+    /// Fail if a tensor named `name` was already appended. Readers look
+    /// tensors up by name, so a second record with the same name could never
+    /// be reached.
+    fn check_new_name(&self, name: &str) -> Result<(), PtwmCoreError> {
+        if self.names.contains(name) {
+            return Err(PtwmCoreError::InvalidContainer(format!(
+                "duplicate tensor name '{name}'"
+            )));
+        }
         Ok(())
     }
 
@@ -458,6 +489,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
         if self.finalized {
             return Err(PtwmCoreError::InvalidContainer("already finalized".into()));
         }
+        self.check_new_name(name)?;
         if !self.prelude_written {
             self.flush_prelude()?;
             self.tensors_start_pos = self.header.shared_prelude_offset + self.prelude_section_len;
@@ -474,6 +506,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
             tensor_offset,
             tensor_len: tensor_buf.len() as u64,
         });
+        self.names.insert(name.to_owned());
         Ok(())
     }
 
@@ -838,13 +871,24 @@ impl<'a> ContainerReader<'a> {
             ));
         }
 
-        let (prelude, prelude_bytes_consumed) = parse_prelude(&buf[prelude_off..])?;
+        // The prelude and the chain registry both live inside the
+        // shared-prelude section; parse them from that slice only.
+        let prelude_end = usize::try_from(header.shared_prelude_length)
+            .ok()
+            .and_then(|len| prelude_off.checked_add(len))
+            .filter(|&end| end <= buf.len())
+            .ok_or_else(|| {
+                PtwmCoreError::InvalidContainer("shared prelude section exceeds buffer".into())
+            })?;
+        let prelude_section = &buf[prelude_off..prelude_end];
+        let (prelude, prelude_bytes_consumed) = parse_prelude(prelude_section)?;
 
         // The chain registry immediately follows the prelude bytes within the
-        // shared-prelude region.
+        // shared-prelude section.
         let cr_off = prelude_off + prelude_bytes_consumed;
-        let chain_registry = if cr_off < index_off && cr_off < buf.len() {
-            let (registry, _) = ChainRegistry::read(&buf[cr_off..], &extension_table)?;
+        let chain_registry = if prelude_bytes_consumed < prelude_section.len() {
+            let (registry, _) =
+                ChainRegistry::read(&prelude_section[prelude_bytes_consumed..], &extension_table)?;
             registry
         } else {
             ChainRegistry::new()
@@ -891,22 +935,31 @@ impl<'a> ContainerReader<'a> {
 
     /// Look up a tensor by name and return a slice covering its serialized
     /// `TensorRecord` bytes. Returns `None` if no tensor with that name
-    /// exists. The on-disk index is sorted by `name_hash`, so we use
-    /// `binary_search_by_key` for an O(log n) lookup instead of a linear
-    /// scan — material on models with thousands of tensors.
+    /// exists.
+    ///
+    /// The on-disk index is sorted by `name_hash`, so a binary search finds
+    /// the run of entries with the target hash in O(log n). Two names can
+    /// share a hash, so every entry in the run has its record name compared
+    /// against `name`. Entries whose range or name cannot be read do not
+    /// match.
     pub fn get_tensor_record_bytes(&self, name: &str) -> Option<&[u8]> {
-        let target = name_hash(name);
-        let idx = self
-            .index
-            .binary_search_by_key(&target, |e| e.name_hash)
-            .ok()?;
-        let e = &self.index[idx];
-        let start = e.tensor_offset as usize;
-        let end = start.checked_add(e.tensor_len as usize)?;
-        if end > self.buf.len() {
-            return None;
-        }
-        Some(&self.buf[start..end])
+        self.record_bytes_with_hash(name, name_hash(name))
+    }
+
+    /// [`get_tensor_record_bytes`](Self::get_tensor_record_bytes) with the
+    /// index hash given explicitly, so tests can force a hash collision.
+    fn record_bytes_with_hash(&self, name: &str, target: u64) -> Option<&[u8]> {
+        use crate::tensor_record::peek_tensor_record_name;
+
+        let lo = self.index.partition_point(|e| e.name_hash < target);
+        let hi = lo + self.index[lo..].partition_point(|e| e.name_hash == target);
+        self.index[lo..hi].iter().find_map(|e| {
+            let start = usize::try_from(e.tensor_offset).ok()?;
+            let len = usize::try_from(e.tensor_len).ok()?;
+            let end = start.checked_add(len)?;
+            let bytes = self.buf.get(start..end)?;
+            (peek_tensor_record_name(bytes).ok()? == name).then_some(bytes)
+        })
     }
 
     /// Retrieve the shape + dtype_name embedded in this tensor's metadata,
@@ -1305,6 +1358,7 @@ mod tests {
     use crate::plane_record::PlaneRecord;
     use crate::tensor_record::{CHAIN_REF_INLINE_BIT, parse_tensor_record};
     use crate::types::PlaneRole;
+    use std::io::Cursor;
 
     fn sample_tensor_record(name: &str) -> TensorRecord {
         TensorRecord {
@@ -1604,6 +1658,163 @@ mod tests {
                 },
             }],
         }
+    }
+
+    #[test]
+    fn chain_registry_write_rejects_ids_beyond_15_bits() {
+        let mut builder = ExtensionTableBuilder::new();
+        let mut out = Vec::new();
+        let reg = ChainRegistry {
+            chains: vec![(MAX_CHAIN_ID + 1, make_minimal_chain(0))],
+        };
+        let err = reg.write(&mut builder, &mut out).unwrap_err().to_string();
+        assert!(err.contains("15-bit"), "{err}");
+
+        let reg = ChainRegistry {
+            chains: vec![(MAX_CHAIN_ID, make_minimal_chain(0))],
+        };
+        reg.write(&mut builder, &mut out).unwrap();
+    }
+
+    #[test]
+    fn chain_registry_write_rejects_more_than_0x8000_chains() {
+        let chain = make_minimal_chain(0);
+        let reg = ChainRegistry {
+            chains: (0..=MAX_REGISTRY_CHAINS)
+                .map(|i| ((i & 0x7FFF) as u16, chain.clone()))
+                .collect(),
+        };
+        let mut builder = ExtensionTableBuilder::new();
+        let mut out = Vec::new();
+        let err = reg.write(&mut builder, &mut out).unwrap_err().to_string();
+        assert!(err.contains("exceeds the limit"), "{err}");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn writer_rejects_duplicate_tensor_names() {
+        let mut buf = Cursor::new(Vec::new());
+        let mut w = ContainerWriter::new(&mut buf).unwrap();
+        w.append_tensor(&sample_tensor_record("a")).unwrap();
+        let err = w
+            .append_tensor(&sample_tensor_record("a"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate tensor name"), "{err}");
+
+        let mut bytes = Vec::new();
+        write_tensor_record(&sample_tensor_record("b"), &mut bytes).unwrap();
+        w.append_serialized_tensor("b", &bytes).unwrap();
+        let err = w
+            .append_serialized_tensor("b", &bytes)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate tensor name"), "{err}");
+        let err = w
+            .append_serialized_tensor("a", &bytes)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate tensor name"), "{err}");
+        w.finalize().unwrap();
+    }
+
+    /// Two names with the same index hash: lookups compare the record name
+    /// and pick the right entry, whatever their order in the hash run.
+    #[test]
+    fn lookup_resolves_name_hash_collision() {
+        let names = ["first", "second", "third"];
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut w = ContainerWriter::new(&mut buf).unwrap();
+            for name in names {
+                w.append_tensor(&sample_tensor_record(name)).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let bytes = buf.into_inner();
+        let mut reader = ContainerReader::open(&bytes).unwrap();
+        let expected: Vec<Vec<u8>> = names
+            .iter()
+            .map(|n| reader.get_tensor_record_bytes(n).unwrap().to_vec())
+            .collect();
+
+        // Give "first" and "second" one hash, then try both run orders.
+        let forced = name_hash("first");
+        for e in reader.index.iter_mut() {
+            if e.name_hash == name_hash("second") {
+                e.name_hash = forced;
+            }
+        }
+        reader.index.sort_by_key(|e| e.name_hash);
+        let run: Vec<usize> = (0..reader.index.len())
+            .filter(|&i| reader.index[i].name_hash == forced)
+            .collect();
+        assert_eq!(run.len(), 2);
+        for _ in 0..2 {
+            for (name, want) in names[..2].iter().zip(&expected) {
+                let got = reader.record_bytes_with_hash(name, forced).unwrap();
+                assert_eq!(got, want.as_slice(), "lookup of {name}");
+            }
+            assert_eq!(
+                reader.get_tensor_record_bytes("third").unwrap(),
+                expected[2].as_slice()
+            );
+            // A name in the run's hash with no record of its own.
+            assert!(reader.record_bytes_with_hash("absent", forced).is_none());
+            reader.index.swap(run[0], run[1]);
+        }
+        // The real hash of "second" no longer has an entry.
+        assert!(reader.get_tensor_record_bytes("second").is_none());
+        assert!(reader.decode_tensor("second").is_err());
+    }
+
+    /// The prelude and the chain registry are parsed from the shared-prelude
+    /// section only. A shrunk shared_prelude_length cuts the registry off
+    /// instead of letting the parser read into the tensor records.
+    #[test]
+    fn prelude_and_registry_are_bounded_by_shared_prelude_length() {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut w = ContainerWriter::new(&mut buf).unwrap();
+            w.set_chain_registry(ChainRegistry {
+                chains: vec![(0, make_minimal_chain(7))],
+            })
+            .unwrap();
+            w.append_tensor(&sample_tensor_record("t")).unwrap();
+            w.finalize().unwrap();
+        }
+        let bytes = buf.into_inner();
+        let reader = ContainerReader::open(&bytes).unwrap();
+        assert_eq!(reader.chain_registry.chains.len(), 1);
+        let header = reader.header.clone();
+
+        let patch = |len: u64| {
+            let mut h = header.clone();
+            h.shared_prelude_length = len;
+            let mut b = bytes.clone();
+            b[..HEADER_LEN].copy_from_slice(&h.to_bytes().unwrap());
+            b
+        };
+
+        // Section ends one byte early: the registry is truncated.
+        let short = patch(header.shared_prelude_length - 1);
+        let err = ContainerReader::open(&short).err().expect("must fail");
+        assert!(err.to_string().contains("ChainRegistry"), "{err}");
+
+        // Section holds only the prelude: no registry is read.
+        let prelude_only = patch(4);
+        let reader = ContainerReader::open(&prelude_only).unwrap();
+        assert!(reader.chain_registry.chains.is_empty());
+
+        // Section shorter than the prelude count.
+        let err = ContainerReader::open(&patch(2)).err().expect("must fail");
+        assert!(err.to_string().contains("prelude"), "{err}");
+
+        // Section runs past the end of the buffer.
+        let err = ContainerReader::open(&patch(u64::MAX))
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("shared prelude"), "{err}");
     }
 
     #[test]

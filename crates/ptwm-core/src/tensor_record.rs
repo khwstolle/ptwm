@@ -79,6 +79,17 @@ fn name_padding(name_len: usize) -> usize {
     if rem == 0 { 0 } else { 4 - rem }
 }
 
+/// Convert a length or count to its wire integer type, or fail with
+/// `InvalidContainer` when it does not fit.
+pub(crate) fn checked_len<T: TryFrom<usize>>(n: usize, what: &str) -> Result<T, PtwmCoreError> {
+    T::try_from(n).map_err(|_| {
+        PtwmCoreError::InvalidContainer(format!(
+            "{what} {n} exceeds the wire limit of {} bytes",
+            std::mem::size_of::<T>()
+        ))
+    })
+}
+
 pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), PtwmCoreError> {
     // Validate inline_chain vs chain_ref consistency.
     let has_inline = rec.chain_ref & CHAIN_REF_INLINE_BIT != 0;
@@ -105,9 +116,20 @@ pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), 
         flags |= TENSOR_FLAG_PAYLOAD_HASH;
     }
 
-    let num_terminals = rec.terminals.len() as u8;
+    // Check every length field before writing, so an oversized field fails
+    // cleanly and leaves `out` untouched.
+    let num_terminals: u8 = checked_len(rec.terminals.len(), "terminal count")?;
     let name_bytes = rec.name.as_bytes();
-    let name_len = name_bytes.len() as u16;
+    let name_len: u16 = checked_len(name_bytes.len(), "tensor name length")?;
+    let dep_count: u16 = checked_len(rec.dependencies.len(), "dependency count")?;
+    for dep in &rec.dependencies {
+        checked_len::<u16>(dep.ref_bytes.len(), "dependency ref length")?;
+    }
+    let meta_len: Option<u32> = rec
+        .tensor_metadata
+        .as_ref()
+        .map(|m| checked_len(m.len(), "tensor metadata length"))
+        .transpose()?;
 
     // Fixed header: chain_ref(u16) + dtype_code(u16) + input_format(u8) +
     //               num_terminals(u8) + flags(u8) + reserved(u8) +
@@ -159,7 +181,6 @@ pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), 
 
     // dependencies  (present iff TENSOR_FLAG_DEPENDENCIES)
     if !rec.dependencies.is_empty() {
-        let dep_count = rec.dependencies.len() as u16;
         out.extend_from_slice(&dep_count.to_le_bytes());
         for dep in &rec.dependencies {
             let ref_flags: u8 = if dep.expected_hash.is_some() {
@@ -169,6 +190,7 @@ pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), 
             };
             out.push(dep.ref_kind as u8);
             out.push(ref_flags);
+            // Length checked above.
             out.extend_from_slice(&(dep.ref_bytes.len() as u16).to_le_bytes());
             out.extend_from_slice(&dep.ref_bytes);
             if let Some(hash) = dep.expected_hash {
@@ -178,8 +200,8 @@ pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), 
     }
 
     // tensor_metadata  (present iff TENSOR_FLAG_METADATA)
-    if let Some(meta) = &rec.tensor_metadata {
-        out.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+    if let (Some(meta), Some(meta_len)) = (&rec.tensor_metadata, meta_len) {
+        out.extend_from_slice(&meta_len.to_le_bytes());
         out.extend_from_slice(meta);
     }
 
@@ -189,6 +211,24 @@ pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), 
     }
 
     Ok(())
+}
+
+/// Read only the tensor name from serialized record bytes, without parsing
+/// or copying the rest of the record.
+pub fn peek_tensor_record_name(buf: &[u8]) -> Result<&str, PtwmCoreError> {
+    const NAME_LEN_POS: usize = 16;
+    const NAME_POS: usize = 18;
+    if buf.len() < NAME_POS {
+        return Err(PtwmCoreError::InvalidContainer(
+            "tensor record header truncated".into(),
+        ));
+    }
+    let name_len = u16::from_le_bytes(buf[NAME_LEN_POS..NAME_POS].try_into().unwrap()) as usize;
+    let name = buf.get(NAME_POS..NAME_POS + name_len).ok_or_else(|| {
+        PtwmCoreError::InvalidContainer("tensor record truncated reading name".into())
+    })?;
+    std::str::from_utf8(name)
+        .map_err(|_| PtwmCoreError::InvalidContainer("tensor name is not valid UTF-8".into()))
 }
 
 pub fn parse_tensor_record(buf: &[u8]) -> Result<(TensorRecord, usize), PtwmCoreError> {
@@ -585,5 +625,70 @@ mod tests {
         };
         let mut out = Vec::new();
         assert!(write_tensor_record(&rec, &mut out).is_err());
+    }
+
+    fn base_record() -> TensorRecord {
+        TensorRecord {
+            chain_ref: 0x0001,
+            dtype_code: 0x0001,
+            input_format: 1,
+            flags: 0,
+            orig_size: 0,
+            name: "w".to_string(),
+            payload_hash: None,
+            inline_chain: None,
+            dependencies: Vec::new(),
+            tensor_metadata: None,
+            terminals: vec![identity_plane()],
+        }
+    }
+
+    fn assert_write_fails_cleanly(rec: &TensorRecord, needle: &str) {
+        let mut out = Vec::new();
+        let err = write_tensor_record(rec, &mut out).unwrap_err();
+        assert!(err.to_string().contains(needle), "{err}");
+        assert!(out.is_empty(), "writer emitted bytes before failing");
+    }
+
+    #[test]
+    fn write_rejects_more_than_255_terminals() {
+        let mut rec = base_record();
+        rec.terminals = vec![identity_plane(); 256];
+        assert_write_fails_cleanly(&rec, "terminal count");
+        rec.terminals.pop();
+        let mut out = Vec::new();
+        write_tensor_record(&rec, &mut out).unwrap();
+        let (parsed, _) = parse_tensor_record(&out).unwrap();
+        assert_eq!(parsed.terminals.len(), 255);
+    }
+
+    #[test]
+    fn write_rejects_name_longer_than_u16() {
+        let mut rec = base_record();
+        rec.name = "n".repeat(u16::MAX as usize + 1);
+        assert_write_fails_cleanly(&rec, "tensor name length");
+    }
+
+    #[test]
+    fn write_rejects_too_many_dependencies() {
+        let mut rec = base_record();
+        let dep = Dependency {
+            ref_kind: RefKind::LocalTensor,
+            expected_hash: None,
+            ref_bytes: b"x".to_vec(),
+        };
+        rec.dependencies = vec![dep; u16::MAX as usize + 1];
+        assert_write_fails_cleanly(&rec, "dependency count");
+    }
+
+    #[test]
+    fn write_rejects_dependency_ref_longer_than_u16() {
+        let mut rec = base_record();
+        rec.dependencies = vec![Dependency {
+            ref_kind: RefKind::LocalTensor,
+            expected_hash: None,
+            ref_bytes: vec![b'x'; u16::MAX as usize + 1],
+        }];
+        assert_write_fails_cleanly(&rec, "dependency ref length");
     }
 }

@@ -3,6 +3,7 @@
 use crate::codec::{CodecId, StateSource};
 use crate::error::PtwmCoreError;
 use crate::layout::PlaneLayout;
+use crate::tensor_record::checked_len;
 use crate::types::PlaneRole;
 
 pub const PLANE_FLAG_CHUNK_TABLE: u8 = 0x01;
@@ -49,6 +50,20 @@ pub struct PlaneRecord {
 }
 
 pub fn write_plane_record(rec: &PlaneRecord, out: &mut Vec<u8>) -> Result<(), PtwmCoreError> {
+    // Check every length field before writing, so an oversized field fails
+    // cleanly and leaves `out` untouched.
+    let inline_state_len: u32 = checked_len(rec.inline_state_bytes.len(), "inline state length")?;
+    let chunk_count: Option<u32> = rec
+        .chunk_table
+        .as_ref()
+        .map(|c| checked_len(c.len(), "chunk count"))
+        .transpose()?;
+    let ext_ref_len: Option<u16> = rec
+        .external_state
+        .as_ref()
+        .map(|e| checked_len(e.ref_bytes.len(), "external state ref length"))
+        .transpose()?;
+
     let mut plane_flags: u8 = 0;
     if rec.chunk_table.is_some() {
         plane_flags |= PLANE_FLAG_CHUNK_TABLE;
@@ -65,20 +80,19 @@ pub fn write_plane_record(rec: &PlaneRecord, out: &mut Vec<u8>) -> Result<(), Pt
     out.push(rec.state_source as u8);
     out.push(rec.state_version);
     out.extend_from_slice(&rec.state_info.to_le_bytes());
-    let inline_state_len = rec.inline_state_bytes.len() as u32;
     out.extend_from_slice(&inline_state_len.to_le_bytes());
     out.extend_from_slice(&rec.payload_len.to_le_bytes());
     if let Some(crc) = rec.crc32 {
         out.extend_from_slice(&crc.to_le_bytes());
     }
-    if let Some(chunks) = &rec.chunk_table {
-        out.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+    if let (Some(chunks), Some(chunk_count)) = (&rec.chunk_table, chunk_count) {
+        out.extend_from_slice(&chunk_count.to_le_bytes());
         for c in chunks {
             out.extend_from_slice(&c.offset_in_payload.to_le_bytes());
             out.extend_from_slice(&c.decoded_size.to_le_bytes());
         }
     }
-    if let Some(ext) = &rec.external_state {
+    if let (Some(ext), Some(ext_ref_len)) = (&rec.external_state, ext_ref_len) {
         let expected_hash_present = if ext.expected_hash.is_some() {
             0x01u8
         } else {
@@ -86,7 +100,7 @@ pub fn write_plane_record(rec: &PlaneRecord, out: &mut Vec<u8>) -> Result<(), Pt
         };
         out.push(ext.ref_kind);
         out.push(expected_hash_present);
-        out.extend_from_slice(&(ext.ref_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(&ext_ref_len.to_le_bytes());
         out.extend_from_slice(&ext.ref_bytes);
         out.push(ext.state_format_version);
         if let Some(hash) = ext.expected_hash {
@@ -430,5 +444,36 @@ mod tests {
         let (parsed, consumed) = parse_plane_record(&buf).unwrap();
         assert_eq!(parsed.layout, PlaneLayout::Flat);
         assert_eq!(consumed, buf.len());
+    }
+
+    #[test]
+    fn write_rejects_external_ref_longer_than_u16() {
+        let rec = PlaneRecord {
+            role: PlaneRole::Value,
+            codec_id: CodecId::Identity,
+            codec_table_idx: 0,
+            state_source: StateSource::External,
+            state_version: 0,
+            state_info: 0,
+            payload_len: 0,
+            crc32: None,
+            chunk_table: None,
+            external_state: Some(ExternalStateRef {
+                ref_kind: 0x02,
+                expected_hash: None,
+                ref_bytes: vec![b'x'; u16::MAX as usize + 1],
+                state_format_version: 0,
+            }),
+            inline_state_bytes: Vec::new(),
+            payload_bytes: Vec::new(),
+            layout: PlaneLayout::Flat,
+        };
+        let mut out = Vec::new();
+        let err = write_plane_record(&rec, &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("external state ref length"),
+            "{err}"
+        );
+        assert!(out.is_empty());
     }
 }

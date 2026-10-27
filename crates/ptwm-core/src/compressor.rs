@@ -616,7 +616,19 @@ fn pass1_select_chain(
 
 /// Build the deduped chain registry. Returns the registry and a per-tensor
 /// vector of registry indices (each in 0..registry.chains.len()).
-fn build_chain_registry(chains: &[Chain]) -> (ChainRegistry, Vec<u16>) {
+///
+/// Fails when the tensors need more distinct chains than a registry can
+/// address ([`crate::container::MAX_REGISTRY_CHAINS`]).
+fn build_chain_registry(chains: &[Chain]) -> Result<(ChainRegistry, Vec<u16>), PtwmCoreError> {
+    build_chain_registry_with_limit(chains, crate::container::MAX_REGISTRY_CHAINS)
+}
+
+/// [`build_chain_registry`] with an explicit chain limit, so tests can reach
+/// the limit without building 32768 chains.
+fn build_chain_registry_with_limit(
+    chains: &[Chain],
+    max_chains: usize,
+) -> Result<(ChainRegistry, Vec<u16>), PtwmCoreError> {
     let mut registry: Vec<(u16, Chain)> = Vec::new();
     let mut tensor_to_idx: Vec<u16> = Vec::with_capacity(chains.len());
     for c in chains {
@@ -624,13 +636,18 @@ fn build_chain_registry(chains: &[Chain]) -> (ChainRegistry, Vec<u16>) {
         match existing {
             Some(pos) => tensor_to_idx.push(pos as u16),
             None => {
+                if registry.len() >= max_chains {
+                    return Err(PtwmCoreError::InvalidContainer(format!(
+                        "compress_model: more than {max_chains} distinct chains"
+                    )));
+                }
                 let new_id = registry.len() as u16;
                 registry.push((new_id, c.clone()));
                 tensor_to_idx.push(new_id);
             }
         }
     }
-    (ChainRegistry { chains: registry }, tensor_to_idx)
+    Ok((ChainRegistry { chains: registry }, tensor_to_idx))
 }
 
 // ---------------------------------------------------------------------------
@@ -900,7 +917,7 @@ pub fn compress_model<W: Write + Seek>(
         .zip(inputs.iter())
         .map(|(outcome, inp)| inp.candidate_chains[outcome.chain_idx].clone())
         .collect();
-    let (registry, tensor_chain_indices) = build_chain_registry(&chosen_chains);
+    let (registry, tensor_chain_indices) = build_chain_registry(&chosen_chains)?;
 
     let mut writer = ContainerWriter::new(writer)?;
     writer.set_prelude(&prelude_entries)?;
@@ -1729,6 +1746,31 @@ mod tests {
             assert_eq!(rec.chain_ref, 0);
             assert!(rec.inline_chain.is_none());
         }
+    }
+
+    #[test]
+    fn build_chain_registry_rejects_too_many_distinct_chains() {
+        let chain = |b: u8| Chain {
+            nodes: vec![ChainNode {
+                op: OpId::BytePassthrough,
+                params: vec![b],
+            }],
+            edges: vec![],
+            terminals: vec![TerminalRef {
+                node_idx: 0,
+                output_idx: 0,
+                role: Role::Raw,
+            }],
+        };
+        // Duplicates share an id and do not count against the limit.
+        let (reg, idx) =
+            build_chain_registry_with_limit(&[chain(0), chain(1), chain(0)], 2).unwrap();
+        assert_eq!(reg.chains.len(), 2);
+        assert_eq!(idx, vec![0, 1, 0]);
+        let err = build_chain_registry_with_limit(&[chain(0), chain(1), chain(2)], 2)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than 2 distinct chains"), "{err}");
     }
 }
 

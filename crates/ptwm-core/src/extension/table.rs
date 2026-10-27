@@ -114,6 +114,19 @@ impl ExtensionTable {
         Self::read(&mut c)
     }
 
+    /// Parse a table from the start of `bytes` and return it with the number
+    /// of bytes it occupies. The count comes from the parse position, not
+    /// from re-serializing: a table whose fields have more than one valid
+    /// encoding (for example, non-canonical capability CBOR) re-serializes
+    /// to a different length.
+    pub fn from_bytes_prefix(bytes: &[u8]) -> Result<(Self, usize), ExtensionError> {
+        let mut c = Cursor::new(bytes);
+        let table = Self::read(&mut c)?;
+        // The cursor reads from a slice, so its position never exceeds
+        // `bytes.len()`.
+        Ok((table, c.position() as usize))
+    }
+
     /// blake3 hash committed in the header to detect tampering / corruption.
     pub fn hash(bytes: &[u8]) -> [u8; 32] {
         let mut out = [0u8; 32];

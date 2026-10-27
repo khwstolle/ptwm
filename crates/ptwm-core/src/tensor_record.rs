@@ -90,7 +90,23 @@ pub(crate) fn checked_len<T: TryFrom<usize>>(n: usize, what: &str) -> Result<T, 
     })
 }
 
+/// Append the serialized record to `out`.
+///
+/// On error, `out` is truncated back to its length before the call, so a
+/// failed write never leaves a partial record behind.
 pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), PtwmCoreError> {
+    let start = out.len();
+    let result = write_tensor_record_unchecked(rec, out);
+    if result.is_err() {
+        out.truncate(start);
+    }
+    result
+}
+
+fn write_tensor_record_unchecked(
+    rec: &TensorRecord,
+    out: &mut Vec<u8>,
+) -> Result<(), PtwmCoreError> {
     // Validate inline_chain vs chain_ref consistency.
     let has_inline = rec.chain_ref & CHAIN_REF_INLINE_BIT != 0;
     if has_inline && rec.inline_chain.is_none() {
@@ -116,8 +132,9 @@ pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), 
         flags |= TENSOR_FLAG_PAYLOAD_HASH;
     }
 
-    // Check every length field before writing, so an oversized field fails
-    // cleanly and leaves `out` untouched.
+    // Check the record-level length fields before writing anything. Errors
+    // from the inline chain and the terminal records can still fire after
+    // the header is written; `write_tensor_record` truncates `out` for those.
     let num_terminals: u8 = checked_len(rec.terminals.len(), "terminal count")?;
     let name_bytes = rec.name.as_bytes();
     let name_len: u16 = checked_len(name_bytes.len(), "tensor name length")?;
@@ -648,6 +665,32 @@ mod tests {
         let err = write_tensor_record(rec, &mut out).unwrap_err();
         assert!(err.to_string().contains(needle), "{err}");
         assert!(out.is_empty(), "writer emitted bytes before failing");
+
+        // Bytes already in the buffer survive a failed write unchanged.
+        let mut out = b"prefix".to_vec();
+        write_tensor_record(rec, &mut out).unwrap_err();
+        assert_eq!(out, b"prefix");
+    }
+
+    /// A terminal-level error fires after the header, name and hash are
+    /// written; the partial record must not stay in `out`.
+    #[test]
+    fn terminal_error_after_header_leaves_out_unchanged() {
+        let mut rec = base_record();
+        rec.payload_hash = Some(0x1234);
+        rec.dependencies = vec![Dependency {
+            ref_kind: RefKind::LocalTensor,
+            expected_hash: None,
+            ref_bytes: b"dep".to_vec(),
+        }];
+        rec.terminals[0].state_source = StateSource::External;
+        rec.terminals[0].external_state = Some(crate::plane_record::ExternalStateRef {
+            ref_kind: 0x02,
+            expected_hash: None,
+            ref_bytes: vec![b'x'; u16::MAX as usize + 1],
+            state_format_version: 0,
+        });
+        assert_write_fails_cleanly(&rec, "external state ref length");
     }
 
     #[test]

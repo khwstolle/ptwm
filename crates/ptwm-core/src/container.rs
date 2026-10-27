@@ -901,16 +901,11 @@ impl<'a> ContainerReader<'a> {
 
         let index = parse_index(&buf[index_off..])?;
         let num_tensors = index.len() as u64;
-        // tensors_offset: region between prelude section end and index start.
-        // shared_prelude_offset + shared_prelude_length = end of prelude section.
-        let tensors_offset = if header.shared_prelude_length > 0 {
-            header
-                .shared_prelude_offset
-                .saturating_add(header.shared_prelude_length)
-        } else {
-            // Fallback: tensors sit right after the chain-registry end.
-            cr_off as u64
-        };
+        // Tensor records start at the end of the shared-prelude section.
+        // prelude_end is bounds-checked above, and parse_prelude has already
+        // rejected a section too short to hold the prelude (including
+        // shared_prelude_length == 0).
+        let tensors_offset = prelude_end as u64;
 
         // Build the codec router once from the installed extensions snapshot.
         // Using the same `installed` slice that the missing-flavor check and
@@ -1809,6 +1804,16 @@ mod tests {
         // Section shorter than the prelude count.
         let err = ContainerReader::open(&patch(2)).err().expect("must fail");
         assert!(err.to_string().contains("prelude"), "{err}");
+
+        // A zero-length section has no prelude at all and is rejected.
+        let err = ContainerReader::open(&patch(0)).err().expect("must fail");
+        assert!(err.to_string().contains("prelude"), "{err}");
+
+        // An intact section puts the tensor records right after it.
+        assert_eq!(
+            ContainerReader::open(&bytes).unwrap().tensors_offset,
+            header.shared_prelude_offset + header.shared_prelude_length
+        );
 
         // Section runs past the end of the buffer.
         let err = ContainerReader::open(&patch(u64::MAX))

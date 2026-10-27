@@ -115,3 +115,39 @@ def test_inspect_rejects_extension_table_offset_overflow(tmp_path) -> None:
     path.write_bytes(bytes(blob))
     with pytest.raises(ValueError, match="extension table"):
         list_extension_table_entries(str(path))
+
+
+def _pad_first_capability(blob: bytes) -> bytes:
+    """Append one byte to the first Extension Table entry's capability CBOR
+    and grow its length field to match."""
+    label_len = struct.unpack_from("<H", blob, 4 + 32)[0]
+    # count(u32) + canonical_id + label_len(u16) + label + kind(u16)
+    # + abi_version(u16) + lifecycle(u8) + flavor_hints(u8)
+    cap_len_pos = 4 + 32 + 2 + label_len + 2 + 2 + 1 + 1
+    cap_len = struct.unpack_from("<I", blob, cap_len_pos)[0]
+    cap_end = cap_len_pos + 4 + cap_len
+    return (
+        blob[:cap_len_pos]
+        + struct.pack("<I", cap_len + 1)
+        + blob[cap_len_pos + 4 : cap_end]
+        + b"\x00"
+        + blob[cap_end:]
+    )
+
+
+def test_chain_blob_info_reports_parsed_table_size() -> None:
+    """chain_blob_info returns the bytes the Extension Table parse consumed,
+    not the length of a re-serialization. Padding a capability blob by one
+    byte must move the reported chain start by exactly one byte."""
+    from ptwm._core import chain_blob_from_legacy, chain_blob_info
+
+    nodes = struct.pack("<HB", 0, 0)  # one node: op 0, no params
+    legacy = bytes([1, 0, 0]) + struct.pack("<HHH", len(nodes), 0, 0) + nodes
+    blob = bytes(chain_blob_from_legacy(legacy))
+    et_size, table = chain_blob_info(blob)
+
+    padded = _pad_first_capability(blob)
+    padded_size, padded_table = chain_blob_info(padded)
+    assert padded_size == et_size + 1
+    assert padded_table == table
+    assert padded[padded_size:] == blob[et_size:]

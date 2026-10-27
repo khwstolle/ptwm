@@ -5,14 +5,18 @@
 //!
 //! | file | content |
 //! |---|---|
-//! | `legacy_v1_1_0.ptwm` | Multi-tensor container with the v1.1.0 Extension Table layout (every built-in codec interned, `ContainerWriter::set_chain_registry`). Holds bf16, fp16, fp32, fp8 and int8 tensors, two scale tensors that share an `Order1ScaleAC` prelude state, a chunked bf16 tensor, an fp8 tensor with an inline chain, and a tensor with a dependency. Built-in ids and labels are derived for version `1.1.0`. |
-//! | `legacy_v1_0_0.ptwm` | The same file with every built-in id and label re-derived for version `1.0.0` and the Extension Table hash fixed up, as a v1.0.0 writer would have produced it. |
+//! | `legacy_v1_1_0.ptwm` | Multi-tensor container with the v1.1.0 Extension Table layout (every built-in codec interned, `ContainerWriter::set_chain_registry`). Holds bf16, fp16, fp32, fp8 and int8 tensors, two scale tensors that share an `Order1ScaleAC` prelude state, a chunked bf16 tensor, an fp8 tensor with an inline chain, and a tensor with a dependency. Built by [`rewrite_as_v1_1`] from current `compress_model` output; built-in ids and labels are derived for version `1.1.0`. Byte-identical to what this generator writes when built against the v1.1.0 release, whose `compress_model` emits the same layout. |
+//! | `legacy_v1_0_0.ptwm` | The v1.1.0 fixture with every built-in id and label re-derived for version `1.0.0` and the Extension Table hash fixed up. It is not v1.0.0 writer output: for these inputs the v1.0.0 `compress_model` writes no shared `Order1ScaleAC` prelude state. It covers v1.0.0 ids on a file that has the v1.1.0 features. |
+//! | `legacy_v1_0_0_native.ptwm` | Written once by the v1.0.0 release (commit `a17d403`): this generator, built against that tree, run as `rewrite_as_v1_1(&[main, chunked], INLINE_TENSOR)`. Real v1.0.0 writer output, with v1.0.0 built-in ids. `regenerate_fixtures` does not rewrite it. |
 //! | `legacy_trimmed.ptwm` | `compress_model` output of the current writer, whose Extension Table holds only the codecs the planes use. Same tensors as the v1.1.0 file minus the two scale tensors and the chunked tensor. |
-//! | `legacy_p4_byte_fp32.ptwm` | An fp32 tensor written from `Format.BYTE` input by the v1.1 Python path: its Source node declares `[n_bytes]` fp32 elements, four times the real size. |
+//! | `legacy_p4_byte_fp32_v1_1_0.ptwm` | An fp32 tensor from `Format.BYTE` input, with the chain built the way the v1.1 Python path builds it: the Source node declares `[n_bytes]` fp32 elements, four times the real size. v1.1.0 layout (full Extension Table), built-in ids for `1.1.0`. This is the layout of P4 files written by v1.1.x; it is byte-identical to the v1.1.0 `compress_model` output for the same input. |
+//! | `legacy_p4_byte_fp32.ptwm` | The same tensor written by the current writer (trimmed Extension Table). |
 //!
 //! The tests check that every fixture decodes to the expected bytes and that
 //! `implode(explode(x)) == x`. The expected bytes are stored as
-//! `(length, xxh64)` pairs in [`EXPECTED`].
+//! `(length, xxh64)` pairs in [`EXPECTED`]. Fixtures with built-in ids of
+//! another version are checked after [`rederive_builtins`] maps the ids to
+//! the crate version, until the reader accepts older built-in ids.
 //!
 //! # Regenerating
 //!
@@ -25,9 +29,14 @@
 //! golden hash for [`LEGACY_WRITER_GOLDEN_BLAKE3`]. Regenerate only when a
 //! format change is intended: the point of the fixtures is that they do not
 //! change. A crate version bump changes the built-in ids that the current
-//! writer emits, so it changes `legacy_trimmed.ptwm` and the golden hash;
-//! the v1.1.0 and v1.0.0 fixtures are pinned to their versions and do not
-//! change.
+//! writer emits, so it changes `legacy_trimmed.ptwm`,
+//! `legacy_p4_byte_fp32.ptwm` and the golden hash; the fixtures pinned to
+//! v1.1.0 and v1.0.0 do not change.
+//!
+//! [`rederive_builtins`] rewrites the version inside the built-in labels in
+//! place, so it only maps between versions whose strings have the same
+//! length (`1.1.0` and `1.0.0`, but not `1.10.0`). A bump to a version of
+//! another length must extend it first.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -46,7 +55,9 @@ use xxhash_rust::xxh64::xxh64;
 const V1_1_0: &str = "legacy_v1_1_0.ptwm";
 const V1_0_0: &str = "legacy_v1_0_0.ptwm";
 const TRIMMED: &str = "legacy_trimmed.ptwm";
+const V1_0_0_NATIVE: &str = "legacy_v1_0_0_native.ptwm";
 const P4: &str = "legacy_p4_byte_fp32.ptwm";
+const P4_V1_1_0: &str = "legacy_p4_byte_fp32_v1_1_0.ptwm";
 
 /// Expected decoded bytes per fixture: `(tensor name, length, xxh64 seed 0)`.
 /// Printed by `regenerate_fixtures`.
@@ -81,6 +92,20 @@ const EXPECTED: &[(&str, &[(&str, usize, u64)])] = &[
         ],
     ),
     (
+        V1_0_0_NATIVE,
+        &[
+            ("model.layers.0.q.weight", 512, 0xc82d5962a46d19ff),
+            ("model.layers.0.k.weight", 512, 0x73173bba2f17ef23),
+            ("model.norm.weight", 512, 0x946ca638752e3bfc),
+            ("model.layers.0.mlp.fp8.weight", 256, 0x84e10734e3fb3518),
+            ("model.embed.int8", 256, 0xf6193be8f075d386),
+            ("model.layers.0.q.scale", 2048, 0x95a622e512233480),
+            ("model.layers.0.k.scale", 2048, 0xda44a3268d62821d),
+            ("model.layers.1.q.weight", 256, 0x0d7f3dd0787bd569),
+            ("model.layers.2.chunked.weight", 1024, 0xf9e05338b3a99b14),
+        ],
+    ),
+    (
         TRIMMED,
         &[
             ("model.layers.0.q.weight", 512, 0xc82d5962a46d19ff),
@@ -92,6 +117,7 @@ const EXPECTED: &[(&str, &[(&str, usize, u64)])] = &[
         ],
     ),
     (P4, &[("p4.byte.fp32", 512, 0x57e3af5eb7d32ec1)]),
+    (P4_V1_1_0, &[("p4.byte.fp32", 512, 0x57e3af5eb7d32ec1)]),
     // EXPECTED-END
 ];
 
@@ -556,14 +582,29 @@ fn rewrite_as_v1_1(parts: &[&[u8]], inline_tensor: &str) -> Vec<u8> {
 /// re-derived and the `io.ptwm.builtin.<name>@<ver>` label is changed. The
 /// file-level table hash in the header is recomputed. Returns the number of
 /// entries rewritten.
+///
+/// The header is parsed by hand, not with `ContainerReader`, because the
+/// reader rejects built-in ids of other versions. The version is replaced
+/// in place, so `from` and `to` must have the same length.
 fn rederive_builtins(blob: &mut [u8], from: &str, to: &str) -> usize {
-    assert_eq!(from.len(), to.len(), "labels must keep their length");
+    assert_eq!(
+        from.len(),
+        to.len(),
+        "rederive_builtins only maps between versions of equal length"
+    );
     if from == to {
         return 0;
     }
-    let header = ContainerReader::open_partial(blob).unwrap().header;
-    let et_off = header.extension_table_offset as usize;
-    let et_len = header.extension_table_length as usize;
+    // Header: magic[9] flags u16 | et_offset u64 | et_length u64 | et_hash [32].
+    let u64_at = |off: usize| u64::from_le_bytes(blob[off..off + 8].try_into().unwrap());
+    let et_off = u64_at(9 + 2) as usize;
+    let et_len = u64_at(9 + 2 + 8) as usize;
+    let hash_off = 9 + 2 + 8 + 8;
+    assert_eq!(
+        &blob[hash_off..hash_off + 32],
+        blake3::hash(&blob[et_off..et_off + et_len]).as_bytes(),
+        "Extension Table hash"
+    );
 
     let prefix = b"io.ptwm.builtin.";
     let mut count = 0;
@@ -588,9 +629,6 @@ fn rederive_builtins(blob: &mut [u8], from: &str, to: &str) -> usize {
         p = label_start + label_len;
     }
 
-    // Header: magic[9] flags u16 | et_offset u64 | et_length u64 | et_hash [32].
-    let hash_off = 9 + 2 + 8 + 8;
-    assert_eq!(&blob[hash_off..hash_off + 32], &header.extension_table_hash);
     let hash = blake3::hash(&blob[et_off..et_off + et_len]);
     blob[hash_off..hash_off + 32].copy_from_slice(hash.as_bytes());
     count
@@ -635,6 +673,13 @@ fn p4_container() -> Vec<u8> {
     compress(&[input], main_options(None))
 }
 
+/// The P4 tensor in the v1.1.0 table layout, built-in ids pinned to 1.1.0.
+fn p4_v1_1_0_container() -> Vec<u8> {
+    let mut blob = rewrite_as_v1_1(&[&p4_container()], "");
+    rederive_builtins(&mut blob, env!("CARGO_PKG_VERSION"), "1.1.0");
+    blob
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn fixture_dir() -> PathBuf {
@@ -654,10 +699,19 @@ fn expected(fixture: &str) -> &'static [(&'static str, usize, u64)] {
         .1
 }
 
+/// `blob` with built-in ids of version `from` re-derived for the crate
+/// version, so the current reader accepts it.
+fn as_current_version(mut blob: Vec<u8>, from: &str) -> Vec<u8> {
+    rederive_builtins(&mut blob, from, env!("CARGO_PKG_VERSION"));
+    blob
+}
+
 fn assert_decodes(fixture: &str) {
-    let blob = load(fixture);
-    let reader = ContainerReader::open(&blob).unwrap_or_else(|e| panic!("{fixture}: open: {e}"));
-    let want = expected(fixture);
+    assert_blob_decodes(fixture, &load(fixture), expected(fixture));
+}
+
+fn assert_blob_decodes(fixture: &str, blob: &[u8], want: &[(&str, usize, u64)]) {
+    let reader = ContainerReader::open(blob).unwrap_or_else(|e| panic!("{fixture}: open: {e}"));
     assert_eq!(reader.index.len(), want.len(), "{fixture}: tensor count");
     for (name, len, hash) in want {
         let got = reader
@@ -678,9 +732,21 @@ fn assert_decodes(fixture: &str) {
     }
 }
 
+fn plane_codec_count(reader: &ContainerReader<'_>) -> usize {
+    reader
+        .extension_table
+        .entries
+        .iter()
+        .filter(|e| e.kind == ptwm_core::extension::Kind::PlaneCodec)
+        .count()
+}
+
 fn assert_transcode_round_trip(fixture: &str) {
-    let blob = load(fixture);
-    let exploded = explode(&blob).unwrap_or_else(|e| panic!("{fixture}: explode: {e}"));
+    assert_blob_transcode_round_trip(fixture, &load(fixture));
+}
+
+fn assert_blob_transcode_round_trip(fixture: &str, blob: &[u8]) {
+    let exploded = explode(blob).unwrap_or_else(|e| panic!("{fixture}: explode: {e}"));
     let members: HashMap<String, &[u8]> = exploded
         .members
         .iter()
@@ -705,11 +771,11 @@ fn assert_transcode_round_trip(fixture: &str) {
 
 #[test]
 fn fixtures_stay_small() {
-    let total: u64 = [V1_1_0, V1_0_0, TRIMMED, P4]
+    let total: u64 = [V1_1_0, V1_0_0, V1_0_0_NATIVE, TRIMMED, P4, P4_V1_1_0]
         .iter()
         .map(|f| load(f).len() as u64)
         .sum();
-    assert!(total < 64 * 1024, "fixtures total {total} B");
+    assert!(total < 96 * 1024, "fixtures total {total} B");
 }
 
 #[test]
@@ -751,13 +817,7 @@ fn v1_1_0_fixture_has_expected_features() {
         "dependency"
     );
     // The v1.1.0 table interns all 16 built-in codecs.
-    let codecs = reader
-        .extension_table
-        .entries
-        .iter()
-        .filter(|e| e.kind == ptwm_core::extension::Kind::PlaneCodec)
-        .count();
-    assert_eq!(codecs, 16);
+    assert_eq!(plane_codec_count(&reader), 16);
 }
 
 #[test]
@@ -803,16 +863,121 @@ fn p4_fixture_transcode_round_trip() {
 
 #[test]
 fn p4_fixture_source_overstates_size() {
-    let blob = load(P4);
+    for fixture in [P4, P4_V1_1_0] {
+        let blob = load(fixture);
+        let reader = ContainerReader::open(&blob).unwrap();
+        let rec = &records_in_file_order(&reader)[0];
+        let chain = reader.chain_registry.lookup(rec.chain_ref).unwrap();
+        let p = &chain.nodes[0].params;
+        assert_eq!(p[0], 1, "{fixture}: 1-D Source");
+        let dim = u32::from_le_bytes(p[1..5].try_into().unwrap()) as u64;
+        assert_eq!(u16::from_le_bytes([p[5], p[6]]), 0x0003, "{fixture}: fp32");
+        // dim fp32 elements = 4 * dim bytes, against orig_size bytes.
+        assert_eq!(dim, rec.orig_size, "{fixture}: Source declares 4x size");
+    }
+}
+
+#[test]
+fn p4_v1_1_0_fixture_decodes() {
+    assert_decodes(P4_V1_1_0);
+}
+
+#[test]
+fn p4_v1_1_0_fixture_transcode_round_trip() {
+    assert_transcode_round_trip(P4_V1_1_0);
+}
+
+#[test]
+fn p4_v1_1_0_fixture_has_full_table() {
+    let blob = load(P4_V1_1_0);
     let reader = ContainerReader::open(&blob).unwrap();
-    let rec = &records_in_file_order(&reader)[0];
-    let chain = reader.chain_registry.lookup(rec.chain_ref).unwrap();
-    let p = &chain.nodes[0].params;
-    assert_eq!(p[0], 1, "1-D Source");
-    let dim = u32::from_le_bytes(p[1..5].try_into().unwrap()) as u64;
-    assert_eq!(u16::from_le_bytes([p[5], p[6]]), 0x0003, "fp32 Source");
-    // dim fp32 elements = 4 * dim bytes, against orig_size bytes.
-    assert_eq!(dim, rec.orig_size, "Source declares 4x orig_size");
+    assert_eq!(plane_codec_count(&reader), 16);
+    let trimmed = load(P4);
+    let reader = ContainerReader::open(&trimmed).unwrap();
+    assert!(plane_codec_count(&reader) < 16);
+}
+
+/// The v1.1.0 table layout must keep producing the same bytes for the P4
+/// input.
+#[test]
+fn p4_v1_1_0_layout_writer_output_is_golden() {
+    assert!(p4_v1_1_0_container() == load(P4_V1_1_0));
+}
+
+#[test]
+#[ignore = "cross-version builtins: fixed in stage 3"]
+fn v1_0_0_native_fixture_decodes() {
+    assert_decodes(V1_0_0_NATIVE);
+}
+
+#[test]
+#[ignore = "cross-version builtins: fixed in stage 3"]
+fn v1_0_0_native_fixture_transcode_round_trip() {
+    assert_transcode_round_trip(V1_0_0_NATIVE);
+}
+
+/// The v1.0.0 writer output decodes and transcodes byte-exactly once its
+/// built-in ids are mapped to the crate version.
+#[test]
+fn v1_0_0_native_fixture_decodes_with_current_ids() {
+    let blob = load(V1_0_0_NATIVE);
+    let mut cur = blob.clone();
+    assert!(rederive_builtins(&mut cur, "1.0.0", env!("CARGO_PKG_VERSION")) > 0);
+    let reader = ContainerReader::open(&cur).unwrap();
+    assert!(
+        reader.prelude.is_empty(),
+        "v1.0.0 writes no shared state here"
+    );
+    assert_eq!(plane_codec_count(&reader), 16);
+    assert_blob_decodes(V1_0_0_NATIVE, &cur, expected(V1_0_0_NATIVE));
+    assert_blob_transcode_round_trip(V1_0_0_NATIVE, &cur);
+    assert!(as_current_version(blob, "1.0.0") == cur);
+}
+
+/// `rederive_builtins` must work on blobs whose built-in ids are not those
+/// of the crate version, in both directions.
+#[test]
+fn rederive_builtins_handles_foreign_versions() {
+    let orig = load(V1_0_0_NATIVE);
+    let mut blob = orig.clone();
+    let n = rederive_builtins(&mut blob, "1.0.0", "1.2.0");
+    assert!(n > 0);
+    assert_eq!(rederive_builtins(&mut blob, "1.2.0", "1.0.0"), n);
+    assert!(blob == orig);
+}
+
+#[test]
+#[should_panic(expected = "versions of equal length")]
+fn rederive_builtins_rejects_length_change() {
+    let mut blob = load(V1_1_0);
+    rederive_builtins(&mut blob, "1.1.0", "1.10.0");
+}
+
+/// Current writer output with a trimmed table and shared `Order1ScaleAC`
+/// prelude state (the default for models with scale planes) decodes to the
+/// inputs and transcodes byte-exactly. No fixture file: the bytes come from
+/// [`main_container`], whose hash is pinned by
+/// [`legacy_writer_output_is_golden`].
+#[test]
+fn current_writer_shared_state_transcode_round_trip() {
+    let blob = main_container();
+    let reader = ContainerReader::open(&blob).unwrap();
+    assert!(!reader.prelude.is_empty(), "shared prelude state");
+    assert!(plane_codec_count(&reader) < 16, "trimmed table");
+    assert!(
+        records_in_file_order(&reader)
+            .iter()
+            .flat_map(|r| &r.terminals)
+            .any(|p| p.state_source == ptwm_core::codec::StateSource::Shared),
+        "plane with shared state"
+    );
+    let data = tensors();
+    let want: Vec<(&str, usize, u64)> = data
+        .iter()
+        .map(|t| (t.name, t.bytes.len(), xxh64(&t.bytes, 0)))
+        .collect();
+    assert_blob_decodes("main_container", &blob, &want);
+    assert_blob_transcode_round_trip("main_container", &blob);
 }
 
 /// The legacy writer must keep producing the same bytes. A failure here
@@ -840,7 +1005,8 @@ fn v1_1_0_layout_writer_output_is_golden() {
     assert!(v1_1_0_container() == load(V1_1_0));
 }
 
-/// Writes the fixtures and prints the `EXPECTED` table and the golden hash.
+/// Writes the fixtures (all but `legacy_v1_0_0_native.ptwm`, which only the
+/// v1.0.0 release can write) and prints the `EXPECTED` table and the golden hash.
 #[test]
 #[ignore = "regenerates tests/fixtures; run with PTWM_REGEN_FIXTURES=1"]
 fn regenerate_fixtures() {
@@ -854,6 +1020,7 @@ fn regenerate_fixtures() {
     let trimmed = trimmed_container();
     let golden = main_container();
     let p4 = p4_container();
+    let p4_v1_1_0 = p4_v1_1_0_container();
 
     let dir = fixture_dir();
     std::fs::create_dir_all(&dir).unwrap();
@@ -862,6 +1029,7 @@ fn regenerate_fixtures() {
         (V1_0_0, &v1_0_0),
         (TRIMMED, &trimmed),
         (P4, &p4),
+        (P4_V1_1_0, &p4_v1_1_0),
     ];
     for (name, bytes) in files {
         std::fs::write(dir.join(name), bytes).unwrap();
@@ -887,8 +1055,10 @@ fn regenerate_fixtures() {
     for (fixture, list) in [
         ("V1_1_0", &main),
         ("V1_0_0", &main),
+        ("V1_0_0_NATIVE", &main),
         ("TRIMMED", &trimmed_expected),
         ("P4", &p4_expected),
+        ("P4_V1_1_0", &p4_expected),
     ] {
         println!("    (\n        {fixture},\n        &[");
         for (name, bytes) in list.iter() {

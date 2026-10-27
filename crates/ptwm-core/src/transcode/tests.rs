@@ -345,7 +345,7 @@ fn round_trip_trimmed_codec_table() {
         .unwrap();
     let rebuilt = implode(
         &exploded.registry_json,
-        &[b.manifest_json.clone()],
+        std::slice::from_ref(&b.manifest_json),
         members_map(&exploded),
     )
     .unwrap();

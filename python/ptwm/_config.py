@@ -42,6 +42,30 @@ class Format(Enum):
         return None
 
 
+class Framing(Enum):
+    r"""Byte layout of a single-tensor :meth:`Compressor.compress` output.
+
+    ``COMPACT`` writes a compact single-tensor frame (magic ``\x89PTWS``)
+    with a fixed cost of about 10 to 130 bytes, and stores the raw bytes when
+    no codec makes them smaller. It falls back to ``CONTAINER`` when the
+    tensor cannot use the frame (streaming, or a plane that selects shared
+    codec state). ``CONTAINER`` writes a full ``.ptwm`` container (magic
+    ``\x89PTWM``), which readers before v1.2 require, and which the
+    random-access, store and transcode tools open.
+    """
+
+    COMPACT = 1
+    CONTAINER = 2
+
+    @classmethod
+    def _missing_(cls, value):
+        if isinstance(value, str):
+            value = value.upper()
+            if value in cls.__members__:
+                return cls.__members__[value]
+        return None
+
+
 class Lossy(Enum):
     NONE = 0
     INTEGER = 1
@@ -87,6 +111,12 @@ class CompressionConfig:
     """
     codec: str | None = None
     device: int | None = None
+    framing: Framing = Framing.COMPACT
+    """Output layout; see :class:`Framing`."""
+    emit_payload_hash: bool = True
+    """Store an xxh64 of the raw bytes (8 B per tensor), checked on decode."""
+    emit_plane_crc: bool = True
+    """Store a CRC32 of every coded plane (4 B per plane), checked on decode."""
 
     @classmethod
     def from_resolved_policy(

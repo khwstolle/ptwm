@@ -45,6 +45,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_blake3_hash, m)?)?;
     m.add_function(wrap_pyfunction!(py_dtype_element_size, m)?)?;
     m.add_function(wrap_pyfunction!(compress_model, m)?)?;
+    m.add_function(wrap_pyfunction!(compress_compact, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_compact, m)?)?;
     m.add_function(wrap_pyfunction!(decode_tensor, m)?)?;
     m.add_function(wrap_pyfunction!(decode_model, m)?)?;
     m.add_function(wrap_pyfunction!(decode_tensor_shape, m)?)?;
@@ -444,6 +446,124 @@ fn compress_model<'py>(
     .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
     Ok(pyo3::types::PyBytes::new(py, &out))
+}
+
+/// Compress one tensor into a compact single-tensor frame.
+///
+/// Arguments mirror one element of :func:`compress_model` (the tensor name is
+/// not stored). Returns ``None`` when the tensor cannot use the compact frame
+/// (chunked encoding, or a plane that selects shared state); the caller then
+/// writes a full container with :func:`compress_model`.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (dtype_code, input_format, raw_bytes, shape, dtype_name, delta_reference_blake3, chains, emit_payload_hash, emit_plane_crc, method_hint=3, codec_menu=None))]
+fn compress_compact<'py>(
+    py: Python<'py>,
+    dtype_code: u16,
+    input_format: u8,
+    raw_bytes: PyBuffer<u8>,
+    shape: Option<Vec<u64>>,
+    dtype_name: Option<String>,
+    delta_reference_blake3: Option<Vec<u8>>,
+    chains: Vec<Vec<u8>>,
+    emit_payload_hash: bool,
+    emit_plane_crc: bool,
+    method_hint: u16,
+    codec_menu: Option<Vec<u16>>,
+) -> PyResult<Option<Bound<'py, pyo3::types::PyBytes>>> {
+    let delta_reference_blake3 = match delta_reference_blake3 {
+        Some(h) => Some(<[u8; 32]>::try_from(h.as_slice()).map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "delta_reference_blake3 must be 32 bytes, got {}",
+                h.len()
+            ))
+        })?),
+        None => None,
+    };
+    if chains.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "chains: at least one candidate chain required",
+        ));
+    }
+    let mut candidate_chains = Vec::with_capacity(chains.len());
+    for (chain_idx, blob) in chains.iter().enumerate() {
+        let (chain, _) = read_chain_blob(blob).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("chains[{chain_idx}]: {e}"))
+        })?;
+        candidate_chains.push(chain);
+    }
+    let raw = contiguous_slice(&raw_bytes, "raw_bytes")?;
+    let forced_codec = match method_hint {
+        2 => Some(ptwm_core::codec::CodecId::Zstd),
+        4 => Some(ptwm_core::codec::CodecId::Rans),
+        5 => Some(ptwm_core::codec::CodecId::Identity),
+        _ => None,
+    };
+    let allow_codec_ids: Option<Vec<ptwm_core::codec::CodecId>> = codec_menu.map(|ids| {
+        ids.into_iter()
+            .filter_map(ptwm_core::codec::CodecId::from_u16)
+            .collect()
+    });
+    let out = py
+        .allow_threads(|| {
+            let input = InputTensor {
+                name: "_".to_string(),
+                candidate_chains,
+                dtype_code,
+                input_format,
+                raw_bytes: raw,
+                shape,
+                dtype_name,
+                delta_reference_blake3,
+            };
+            let opts = CompressorOptions {
+                method_hint,
+                emit_payload_hash,
+                emit_plane_crc,
+                forced_codec,
+                allow_codec_ids,
+                chunk_size: None,
+            };
+            ptwm_core::compact::compress_compact(&input, &opts)
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    Ok(out.map(|b| pyo3::types::PyBytes::new(py, &b)))
+}
+
+/// Decode a compact single-tensor frame.
+///
+/// Returns ``(raw_bytes, shape, dtype_name, dtype_code, input_format,
+/// delta_reference_blake3, payload_len)``; ``shape``, ``dtype_name`` and
+/// ``delta_reference_blake3`` are ``None`` when the frame does not carry them.
+/// ``payload_len`` counts codec payload plus inline codec state (the raw size
+/// for a stored frame).
+#[allow(clippy::type_complexity)]
+#[pyfunction]
+fn decode_compact<'py>(
+    py: Python<'py>,
+    blob: &[u8],
+) -> PyResult<(
+    Bound<'py, pyo3::types::PyBytes>,
+    Option<Vec<u64>>,
+    Option<String>,
+    u16,
+    u8,
+    Option<Bound<'py, pyo3::types::PyBytes>>,
+    u64,
+)> {
+    let t = py
+        .allow_threads(|| ptwm_core::compact::decode_compact(blob))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    Ok((
+        pyo3::types::PyBytes::new(py, &t.raw),
+        t.shape,
+        t.dtype_name,
+        t.dtype_code,
+        t.input_format,
+        t.delta_reference_blake3
+            .map(|h| pyo3::types::PyBytes::new(py, &h)),
+        t.payload_len,
+    ))
 }
 
 /// Decode a single tensor from a container blob.

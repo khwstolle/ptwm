@@ -49,6 +49,7 @@ BF16 tensor ≥ 50 MB; the full-model scripts use BF16 tensors up to a 3 GB cap.
 
 | Module | Needs a shard? | What it measures |
 | --- | --- | --- |
+| `container_overhead` | no (synthetic) | Fixed per-output bytes of single-tensor `Compressor.compress` output, compact frame vs full container, bf16/fp32, constant/normal, 64 B to 1 MB, against zstd-19. `tests/ptwm/benchmarks/test_container_overhead.py` enforces the size limits in CI. |
 | `validate_dtype` | no (synthetic) | Losslessness + ratio across BF16/FP16/FP32/FP8 through the production streaming path. |
 | `validate_scale {small,large,edge}` | `large` only | `small`: many tiny tensors; `large`: a 72B-class shard (scaling + RSS); `edge`: single-tensor files, non-float dtypes, degenerate shapes. Every mode verifies a bit-exact roundtrip. |
 | `validate_realmodel` | yes (real shards) | Real-model validation matrix: ratio / encode / decode / losslessness across Mistral-7B (BF16), gpt-oss-20b (MXFP4), Nemotron (FP8), Qwen2.5-72B (BF16). |

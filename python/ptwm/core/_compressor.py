@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from .. import _rust
-from .._config import CompressionConfig, Format, Method
+from .._config import CompressionConfig, Format, Framing, Method
 from .._exceptions import CompressionMethodNotSupportedError
 from ..delta import encode as delta_encode
 from ..preprocessing._chains import (
@@ -174,7 +174,10 @@ class Compressor:
         dtype_code: int,
         delta_ref_blake3: bytes | None = None,
     ) -> bytes:
-        """Encode a single-tensor ``.ptwm`` via ``compress_model``."""
+        """Encode one tensor as a compact frame or a single-tensor container.
+
+        ``config.framing`` selects the layout; see :class:`ptwm.Framing`.
+        """
         method_hint = _METHOD_HINTS.get(self.config.method.value)
         if method_hint is None:
             msg = f"Unsupported compression method: {self.config.method}"
@@ -205,6 +208,28 @@ class Compressor:
         else:
             codec_menu_ids = [int(c) for c in self.config.codec_menu]
 
+        emit_payload_hash = self.config.emit_payload_hash
+        emit_plane_crc = self.config.emit_plane_crc
+
+        # The compact frame has no chunk table, so streaming always writes a
+        # full container.
+        if self.config.framing == Framing.COMPACT and streaming_chunk is None:
+            blob = _rust.compress_compact(
+                int(dtype_code),
+                int(self.config.input_format.value),
+                ba,
+                tensor_shape,
+                dtype_name_str,
+                delta_ref_blake3,
+                chains[0],
+                emit_payload_hash,
+                emit_plane_crc,
+                method_hint,
+                codec_menu_ids,
+            )
+            if blob is not None:
+                return blob
+
         return _rust.compress_model(
             [
                 (
@@ -218,8 +243,8 @@ class Compressor:
                 )
             ],
             chains,
-            True,  # emit_payload_hash
-            True,  # emit_plane_crc
+            emit_payload_hash,
+            emit_plane_crc,
             method_hint,
             streaming_chunk,
             codec_menu_ids,

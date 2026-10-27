@@ -12,7 +12,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ptwm import CompressionConfig, Compressor, Format
+from ptwm import CompressionConfig, Compressor, Format, Framing
 from ptwm.ablation._resolve import resolve_active
 
 
@@ -91,7 +91,9 @@ def bench_compress(
         # rather than silently using the unconstrained menu.
         config = CompressionConfig.from_resolved_policy(
             resolved,
-            base=CompressionConfig(input_format=Format.BYTE),
+            # Full containers: the compact frame's stored-raw fallback would
+            # hide which codec the policy selected.
+            base=CompressionConfig(input_format=Format.BYTE, framing=Framing.CONTAINER),
         )
         for trial in range(trials):
             t0 = time.perf_counter_ns()

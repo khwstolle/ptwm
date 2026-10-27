@@ -1,12 +1,14 @@
 """Round-trip the v1 wire format from Python."""
 
 import torch
-from ptwm import CompressionConfig, Compressor, Decompressor, Format
+from ptwm import CompressionConfig, Compressor, Decompressor, Format, Framing
 
 
 def test_compress_decompress_round_trip_v1_format():
     tensor = torch.randn(64, 64, dtype=torch.bfloat16)
-    compressor = Compressor(CompressionConfig(input_format=Format.TORCH))
+    compressor = Compressor(
+        CompressionConfig(input_format=Format.TORCH, framing=Framing.CONTAINER)
+    )
     decompressor = Decompressor()
 
     blob = compressor.compress(tensor)

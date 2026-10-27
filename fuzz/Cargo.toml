@@ -95,3 +95,9 @@ name = "raw_binary_schema"
 path = "fuzz_targets/raw_binary_schema.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "compact_decode"
+path = "fuzz_targets/compact_decode.rs"
+test = false
+doc = false

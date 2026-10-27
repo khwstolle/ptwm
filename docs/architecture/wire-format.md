@@ -142,6 +142,16 @@ The capabilities are CBOR rather than TOML because the format is
 parsed in Rust without an extra dependency on a TOML parser path
 that the reader would otherwise not need.
 
+The writer interns the ops of every chain in the chain registry,
+then only the plane codecs that the plane records reference, in the
+order of the built-in registry. Writers up to v1.1 interned all 16
+built-in plane codecs, about 2 KB per file, whether or not a plane
+used them. Readers resolve `codec_table_idx` by position and check
+the table hash against the bytes present, so they decode both
+layouts. The table is a pure function of the chain registry and the
+codec set; the explode/implode transcoder relies on this to rebuild
+the same bytes from the codec list in the registry manifest.
+
 ## Plane records
 
 Each tensor's record holds a fixed header plus a sequence of plane
@@ -178,6 +188,51 @@ shared across planes within a tensor, a state shared across tensors
 (the prelude case), or no state at all. The four-valued enum lets
 the writer record exactly one of those four, which the reader uses
 to find the bytes to feed back into the codec.
+
+## Compact single-tensor frame
+
+`Compressor.compress` writes one tensor. The container sections
+above cost about 500 to 1,000 bytes for one tensor, which is more
+than the payload of a small tensor. By default the compressor writes
+a compact frame instead, with its own magic `\x89PTWS`:
+
+```
+magic          [u8;5]    \x89PTWS
+flags          u8        payload hash, plane CRC, shape, dtype name,
+                         delta reference, stored; unknown bits rejected
+dtype_code     varint
+input_format   u8
+orig_size      varint
+shape          varint ndim + varint dims          (if flagged)
+dtype_name     varint length + utf8               (if flagged)
+delta_ref      [u8;32]   blake3 of the reference  (if flagged)
+payload_hash   u64       xxh64 of the raw bytes   (if flagged)
+body
+```
+
+The body is either the raw bytes (the stored flag, written when no
+codec makes the tensor smaller) or a coded tensor: a list of op wire
+ids, the chain in the wire form the chain registry uses (its op
+indices refer to that list), and one record per terminal plane
+(codec id, inline state, payload length, optional CRC32, payload).
+The frame does not store plane layouts, plane lengths or the plane
+count, because the decoder derives them from the chain. The dtype
+name is stored only when it differs from the canonical name of
+`dtype_code`.
+
+The fixed cost is 10 to 130 bytes, depending on the chain and on
+which integrity fields are on. A tensor whose planes need shared
+state (a prelude) or chunked encoding cannot use the frame; the
+compressor writes a full container for it. The frame holds no
+extension table, so it can reference built-in ops and codecs only.
+
+The frame follows the same versioning rule as the container: no
+numeric version field, and a new magic for an incompatible layout.
+Readers that predate the frame reject `\x89PTWS` as "not a .ptwm
+container" rather than misparse it. `CompressionConfig(framing=
+Framing.CONTAINER)` keeps the full container for consumers pinned to
+such readers, and the CLI writes `.ptwm` files as full containers so
+the random-access and store tools can open them.
 
 ## Wire-format invariants
 

@@ -7,7 +7,7 @@ multi-tensor ``.ptwm`` container with per-tensor random-access lookup.
 
 Public entry points: :class:`Compressor`, :class:`Decompressor`,
 :class:`CompressionConfig`, :class:`DecompressionConfig`,
-:class:`Method`, :class:`Format`. Third-party integrations
+:class:`Method`, :class:`Format`, :class:`Framing`. Third-party integrations
 (HuggingFace `transformers`, `safetensors`) live in :mod:`ptwm.integrations`
 and are imported from there explicitly, not re-exported here.
 """
@@ -18,6 +18,7 @@ from ._config import (
     CompressionConfig,
     DecompressionConfig,
     Format,
+    Framing,
     Lossy,
     Method,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "DecompressionConfig",
     "Decompressor",
     "Format",
+    "Framing",
     "Lossy",
     "Method",
     "Error",

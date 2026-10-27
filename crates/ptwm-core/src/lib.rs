@@ -19,6 +19,7 @@ pub mod chain;
 pub mod codec;
 pub mod codec_tagged;
 pub mod codecs;
+pub mod compact;
 pub mod compressor;
 pub mod container;
 pub mod delta;

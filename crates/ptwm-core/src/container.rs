@@ -105,6 +105,82 @@ impl ChainRegistry {
     }
 }
 
+/// Which plane codecs an Extension Table interns besides the chain ops.
+#[derive(Clone, Copy, Debug)]
+pub enum CodecSet<'a> {
+    /// Every built-in plane codec (legacy layout, v1.1 and earlier).
+    AllBuiltins,
+    /// Only the listed codecs, interned in built-in registry order.
+    Only(&'a [CanonicalId]),
+}
+
+/// Output of [`build_extension_table`].
+pub struct BuiltExtensionTable {
+    pub table: ExtensionTable,
+    /// Serialized chain registry whose op indices refer to `table`.
+    pub registry_bytes: Vec<u8>,
+    /// Table index of every interned plane codec.
+    pub codec_idx_map: HashMap<CanonicalId, u16>,
+}
+
+/// Build the Extension Table and the serialized chain registry for a
+/// container. Chain ops are interned first (in registry order), then the
+/// plane codecs selected by `codecs`, in the order of
+/// [`crate::extension::builtin_entries`].
+///
+/// The result is a pure function of `registry` and the codec set, so a
+/// reader-side tool (the transcoder) can rebuild the same bytes.
+pub fn build_extension_table(
+    registry: &ChainRegistry,
+    codecs: CodecSet<'_>,
+) -> Result<BuiltExtensionTable, PtwmCoreError> {
+    use crate::extension::Kind;
+    use crate::extension::builtin_entries;
+
+    let mut builder = ExtensionTableBuilder::new();
+    let mut registry_bytes = Vec::new();
+    registry.write(&mut builder, &mut registry_bytes)?;
+
+    // Use `builtin_entries()` (the curated list with `is_builtin` coverage)
+    // filtered by `Kind::PlaneCodec` rather than hard-coded names. This
+    // excludes `huffman_nibble`, which `dispatch_builtin` keeps for legacy
+    // wire compat but which has no `builtin_entry`, so `is_builtin` and
+    // `collect_missing_flavors` do not recognise it.
+    let codec_entries: Vec<_> = builtin_entries()
+        .into_iter()
+        .filter(|e| e.kind == Kind::PlaneCodec)
+        .collect();
+    if let CodecSet::Only(wanted) = codecs {
+        for id in wanted {
+            if !codec_entries.iter().any(|e| e.canonical_id == *id) {
+                return Err(PtwmCoreError::InvalidContainer(format!(
+                    "codec {id:?} has no built-in Extension Table entry"
+                )));
+            }
+        }
+    }
+    let mut codec_idx_map = HashMap::new();
+    for entry in codec_entries {
+        let keep = match codecs {
+            CodecSet::AllBuiltins => true,
+            CodecSet::Only(wanted) => wanted.contains(&entry.canonical_id),
+        };
+        if keep {
+            let canonical_id = entry.canonical_id;
+            let idx = builder.intern(entry);
+            codec_idx_map.insert(canonical_id, idx);
+        }
+    }
+
+    Ok(BuiltExtensionTable {
+        table: ExtensionTable {
+            entries: builder.finish(),
+        },
+        registry_bytes,
+        codec_idx_map,
+    })
+}
+
 /// Streaming writer for a `.ptwm` container.
 pub struct ContainerWriter<W: Write + Seek> {
     writer: W,
@@ -191,49 +267,54 @@ impl<W: Write + Seek> ContainerWriter<W> {
     /// second table-building pass.  Any previously set extension table is
     /// replaced.
     ///
+    /// This is the legacy (v1.1 and earlier) table layout. Writers that know
+    /// the set of codecs in use should call
+    /// [`set_chain_registry_with_codecs`](Self::set_chain_registry_with_codecs)
+    /// instead, which omits the unreferenced codec entries (about 125 B each).
+    ///
     /// After this call, use [`codec_table_idx_for`](Self::codec_table_idx_for)
     /// to obtain the stable index for a codec's canonical id.
     ///
     /// Must be called before any `append_tensor` call.
     pub fn set_chain_registry(&mut self, registry: ChainRegistry) -> Result<(), PtwmCoreError> {
+        self.install_registry(registry, CodecSet::AllBuiltins)
+    }
+
+    /// Set the chain registry and build an Extension Table that holds only
+    /// the chain ops plus the plane codecs in `codecs`.
+    ///
+    /// Codec entries are interned in the order of
+    /// [`crate::extension::builtin_entries`], not in the order of `codecs`,
+    /// so the table is a pure function of the registry and the codec *set*.
+    /// The transcoder relies on this to rebuild the same table bytes.
+    ///
+    /// Returns `InvalidContainer` if a codec in `codecs` has no built-in
+    /// Extension Table entry.
+    ///
+    /// Must be called before any `append_tensor` call.
+    pub fn set_chain_registry_with_codecs(
+        &mut self,
+        registry: ChainRegistry,
+        codecs: &[CanonicalId],
+    ) -> Result<(), PtwmCoreError> {
+        self.install_registry(registry, CodecSet::Only(codecs))
+    }
+
+    fn install_registry(
+        &mut self,
+        registry: ChainRegistry,
+        codecs: CodecSet<'_>,
+    ) -> Result<(), PtwmCoreError> {
         if self.prelude_written || !self.index_entries.is_empty() {
             return Err(PtwmCoreError::InvalidContainer(
                 "chain registry must be set before appending tensors".into(),
             ));
         }
-        // Build the extension table from the registry chains, producing the
-        // chain registry bytes in the same pass so table indices are consistent.
-        let mut builder = ExtensionTableBuilder::new();
-        let mut registry_bytes = Vec::new();
-        registry.write(&mut builder, &mut registry_bytes)?;
-
-        // Additionally intern all builtin plane-codec entries so every codec
-        // the compressor selects gets a stable u16 table index for
-        // `PlaneRecord::codec_table_idx`.  Ops that are already in the table
-        // from chain interning just get their existing index back.
-        //
-        // Note: we use `builtin_entries()` (the curated list with `is_builtin`
-        // coverage) and filter by `Kind::PlaneCodec` rather than hard-coding
-        // names.  This avoids interning `huffman_nibble`, which is present in
-        // `dispatch_builtin` for legacy wire compat but has no `builtin_entry`
-        // and therefore is NOT recognised by `is_builtin` / `collect_missing_flavors`.
-        use crate::extension::Kind;
-        use crate::extension::builtin_entries;
-        let mut codec_idx_map = HashMap::new();
-        for entry in builtin_entries()
-            .into_iter()
-            .filter(|e| e.kind == Kind::PlaneCodec)
-        {
-            let canonical_id = entry.canonical_id;
-            let idx = builder.intern(entry);
-            codec_idx_map.insert(canonical_id, idx);
-        }
-
-        let entries = builder.finish();
-        self.extension_table = ExtensionTable { entries };
-        self.chain_registry_bytes = registry_bytes;
+        let built = build_extension_table(&registry, codecs)?;
+        self.extension_table = built.table;
+        self.chain_registry_bytes = built.registry_bytes;
         self.chain_registry = registry;
-        self.codec_idx_map = codec_idx_map;
+        self.codec_idx_map = built.codec_idx_map;
         Ok(())
     }
 

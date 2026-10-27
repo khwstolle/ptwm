@@ -286,3 +286,75 @@ fn implode_rejects_missing_member() {
     let empty: HashMap<String, &[u8]> = HashMap::new();
     assert!(implode(&exploded.registry_json, &tensor_jsons(&exploded), empty).is_err());
 }
+
+/// Containers whose Extension Table holds only the referenced codecs must
+/// round-trip byte-exactly, and imploding one tensor must keep its codec
+/// index pointing at the same codec.
+#[test]
+fn round_trip_trimmed_codec_table() {
+    use crate::compressor::codec_canonical_id;
+
+    let registry = ChainRegistry {
+        chains: vec![(0u16, passthrough_chain())],
+    };
+    let rec = |name: &str, codec: CodecId| TensorRecord {
+        chain_ref: 0,
+        dtype_code: 6,
+        input_format: 2,
+        flags: 0,
+        orig_size: 8,
+        name: name.to_string(),
+        payload_hash: None,
+        inline_chain: None,
+        dependencies: Vec::new(),
+        tensor_metadata: None,
+        terminals: vec![flat_plane(PlaneRole::Value, codec, vec![5; 8])],
+    };
+    let codecs = [
+        codec_canonical_id(CodecId::Zstd),
+        codec_canonical_id(CodecId::Rans),
+    ];
+
+    let mut cursor = Cursor::new(Vec::<u8>::new());
+    {
+        let mut writer = ContainerWriter::new(&mut cursor).unwrap();
+        writer
+            .set_chain_registry_with_codecs(registry, &codecs)
+            .unwrap();
+        let mut a = rec("a.weight", CodecId::Zstd);
+        a.terminals[0].codec_table_idx = writer.codec_table_idx_for(&codecs[0]).unwrap();
+        let mut b = rec("b.weight", CodecId::Rans);
+        b.terminals[0].codec_table_idx = writer.codec_table_idx_for(&codecs[1]).unwrap();
+        writer.append_tensor(&a).unwrap();
+        writer.append_tensor(&b).unwrap();
+        writer.finalize().unwrap();
+    }
+    let blob = cursor.into_inner();
+
+    let reader = ContainerReader::open(&blob).unwrap();
+    // Two chain ops plus two codecs; no unreferenced built-in codecs.
+    assert_eq!(reader.extension_table.entries.len(), 4);
+    assert_round_trip(&blob);
+
+    // Implode only "b.weight" with the archive-wide registry.
+    let exploded = explode(&blob).unwrap();
+    let b = exploded
+        .tensors
+        .iter()
+        .find(|t| t.name == "b.weight")
+        .unwrap();
+    let rebuilt = implode(
+        &exploded.registry_json,
+        &[b.manifest_json.clone()],
+        members_map(&exploded),
+    )
+    .unwrap();
+    let reader = ContainerReader::open(&rebuilt).unwrap();
+    let rec_bytes = reader.get_tensor_record_bytes("b.weight").unwrap();
+    let (parsed, _) = crate::tensor_record::parse_tensor_record(rec_bytes).unwrap();
+    let idx = parsed.terminals[0].codec_table_idx as usize;
+    assert_eq!(
+        reader.extension_table.entries[idx].canonical_id, codecs[1],
+        "imploded subset must resolve b.weight's plane to rANS"
+    );
+}

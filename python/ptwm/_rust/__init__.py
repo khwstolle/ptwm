@@ -16,7 +16,9 @@ __all__ = [
     "blake3_hash",
     "builtin_canonical_id",
     "codec_id_registry",
+    "compress_compact",
     "compress_model",
+    "decode_compact",
     "decode_model",
     "decode_tensor",
     "decode_tensor_delta_hash",
@@ -213,6 +215,67 @@ def compress_model(
             streaming_chunk,
             codec_menu,
         )
+    )
+
+
+@translate_errors
+def compress_compact(
+    dtype_code: int,
+    input_format: int,
+    raw_bytes: bytes,
+    shape: list[int] | None,
+    dtype_name: str | None,
+    delta_reference_blake3: bytes | None,
+    chains: list[bytes],
+    emit_payload_hash: bool,
+    emit_plane_crc: bool,
+    method_hint: int = 3,
+    codec_menu: list[int] | None = None,
+) -> bytes | None:
+    """Compress one tensor into a compact single-tensor frame.
+
+    The arguments match one record of :func:`compress_model`; the tensor name
+    is not stored. Returns ``None`` when the tensor cannot use the compact
+    frame (a plane selects shared state); write a full container then.
+    """
+    got = _ext.compress_compact(
+        dtype_code,
+        input_format,
+        raw_bytes,
+        shape,
+        dtype_name,
+        delta_reference_blake3,
+        chains,
+        emit_payload_hash,
+        emit_plane_crc,
+        method_hint,
+        codec_menu,
+    )
+    return bytes(got) if got is not None else None
+
+
+@translate_errors
+def decode_compact(
+    blob: bytes,
+) -> tuple[bytes, list[int] | None, str | None, int, int, bytes | None, int]:
+    """Decode a compact single-tensor frame.
+
+    Returns ``(raw_bytes, shape, dtype_name, dtype_code, input_format,
+    delta_reference_blake3, payload_len)``. ``payload_len`` counts codec
+    payload plus inline codec state (the raw size for a stored frame), so
+    ``len(blob) - payload_len`` is the frame's fixed overhead.
+    """
+    raw, shape, dtype_name, dtype_code, input_format, delta, payload_len = (
+        _ext.decode_compact(blob)
+    )
+    return (
+        bytes(raw),
+        shape,
+        dtype_name,
+        dtype_code,
+        input_format,
+        bytes(delta) if delta is not None else None,
+        payload_len,
     )
 
 

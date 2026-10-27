@@ -138,6 +138,7 @@ def compress_file(
         Compressor,
         DecompressionConfig,
         Decompressor,
+        Framing,
         Method,
     )
 
@@ -162,6 +163,9 @@ def compress_file(
     compressor = Compressor(
         CompressionConfig(
             bytearray_dtype=dtype,
+            # `.ptwm` files stay full containers so the random-access, store
+            # and inspect tools can open them.
+            framing=Framing.CONTAINER,
             is_streaming=is_streaming,
             streaming_chunk=chunk_size,
             method=Method(method),
@@ -253,6 +257,7 @@ def compress_file_delta(
         Compressor,
         DecompressionConfig,
         Decompressor,
+        Framing,
         Method,
     )
 
@@ -285,6 +290,7 @@ def compress_file_delta(
     compressor = Compressor(
         CompressionConfig(
             bytearray_dtype="float32" if dtype else "bfloat16",
+            framing=Framing.CONTAINER,
             is_streaming=is_streaming,
             streaming_chunk=chunk_size,
             delta_compressed_type="file",

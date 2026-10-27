@@ -1,13 +1,17 @@
 """Verify the v1 file carries an Extension Table immediately after the header."""
 
 import torch
-from ptwm import CompressionConfig, Compressor, Format, Method
+from ptwm import CompressionConfig, Compressor, Format, Framing, Method
 
 
 def test_extension_table_is_present_for_huffman_chain():
     tensor = torch.randn(128, 128, dtype=torch.float32)
     blob = Compressor(
-        CompressionConfig(input_format=Format.TORCH, method=Method.HUFFMAN)
+        CompressionConfig(
+            input_format=Format.TORCH,
+            method=Method.HUFFMAN,
+            framing=Framing.CONTAINER,
+        )
     ).compress(tensor)
 
     # Header layout (little-endian):
@@ -32,3 +36,16 @@ def test_extension_table_is_present_for_huffman_chain():
     assert count >= 1, (
         "expected at least one Extension Table entry referenced by a Huffman chain"
     )
+
+
+def test_extension_table_holds_only_referenced_codecs():
+    """The writer interns the chain ops plus the codecs the planes use. The
+    v1.1 layout interned all 16 built-in plane codecs, about 2 KB."""
+    tensor = torch.full((32,), 0.5, dtype=torch.bfloat16)
+    blob = Compressor(
+        CompressionConfig(input_format=Format.TORCH, framing=Framing.CONTAINER)
+    ).compress(tensor)
+    table_off = int.from_bytes(blob[11:19], "little")
+    count = int.from_bytes(blob[table_off : table_off + 4], "little")
+    assert count < 16, f"extension table has {count} entries"
+    assert len(blob) < 1024, f"single-tensor container is {len(blob)} bytes"

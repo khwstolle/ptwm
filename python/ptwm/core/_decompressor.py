@@ -10,6 +10,10 @@ from .._exceptions import HeaderParseError, InvalidDTypeError
 from ..delta import decode as delta_decode
 from ..utils import DType
 
+# Full multi-tensor container and compact single-tensor frame.
+_MAGIC_CONTAINER = b"\x89PTWM"
+_MAGIC_COMPACT = b"\x89PTWS"
+
 
 def _torch_dtype_for_code(dtype_code: int) -> torch.dtype | None:
     """Map a wire ``dtype_code`` to a concrete ``torch.dtype`` if supported."""
@@ -35,9 +39,11 @@ class Decompressor:
         self._threads = self.config.threads or min(multiprocessing.cpu_count(), 16)
 
     def decompress(self, data: bytes | memoryview) -> bytes | np.ndarray | torch.Tensor:
-        """Decompress a ``.ptwm`` blob.
+        r"""Decompress a ``.ptwm`` blob.
 
-        The single-tensor wrapper uses name ``"_"``. Raw decompressed bytes
+        Accepts a compact single-tensor frame (magic ``\x89PTWS``) or a
+        full container (magic ``\x89PTWM``). The single-tensor container
+        uses name ``"_"``. Raw decompressed bytes
         come from ``decode_tensor``; shape/dtype/input_format (when present)
         come from the CBOR shape-metadata map. Format recovery:
 
@@ -73,18 +79,30 @@ class Decompressor:
             raise ValueError(msg)
 
         mv_data = memoryview(data)
-        magic = b"\x89PTWM"
-        if len(mv_data) < len(magic):
+        magic = bytes(mv_data[: len(_MAGIC_CONTAINER)])
+        if len(magic) < len(_MAGIC_CONTAINER):
             msg = "too short to be a .ptwm container"
-            raise HeaderParseError(msg)
-        if bytes(mv_data[: len(magic)]) != magic:
-            msg = "not a .ptwm container"
             raise HeaderParseError(msg)
 
         blob = bytes(mv_data)
-        skip = self.config.skip_missing
-        raw = _rust.decode_tensor(blob, "_", skip)
-        expected_hash = _rust.decode_tensor_delta_hash(blob, "_", skip)
+        info: tuple[list[int], str, int, int] | None
+        if magic == _MAGIC_COMPACT:
+            raw, shape, dtype_name, dtype_code, input_format, expected_hash, _ = (
+                _rust.decode_compact(blob)
+            )
+            info = (
+                (shape, dtype_name or "", dtype_code, input_format)
+                if shape is not None
+                else None
+            )
+        elif magic == _MAGIC_CONTAINER:
+            skip = self.config.skip_missing
+            raw = _rust.decode_tensor(blob, "_", skip)
+            expected_hash = _rust.decode_tensor_delta_hash(blob, "_", skip)
+            info = _rust.decode_tensor_info(blob, "_", skip)
+        else:
+            msg = "not a .ptwm container"
+            raise HeaderParseError(msg)
 
         if expected_hash is not None:
             if self.config.delta_second_data is None:
@@ -109,7 +127,6 @@ class Decompressor:
             )
             raise ValueError(msg)
 
-        info = _rust.decode_tensor_info(blob, "_", skip)
         if info is None:
             return raw
         shape, _dtype_name, dtype_code, input_format = info

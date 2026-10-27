@@ -17,6 +17,7 @@ from ptwm import (
     Compressor,
     Decompressor,
     Format,
+    Framing,
     Method,
 )
 
@@ -72,7 +73,9 @@ def test_zstd_numpy_roundtrip() -> None:
 def test_zstd_outputs_ptwm() -> None:
     """ZSTD produces a .ptwm container with a forced Zstd plane codec."""
     arr = np.zeros(256, dtype=np.float32).tobytes()
-    config = CompressionConfig(method=Method.ZSTD, bytearray_dtype="float32")
+    config = CompressionConfig(
+        method=Method.ZSTD, bytearray_dtype="float32", framing=Framing.CONTAINER
+    )
     compressed = Compressor(config).compress(arr)
     assert compressed[:5] == b"\x89PTWM"
 

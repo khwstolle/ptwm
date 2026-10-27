@@ -23,8 +23,11 @@ use std::io::Cursor;
 
 use crate::chain::graph::{Chain, ChainEdge, ChainNode, TerminalRef};
 use crate::codec::{CodecId, StateSource};
-use crate::container::{ChainRegistry, ContainerReader, ContainerWriter};
+use crate::container::{
+    ChainRegistry, CodecSet, ContainerReader, ContainerWriter, build_extension_table,
+};
 use crate::error::PtwmCoreError;
+use crate::extension::ExtensionTable;
 use crate::header::FLAG_PTWX;
 use crate::layout::PlaneLayout;
 use crate::metadata::{decode_shape_metadata, encode_shape_metadata};
@@ -557,7 +560,34 @@ pub fn implode(
     {
         let mut writer = ContainerWriter::new(&mut cursor)?;
         writer.set_prelude(&prelude_entries)?;
-        writer.set_chain_registry(chain_registry)?;
+        // Containers written by v1.1 and earlier intern every built-in codec;
+        // later writers intern only the codecs the planes reference. Rebuild
+        // whichever layout reproduces the recorded table hash, so the planes'
+        // `codec_table_idx` values resolve to the same entries.
+        //
+        // Take the codec set from the archive-wide registry, not from
+        // `records`: a caller may implode a subset of the tensors (the
+        // exploded store layouts rebuild one tensor at a time).
+        let used_codecs: Vec<crate::extension::CanonicalId> = registry
+            .registry
+            .codecs
+            .iter()
+            .filter_map(|c| CodecId::from_u16(c.id))
+            .map(crate::compressor::codec_canonical_id)
+            .collect();
+        let trimmed = build_extension_table(&chain_registry, CodecSet::Only(&used_codecs)).ok();
+        let trimmed_matches = trimmed.is_some_and(|built| {
+            built
+                .table
+                .to_bytes()
+                .map(|b| hex::encode(ExtensionTable::hash(&b)) == registry.registry_hash_blake3)
+                .unwrap_or(false)
+        });
+        if trimmed_matches {
+            writer.set_chain_registry_with_codecs(chain_registry, &used_codecs)?;
+        } else {
+            writer.set_chain_registry(chain_registry)?;
+        }
         for record in &records {
             writer.append_tensor(record)?;
         }

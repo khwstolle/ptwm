@@ -217,8 +217,12 @@ pub fn builtin_entries() -> Vec<ExtensionTableEntry> {
 
 /// The Extension Table entry of the built-in `name` with its id and label
 /// derived for `version`, as a writer of that version emits it. Returns
-/// `None` if `name` has no built-in entry.
+/// `None` if `name` has no built-in entry or `version` fails
+/// [`is_valid_builtin_version`].
 pub fn builtin_entry_at_version(name: &str, version: &str) -> Option<ExtensionTableEntry> {
+    if !is_valid_builtin_version(version) {
+        return None;
+    }
     let reg = builtin_registry();
     let idx = reg.by_id.get(reg.by_name.get(name)?)?.entry_index?;
     if version == CURRENT_BUILTIN_VERSION {
@@ -244,11 +248,23 @@ pub fn is_builtin(id: &CanonicalId) -> bool {
         .is_some_and(|r| r.entry_index.is_some())
 }
 
+/// Whether `version` is a valid built-in version: non-empty, at most 64
+/// bytes, and free of `@`. Every writer and
+/// [`normalize_builtin_ids`] apply this rule, so a version the reader accepts
+/// is one a writer can reproduce.
+pub fn is_valid_builtin_version(version: &str) -> bool {
+    !version.is_empty() && version.len() <= MAX_BUILTIN_VERSION_LEN && !version.contains('@')
+}
+
+/// Longest built-in version string, in bytes.
+pub const MAX_BUILTIN_VERSION_LEN: usize = 64;
+
 /// Map built-in entries written by another release to the ids and labels of
 /// the crate version.
 ///
 /// An entry is changed only when all of these hold:
-/// - its label is `io.ptwm.builtin.<name>@<ver>`;
+/// - its label is `io.ptwm.builtin.<name>@<ver>`, and `<ver>` passes
+///   [`is_valid_builtin_version`];
 /// - `<name>` has a built-in entry ([`builtin_entries`]);
 /// - its id equals `CanonicalId::derive(BUILTIN_PUBKEY, name, ver)`.
 ///
@@ -273,6 +289,9 @@ pub fn normalize_builtin_ids(table: &mut ExtensionTable) -> Option<String> {
         let Some((name, ver)) = rest.split_once('@') else {
             continue;
         };
+        if !is_valid_builtin_version(ver) {
+            continue;
+        }
         let Some(&current_id) = reg.by_name.get(name) else {
             continue;
         };
@@ -400,6 +419,38 @@ mod tests {
         // The genuine entry is still mapped.
         assert!(is_builtin(&table.entries[3].canonical_id));
         assert_eq!(version.as_deref(), Some("1.0.0"));
+    }
+
+    /// Versions that no writer accepts are not normalised, so a reader never
+    /// reports a version that the transcoder cannot write back.
+    #[test]
+    fn invalid_versions_are_not_normalised() {
+        let long = "7".repeat(MAX_BUILTIN_VERSION_LEN + 1);
+        for bad in ["", "9.9@x", long.as_str()] {
+            assert!(!is_valid_builtin_version(bad), "{bad:?}");
+            assert!(
+                builtin_entry_at_version("huffman", bad).is_none(),
+                "{bad:?}"
+            );
+            let mut entry = builtin_entry_at_version("huffman", "1.0.0").unwrap();
+            entry.canonical_id = CanonicalId::derive(&BUILTIN_PUBKEY, "huffman", bad);
+            entry.human_label = format!("{BUILTIN_LABEL_PREFIX}huffman@{bad}");
+            let mut table = ExtensionTable {
+                entries: vec![entry],
+            };
+            let before = table.clone();
+            assert_eq!(normalize_builtin_ids(&mut table), None, "{bad:?}");
+            assert_eq!(table, before);
+            assert!(!is_builtin(&table.entries[0].canonical_id));
+        }
+        let max = "7".repeat(MAX_BUILTIN_VERSION_LEN);
+        for good in ["1.0.0", "0.9.0-rc.1", max.as_str()] {
+            assert!(is_valid_builtin_version(good), "{good:?}");
+            assert_eq!(
+                normalize_builtin_ids(&mut table_at(good)).as_deref(),
+                Some(good)
+            );
+        }
     }
 
     #[test]

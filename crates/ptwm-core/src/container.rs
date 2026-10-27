@@ -158,7 +158,7 @@ pub fn build_extension_table(
 ) -> Result<BuiltExtensionTable, PtwmCoreError> {
     use crate::extension::{Kind, builtin_entries, builtin_registry};
 
-    let mut builder = ExtensionTableBuilder::with_builtin_version(builtin_version);
+    let mut builder = ExtensionTableBuilder::with_builtin_version(builtin_version)?;
     let mut registry_bytes = Vec::new();
     registry.write(&mut builder, &mut registry_bytes)?;
 
@@ -454,7 +454,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
                 "builtin version must be set before the extension table and tensors".into(),
             ));
         }
-        if version.is_empty() || version.len() > 64 || version.contains('@') {
+        if !crate::extension::is_valid_builtin_version(version) {
             return Err(PtwmCoreError::InvalidContainer(format!(
                 "invalid builtin version {version:?}"
             )));
@@ -1859,6 +1859,14 @@ mod tests {
         let mut w = ContainerWriter::new(&mut buf).unwrap();
         for bad in ["", "1@2", &"9".repeat(65)] {
             assert!(w.set_builtin_version(bad).is_err(), "{bad:?}");
+            // The table builder applies the same rule.
+            let registry = ChainRegistry {
+                chains: vec![(0, make_minimal_chain(1))],
+            };
+            assert!(
+                build_extension_table(&registry, CodecSet::AllBuiltins, bad).is_err(),
+                "{bad:?}"
+            );
         }
         w.set_builtin_version("1.0.0").unwrap();
         w.set_chain_registry(ChainRegistry {

@@ -143,3 +143,26 @@ def test_label_layout_assumption() -> None:
     assert m is not None
     (label_len,) = struct.unpack_from("<H", blob, m.start() - 2)
     assert label_len == m.end() - m.start()
+
+
+def test_list_extension_table_entries_reports_current_builtin_ids() -> None:
+    """Built-in entries of an older file are listed with the current ids, so
+    ``ptwm.ablation.bench_compare`` sees the same contributions in both files."""
+    from ptwm._core import list_extension_table_entries
+    from ptwm.ablation import bench_compare
+
+    old = FIXTURES / "legacy_v1_0_0.ptwm"
+    cur = FIXTURES / "legacy_v1_1_0.ptwm"
+    old_entries = list_extension_table_entries(str(old))
+    cur_entries = list_extension_table_entries(str(cur))
+    assert old_entries
+    assert {cid for cid, *_ in old_entries} <= {cid for cid, *_ in cur_entries}
+
+    import ptwm
+
+    for _cid, label, _kind, _flavor in old_entries:
+        assert label.endswith(f"@{ptwm.__version__}"), label
+
+    result = bench_compare(old, cur)
+    assert result.only_in_a == []
+    assert result.common

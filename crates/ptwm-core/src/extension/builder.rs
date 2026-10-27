@@ -3,8 +3,8 @@
 use std::collections::HashMap;
 
 use super::{
-    CURRENT_BUILTIN_VERSION, CanonicalId, ExtensionTableEntry, builtin_entry_at_version,
-    builtin_registry,
+    CURRENT_BUILTIN_VERSION, CanonicalId, ExtensionError, ExtensionTableEntry,
+    builtin_entry_at_version, builtin_registry, is_valid_builtin_version,
 };
 
 /// Intern `ExtensionTableEntry` values by canonical id, returning a
@@ -18,7 +18,11 @@ pub struct ExtensionTableBuilder {
 
 impl Default for ExtensionTableBuilder {
     fn default() -> Self {
-        Self::with_builtin_version(CURRENT_BUILTIN_VERSION)
+        Self {
+            by_id: HashMap::new(),
+            entries: Vec::new(),
+            builtin_version: CURRENT_BUILTIN_VERSION.to_owned(),
+        }
     }
 }
 
@@ -30,12 +34,16 @@ impl ExtensionTableBuilder {
     /// A builder that interns built-ins with the ids and labels of
     /// `version`, as a writer of that release does. The transcoder uses it
     /// to rebuild tables written by other releases byte-exactly.
-    pub fn with_builtin_version(version: &str) -> Self {
-        Self {
-            by_id: HashMap::new(),
-            entries: Vec::new(),
-            builtin_version: version.to_owned(),
+    ///
+    /// Fails when `version` does not pass [`is_valid_builtin_version`].
+    pub fn with_builtin_version(version: &str) -> Result<Self, ExtensionError> {
+        if !is_valid_builtin_version(version) {
+            return Err(ExtensionError::InvalidBuiltinVersion(version.to_owned()));
         }
+        Ok(Self {
+            builtin_version: version.to_owned(),
+            ..Self::default()
+        })
     }
 
     /// A builder whose table starts as `entries`. Interning an id already in
@@ -138,7 +146,7 @@ mod tests {
 
     #[test]
     fn intern_builtin_uses_the_builder_version() {
-        let mut b = ExtensionTableBuilder::with_builtin_version("1.0.0");
+        let mut b = ExtensionTableBuilder::with_builtin_version("1.0.0").unwrap();
         assert_eq!(b.builtin_version(), "1.0.0");
         assert_eq!(b.intern_builtin("source"), Some(0));
         assert_eq!(b.intern_builtin("zstd"), Some(1));
@@ -156,6 +164,16 @@ mod tests {
         let mut b = ExtensionTableBuilder::new();
         b.intern_builtin("source").unwrap();
         assert_eq!(b.finish(), vec![make_entry("source")]);
+    }
+
+    #[test]
+    fn with_builtin_version_rejects_invalid_versions() {
+        for bad in ["", "9.9@x", &"7".repeat(65)] {
+            assert!(
+                ExtensionTableBuilder::with_builtin_version(bad).is_err(),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]

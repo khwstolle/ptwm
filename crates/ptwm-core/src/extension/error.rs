@@ -33,4 +33,7 @@ pub enum ExtensionError {
 
     #[error("attestation parse error: {0}")]
     AttestationParse(String),
+
+    #[error("invalid builtin version {0:?}")]
+    InvalidBuiltinVersion(String),
 }

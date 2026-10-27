@@ -195,7 +195,7 @@ fn write_tensor_record_unchecked(
     //   inline_et_entries: [ExtensionTableEntry; count]
     //   chain_bytes:      (num_nodes, ..., nodes_section, edges_section, terminals_section)
     if let Some(chain) = &rec.inline_chain {
-        let mut builder = ExtensionTableBuilder::with_builtin_version(builtin_version);
+        let mut builder = ExtensionTableBuilder::with_builtin_version(builtin_version)?;
         let mut chain_bytes = Vec::new();
         write_chain(chain, &mut builder, &mut chain_bytes)?;
         let inline_table = ExtensionTable {

@@ -5,7 +5,7 @@ use std::io::Read;
 
 use pyo3::prelude::*;
 
-use ptwm_core::extension::ExtensionTable;
+use ptwm_core::extension::{ExtensionTable, normalize_builtin_ids};
 use ptwm_core::header::{HEADER_LEN, Header};
 
 fn to_pyerr<E: std::fmt::Display>(e: E) -> PyErr {
@@ -25,6 +25,10 @@ fn extension_table_region(buf: &[u8], off: u64, len: u64) -> Option<&[u8]> {
 /// Returns a list of ``(canonical_id_hex, human_label, kind_u16, flavor_hints)``
 /// tuples -- one per entry in the file's extension table.  Returns an empty
 /// list when the file carries no extension table (``extension_table_length == 0``).
+///
+/// Built-in entries written by another release are reported with the ids and
+/// labels of the current release (see ``normalize_builtin_ids``), so the ids
+/// of files written by different releases compare equal.
 ///
 /// Raises ``ValueError`` for any parse error (bad magic, truncated header,
 /// out-of-bounds extension table region, ...).
@@ -58,7 +62,8 @@ pub fn list_extension_table_entries(path: String) -> PyResult<Vec<(String, Strin
             buf.len()
         ))
     })?;
-    let table = ExtensionTable::from_bytes(table_bytes).map_err(to_pyerr)?;
+    let mut table = ExtensionTable::from_bytes(table_bytes).map_err(to_pyerr)?;
+    normalize_builtin_ids(&mut table);
     Ok(table
         .entries
         .iter()

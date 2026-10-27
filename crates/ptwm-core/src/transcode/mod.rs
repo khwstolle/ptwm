@@ -36,7 +36,7 @@ use crate::plane_record::{ChunkEntry, ExternalStateRef, PlaneRecord};
 use crate::prelude::{PreludeEntry, write_prelude};
 use crate::tensor_record::{
     CHAIN_REF_INLINE_BIT, Dependency, RefKind, TensorRecord,
-    parse_tensor_record_with_builtin_version,
+    parse_tensor_record_with_builtin_version, write_tensor_record_with_builtin_version,
 };
 use crate::transforms::op::OpId;
 use crate::types::PlaneRole;
@@ -364,7 +364,7 @@ pub fn explode(blob: &[u8]) -> Result<Exploded, PtwmCoreError> {
             .checked_add(entry.tensor_len as usize)
             .filter(|e| *e <= blob.len())
             .ok_or_else(|| err("tensor record slice out of bounds"))?;
-        let (record, _, inline_version) =
+        let (record, consumed, inline_version) =
             parse_tensor_record_with_builtin_version(&blob[start..end])?;
         // `implode` writes every inline-chain table with one built-in
         // version, so they must agree.
@@ -380,6 +380,25 @@ pub fn explode(blob: &[u8]) -> Result<Exploded, PtwmCoreError> {
                     )));
                 }
                 Some(_) => {}
+            }
+        }
+        // `implode` re-encodes inline-chain tables with a single built-in
+        // version. A table that mixes versions (or is otherwise not what
+        // that writer emits) would come back with different bytes, so
+        // refuse it here instead of producing a silent mismatch.
+        if record.inline_chain.is_some() {
+            let version = inline_builtin_version
+                .as_deref()
+                .unwrap_or(CURRENT_BUILTIN_VERSION);
+            let mut reencoded = Vec::new();
+            write_tensor_record_with_builtin_version(&record, &mut reencoded, version)?;
+            if blob.get(start..start + consumed) != Some(reencoded.as_slice()) {
+                return Err(err(format!(
+                    "tensor {:?}: inline chain record differs from its re-encoding \
+                     (for example, its Extension Table mixes built-in versions); \
+                     the container cannot be transcoded byte-exactly",
+                    record.name
+                )));
             }
         }
         for plane in &record.terminals {

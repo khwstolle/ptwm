@@ -499,7 +499,7 @@ mod tests {
             }],
             terminals: vec![],
         };
-        let mut builder = ExtensionTableBuilder::with_builtin_version("1.0.0");
+        let mut builder = ExtensionTableBuilder::with_builtin_version("1.0.0").unwrap();
         let mut chain_bytes = Vec::new();
         write_chain(&chain, &mut builder, &mut chain_bytes).unwrap();
         let table = ExtensionTable {

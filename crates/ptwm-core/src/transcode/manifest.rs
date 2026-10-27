@@ -18,6 +18,7 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// `shared_prelude` to archive scope so codecs/ops/codebooks/chains are defined
 /// once and referenced by id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegistryManifest {
     pub ptwm_format: String,
     pub manifest_version: u32,
@@ -28,19 +29,33 @@ pub struct RegistryManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContainerFlags {
     pub embedded_wasm: bool,
+    /// Release whose built-in Extension Table ids and labels the container
+    /// was written with, when it is not the release reading it. `implode`
+    /// writes built-in entries (file-level and inline-chain tables) with
+    /// this version. Absent for the crate version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Registry {
     pub ops: Vec<OpEntry>,
     pub codecs: Vec<CodecEntry>,
     pub shared_state: Vec<SharedStateEntry>,
     pub chains: Vec<ChainEntry>,
+    /// The container's Extension Table bytes (base64), present only when no
+    /// table builder reproduces them from `chains`, the codec list and
+    /// `builtin_version`. `implode` then writes them verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_table_b64: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpEntry {
     /// Stable wire op id (`OpId::as_u16`).
     pub id: u16,
@@ -49,6 +64,7 @@ pub struct OpEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CodecEntry {
     /// Wire-stable `CodecId` value.
     pub id: u16,
@@ -60,6 +76,7 @@ pub struct CodecEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SharedStateEntry {
     pub id: u16,
     pub codec: u16,
@@ -73,6 +90,7 @@ pub struct SharedStateEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChainEntry {
     pub id: u16,
     pub nodes: Vec<NodeJson>,
@@ -81,6 +99,7 @@ pub struct ChainEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeJson {
     /// Stable wire op id (`OpId::as_u16`).
     pub op: u16,
@@ -88,6 +107,7 @@ pub struct NodeJson {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EdgeJson {
     pub src: u8,
     pub src_out: u8,
@@ -98,6 +118,7 @@ pub struct EdgeJson {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalJson {
     pub node: u8,
     pub out: u8,
@@ -109,6 +130,7 @@ pub struct TerminalJson {
 
 /// Per-tensor manifest — a direct projection of `TensorRecord`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TensorManifest {
     pub name: String,
     /// Canonical dtype name from the CBOR metadata; `null` when absent.
@@ -132,6 +154,7 @@ pub struct TensorManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChainSpec {
     /// Registry chain index when shared; `null` when the chain is inlined.
     #[serde(rename = "ref")]
@@ -143,6 +166,7 @@ pub struct ChainSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DependencyJson {
     pub ref_kind: String,
     pub ref_b64: String,
@@ -150,6 +174,7 @@ pub struct DependencyJson {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlaneJson {
     pub index: u32,
     /// Human-readable plane role label.
@@ -184,6 +209,7 @@ pub struct PlaneJson {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalStateJson {
     pub ref_kind: u8,
     pub ref_b64: String,
@@ -192,6 +218,7 @@ pub struct ExternalStateJson {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChunkJson {
     pub offset_in_payload: u32,
     pub decoded_size: u32,

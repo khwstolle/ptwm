@@ -15,7 +15,10 @@ pub mod resolve;
 pub mod table;
 
 pub use builder::ExtensionTableBuilder;
-pub use builtins::{builtin_entries, builtin_entry, is_builtin};
+pub use builtins::{
+    BUILTIN_LABEL_PREFIX, BuiltinRef, BuiltinRegistry, CURRENT_BUILTIN_VERSION, builtin_entries,
+    builtin_entry, builtin_entry_at_version, builtin_registry, is_builtin, normalize_builtin_ids,
+};
 pub use capability::{Capability, CapabilityMap};
 pub use dispatch::{BuiltinKind, dispatch_builtin};
 pub use error::ExtensionError;
@@ -32,9 +35,10 @@ pub const BUILTIN_PUBKEY: [u8; 32] = [0xBB; 32];
 
 /// Compute the canonical id of an in-tree built-in by name.
 /// The version is the PTWM crate version (`CARGO_PKG_VERSION`), so
-/// built-in IDs are stable per release.
+/// built-in IDs change with each release. Files from other releases are
+/// mapped to these ids by [`normalize_builtin_ids`].
 pub fn builtin_canonical_id(name: &str) -> CanonicalId {
-    CanonicalId::derive(&BUILTIN_PUBKEY, name, env!("CARGO_PKG_VERSION"))
+    builtins::current_builtin_id(name)
 }
 
 #[cfg(test)]

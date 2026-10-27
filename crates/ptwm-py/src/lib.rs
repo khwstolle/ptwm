@@ -936,8 +936,10 @@ fn py_chain_blob_info(blob: &[u8]) -> PyResult<(usize, Vec<(u16, u16)>)> {
 
     // Parse the extension table; its size is the parse position, not the
     // length of a re-serialization.
-    let (inline_table, et_size) = ExtensionTable::from_bytes_prefix(blob)
+    let (mut inline_table, et_size) = ExtensionTable::from_bytes_prefix(blob)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("chain blob et: {e}")))?;
+    // Blobs cached by another release carry that release's built-in ids.
+    ptwm_core::extension::normalize_builtin_ids(&mut inline_table);
 
     // Build (table_idx, op_id) pairs for every entry that resolves to an op.
     let mut table: Vec<(u16, u16)> = Vec::with_capacity(inline_table.entries.len());

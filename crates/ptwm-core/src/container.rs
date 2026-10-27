@@ -18,7 +18,7 @@ use crate::index::{
     EOF_SENTINEL, IndexEntry, name_hash, parse_index, verify_eof_sentinel, write_index,
 };
 use crate::prelude::{PreludeEntry, parse_prelude, write_prelude};
-use crate::tensor_record::{TensorRecord, write_tensor_record};
+use crate::tensor_record::{TensorRecord, write_tensor_record_with_builtin_version};
 
 // ── Chain registry ────────────────────────────────────────────────────────────
 
@@ -129,6 +129,7 @@ pub enum CodecSet<'a> {
 }
 
 /// Output of [`build_extension_table`].
+#[derive(Debug)]
 pub struct BuiltExtensionTable {
     pub table: ExtensionTable,
     /// Serialized chain registry whose op indices refer to `table`.
@@ -142,16 +143,22 @@ pub struct BuiltExtensionTable {
 /// plane codecs selected by `codecs`, in the order of
 /// [`crate::extension::builtin_entries`].
 ///
-/// The result is a pure function of `registry` and the codec set, so a
-/// reader-side tool (the transcoder) can rebuild the same bytes.
+/// Built-in entries carry the ids and labels of `builtin_version`
+/// ([`crate::extension::CURRENT_BUILTIN_VERSION`] for new files). The
+/// returned `codec_idx_map` is keyed by the current canonical ids whatever
+/// the version.
+///
+/// The result is a pure function of `registry`, the codec set and the
+/// version, so a reader-side tool (the transcoder) can rebuild the same
+/// bytes.
 pub fn build_extension_table(
     registry: &ChainRegistry,
     codecs: CodecSet<'_>,
+    builtin_version: &str,
 ) -> Result<BuiltExtensionTable, PtwmCoreError> {
-    use crate::extension::Kind;
-    use crate::extension::builtin_entries;
+    use crate::extension::{Kind, builtin_entries, builtin_registry};
 
-    let mut builder = ExtensionTableBuilder::new();
+    let mut builder = ExtensionTableBuilder::with_builtin_version(builtin_version);
     let mut registry_bytes = Vec::new();
     registry.write(&mut builder, &mut registry_bytes)?;
 
@@ -160,28 +167,35 @@ pub fn build_extension_table(
     // excludes `huffman_nibble`, which `dispatch_builtin` keeps for legacy
     // wire compat but which has no `builtin_entry`, so `is_builtin` and
     // `collect_missing_flavors` do not recognise it.
-    let codec_entries: Vec<_> = builtin_entries()
+    let codec_ids: Vec<CanonicalId> = builtin_entries()
         .into_iter()
         .filter(|e| e.kind == Kind::PlaneCodec)
+        .map(|e| e.canonical_id)
         .collect();
     if let CodecSet::Only(wanted) = codecs {
         for id in wanted {
-            if !codec_entries.iter().any(|e| e.canonical_id == *id) {
+            if !codec_ids.contains(id) {
                 return Err(PtwmCoreError::InvalidContainer(format!(
                     "codec {id:?} has no built-in Extension Table entry"
                 )));
             }
         }
     }
+    let reg = builtin_registry();
     let mut codec_idx_map = HashMap::new();
-    for entry in codec_entries {
+    for canonical_id in codec_ids {
         let keep = match codecs {
             CodecSet::AllBuiltins => true,
-            CodecSet::Only(wanted) => wanted.contains(&entry.canonical_id),
+            CodecSet::Only(wanted) => wanted.contains(&canonical_id),
         };
         if keep {
-            let canonical_id = entry.canonical_id;
-            let idx = builder.intern(entry);
+            let name = reg
+                .get(&canonical_id)
+                .map(|r| r.name)
+                .expect("built-in codec entry is in the registry");
+            let idx = builder
+                .intern_builtin(name)
+                .expect("built-in codec has an Extension Table entry");
             codec_idx_map.insert(canonical_id, idx);
         }
     }
@@ -190,6 +204,65 @@ pub fn build_extension_table(
         table: ExtensionTable {
             entries: builder.finish(),
         },
+        registry_bytes,
+        codec_idx_map,
+    })
+}
+
+/// Validate serialized Extension Table bytes and encode `registry` against
+/// them, for [`ContainerWriter::set_raw_extension_table`].
+///
+/// Checks:
+/// - `table_bytes` parse as one Extension Table with no trailing bytes and
+///   re-serialize to the same bytes;
+/// - no entry references an embedded WASM module;
+/// - every op of every registry chain is already in the table (built-in
+///   ids of other releases count once normalised).
+///
+/// Registry ops resolve to the first entry with their id; `codec_idx_map`
+/// maps each built-in codec's current id to its first entry. The returned
+/// `table` is the table as parsed, without normalisation.
+pub fn encode_registry_for_table(
+    table_bytes: &[u8],
+    registry: &ChainRegistry,
+) -> Result<BuiltExtensionTable, PtwmCoreError> {
+    use crate::extension::{BuiltinKind, dispatch_builtin, normalize_builtin_ids};
+
+    let bad = |msg: String| PtwmCoreError::InvalidContainer(format!("raw extension table: {msg}"));
+    let (table, used) =
+        ExtensionTable::from_bytes_prefix(table_bytes).map_err(|e| bad(e.to_string()))?;
+    if used != table_bytes.len() {
+        return Err(bad(format!("{} trailing bytes", table_bytes.len() - used)));
+    }
+    if table.to_bytes().map_err(|e| bad(e.to_string()))? != table_bytes {
+        return Err(bad("bytes are not in canonical form".into()));
+    }
+    if table
+        .entries
+        .iter()
+        .any(|e| e.embedded_wasm_offset.is_some() || e.embedded_wasm_length.is_some())
+    {
+        return Err(bad("embedded WASM entries are not supported".into()));
+    }
+
+    let mut normalised = table.clone();
+    normalize_builtin_ids(&mut normalised);
+    let n_entries = normalised.entries.len();
+    let mut codec_idx_map = HashMap::new();
+    for (i, e) in normalised.entries.iter().enumerate() {
+        if let Some(BuiltinKind::Codec(_)) = dispatch_builtin(&e.canonical_id) {
+            let idx = u16::try_from(i).map_err(|_| bad("too many entries".into()))?;
+            codec_idx_map.entry(e.canonical_id).or_insert(idx);
+        }
+    }
+    let mut builder = ExtensionTableBuilder::from_entries(normalised.entries);
+    let mut registry_bytes = Vec::new();
+    registry.write(&mut builder, &mut registry_bytes)?;
+    if builder.len() != n_entries {
+        return Err(bad("a chain op is missing from the table".into()));
+    }
+    Ok(BuiltExtensionTable {
+        table,
         registry_bytes,
         codec_idx_map,
     })
@@ -224,6 +297,14 @@ pub struct ContainerWriter<W: Write + Seek> {
     prelude_section_len: u64,
     /// Names appended so far. A container holds each name at most once.
     names: HashSet<String>,
+    /// Version whose ids and labels built-in Extension Table entries are
+    /// written with (file-level and inline-chain tables).
+    builtin_version: String,
+    /// Extension Table bytes to write verbatim instead of serializing
+    /// `extension_table` (see `set_raw_extension_table`).
+    raw_extension_table: Option<Vec<u8>>,
+    /// Whether an Extension Table or chain registry was set.
+    table_set: bool,
 }
 
 impl<W: Write + Seek> ContainerWriter<W> {
@@ -259,6 +340,9 @@ impl<W: Write + Seek> ContainerWriter<W> {
             finalized: false,
             prelude_section_len: 0,
             names: HashSet::new(),
+            builtin_version: crate::extension::CURRENT_BUILTIN_VERSION.to_owned(),
+            raw_extension_table: None,
+            table_set: false,
         })
     }
 
@@ -327,8 +411,10 @@ impl<W: Write + Seek> ContainerWriter<W> {
                 "chain registry must be set before appending tensors".into(),
             ));
         }
-        let built = build_extension_table(&registry, codecs)?;
+        let built = build_extension_table(&registry, codecs, &self.builtin_version)?;
         self.extension_table = built.table;
+        self.raw_extension_table = None;
+        self.table_set = true;
         self.chain_registry_bytes = built.registry_bytes;
         self.chain_registry = registry;
         self.codec_idx_map = built.codec_idx_map;
@@ -349,6 +435,62 @@ impl<W: Write + Seek> ContainerWriter<W> {
     /// with a real table; the default is `ExtensionTable::empty()`.
     pub fn set_extension_table(&mut self, table: ExtensionTable) {
         self.extension_table = table;
+        self.raw_extension_table = None;
+        self.table_set = true;
+    }
+
+    /// Write built-in Extension Table entries with the ids and labels of
+    /// `version` instead of the crate version. This applies to the table
+    /// built by [`set_chain_registry`](Self::set_chain_registry) and
+    /// [`set_chain_registry_with_codecs`](Self::set_chain_registry_with_codecs)
+    /// and to inline-chain tables. The transcoder uses it to reproduce files
+    /// written by other releases; new files keep the default.
+    ///
+    /// Must be called before the Extension Table or chain registry is set
+    /// and before any tensor is appended.
+    pub fn set_builtin_version(&mut self, version: &str) -> Result<(), PtwmCoreError> {
+        if self.table_set || self.prelude_written || !self.index_entries.is_empty() {
+            return Err(PtwmCoreError::InvalidContainer(
+                "builtin version must be set before the extension table and tensors".into(),
+            ));
+        }
+        if version.is_empty() || version.len() > 64 || version.contains('@') {
+            return Err(PtwmCoreError::InvalidContainer(format!(
+                "invalid builtin version {version:?}"
+            )));
+        }
+        self.builtin_version = version.to_owned();
+        Ok(())
+    }
+
+    /// Use `table_bytes` verbatim as the file's Extension Table and encode
+    /// `registry` against it.
+    ///
+    /// The transcoder uses this for tables that no table builder reproduces
+    /// (for example a table that mixes built-in versions). The bytes are
+    /// validated by [`encode_registry_for_table`] first. Plane codec indices
+    /// for [`codec_table_idx_for`](Self::codec_table_idx_for) come from the
+    /// first table entry of each codec.
+    ///
+    /// Must be called before any tensor is appended.
+    pub fn set_raw_extension_table(
+        &mut self,
+        table_bytes: &[u8],
+        registry: ChainRegistry,
+    ) -> Result<(), PtwmCoreError> {
+        if self.prelude_written || !self.index_entries.is_empty() {
+            return Err(PtwmCoreError::InvalidContainer(
+                "extension table must be set before appending tensors".into(),
+            ));
+        }
+        let built = encode_registry_for_table(table_bytes, &registry)?;
+        self.extension_table = built.table;
+        self.raw_extension_table = Some(table_bytes.to_vec());
+        self.chain_registry_bytes = built.registry_bytes;
+        self.chain_registry = registry;
+        self.codec_idx_map = built.codec_idx_map;
+        self.table_set = true;
+        Ok(())
     }
 
     /// Write the extension table, prelude section, and chain registry section,
@@ -362,10 +504,13 @@ impl<W: Write + Seek> ContainerWriter<W> {
 
         // Extension table sits immediately after the header at HEADER_LEN.
         // Serialize it now (set_extension_table must be called before this point).
-        let et_bytes = self
-            .extension_table
-            .to_bytes()
-            .map_err(|e| PtwmCoreError::InvalidContainer(format!("extension table: {e}")))?;
+        let et_bytes = match &self.raw_extension_table {
+            Some(raw) => raw.clone(),
+            None => self
+                .extension_table
+                .to_bytes()
+                .map_err(|e| PtwmCoreError::InvalidContainer(format!("extension table: {e}")))?,
+        };
         let et_len = et_bytes.len() as u64;
         let et_hash = if et_len > 0 {
             ExtensionTable::hash(&et_bytes)
@@ -448,7 +593,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
             .map_err(|e| PtwmCoreError::Io(e.to_string()))?;
 
         let mut tensor_buf = Vec::new();
-        write_tensor_record(record, &mut tensor_buf)?;
+        write_tensor_record_with_builtin_version(record, &mut tensor_buf, &self.builtin_version)?;
         let tensor_len = tensor_buf.len() as u64;
 
         self.writer
@@ -699,6 +844,11 @@ pub struct ContainerReader<'a> {
     /// request). Populated by `open_partial`; always empty when `open` returns
     /// `Ok` (because `open` returns `Err` instead).
     pub missing_extensions: Vec<crate::error::MissingFlavorEntry>,
+    /// Built-in version of the file's Extension Table, as returned by
+    /// [`crate::extension::normalize_builtin_ids`]: the release whose
+    /// built-in ids the writer used. `None` when the table holds no built-in
+    /// entry. `extension_table` holds the ids mapped to the crate version.
+    pub builtin_version: Option<String>,
 }
 
 impl<'a> ContainerReader<'a> {
@@ -740,7 +890,7 @@ impl<'a> ContainerReader<'a> {
 
         // Parse the Extension Table (sits at extension_table_offset for
         // extension_table_length bytes, immediately after the header).
-        let extension_table = if header.extension_table_length == 0 {
+        let mut extension_table = if header.extension_table_length == 0 {
             ExtensionTable::empty()
         } else {
             let et_start = usize::try_from(header.extension_table_offset).map_err(|_| {
@@ -767,10 +917,25 @@ impl<'a> ContainerReader<'a> {
             ExtensionTable::from_bytes(table_bytes)
                 .map_err(|e| PtwmCoreError::InvalidContainer(format!("extension table: {e}")))?
         };
+        // Map built-in ids written by other releases to the current ones.
+        // This runs after the hash check, which covers the on-disk bytes.
+        let builtin_version = crate::extension::normalize_builtin_ids(&mut extension_table);
+
+        // A table of built-ins only needs no discovery, keyring or trust
+        // pass: built-ins are trusted by construction and always available.
+        // Skipping it keeps opening such a file free of filesystem access.
+        let all_builtin = extension_table
+            .entries
+            .iter()
+            .all(|e| crate::extension::is_builtin(&e.canonical_id));
 
         // Scan installed extensions once; used by both the missing-flavor check
         // and the trust verifier pass below.
-        let installed = crate::discovery::scan_all_cached().unwrap_or_default();
+        let installed = if all_builtin {
+            Vec::new()
+        } else {
+            crate::discovery::scan_all_cached().unwrap_or_default()
+        };
 
         // Check for missing non-builtin flavors immediately after parsing the
         // Extension Table — before touching any tensor payload.
@@ -785,7 +950,7 @@ impl<'a> ContainerReader<'a> {
         // (i.e. not flagged as missing above), verify that its author is
         // trusted by the active keyring. Entries with no matching install
         // (already covered by MissingFlavor above) are skipped here.
-        {
+        if !all_builtin {
             // Build the active keyring: start from the bundled keys, merge the
             // user keyring on top.
             let mut keyring = match crate::trust::evaluate_bundled() {
@@ -925,6 +1090,7 @@ impl<'a> ContainerReader<'a> {
             tensors_offset,
             chain_registry_offset,
             missing_extensions: needs,
+            builtin_version,
         })
     }
 
@@ -1351,6 +1517,7 @@ mod tests {
     use crate::codec::{CodecId, StateSource};
     use crate::layout::PlaneLayout;
     use crate::plane_record::PlaneRecord;
+    use crate::tensor_record::write_tensor_record;
     use crate::tensor_record::{CHAIN_REF_INLINE_BIT, parse_tensor_record};
     use crate::types::PlaneRole;
     use std::io::Cursor;
@@ -1687,6 +1854,126 @@ mod tests {
     }
 
     #[test]
+    fn set_builtin_version_must_come_first() {
+        let mut buf = Cursor::new(Vec::new());
+        let mut w = ContainerWriter::new(&mut buf).unwrap();
+        for bad in ["", "1@2", &"9".repeat(65)] {
+            assert!(w.set_builtin_version(bad).is_err(), "{bad:?}");
+        }
+        w.set_builtin_version("1.0.0").unwrap();
+        w.set_chain_registry(ChainRegistry {
+            chains: vec![(0, make_minimal_chain(1))],
+        })
+        .unwrap();
+        let err = w.set_builtin_version("1.0.1").unwrap_err().to_string();
+        assert!(err.contains("must be set before"), "{err}");
+        assert!(
+            w.extension_table
+                .entries
+                .iter()
+                .all(|e| e.human_label.ends_with("@1.0.0"))
+        );
+        // Codec indices are keyed by the current ids whatever the version.
+        assert!(
+            w.codec_table_idx_for(&crate::extension::builtin_canonical_id("zstd"))
+                .is_some()
+        );
+    }
+
+    /// Serialized Extension Table of a container written with `registry`.
+    fn table_bytes_for(registry: &ChainRegistry, codecs: CodecSet<'_>) -> Vec<u8> {
+        build_extension_table(registry, codecs, crate::extension::CURRENT_BUILTIN_VERSION)
+            .unwrap()
+            .table
+            .to_bytes()
+            .unwrap()
+    }
+
+    #[test]
+    fn raw_extension_table_is_validated() {
+        let registry = ChainRegistry {
+            chains: vec![(0, v3_passthrough_chain(4))],
+        };
+        let good = table_bytes_for(&registry, CodecSet::AllBuiltins);
+        let built = encode_registry_for_table(&good, &registry).unwrap();
+        let reference = build_extension_table(
+            &registry,
+            CodecSet::AllBuiltins,
+            crate::extension::CURRENT_BUILTIN_VERSION,
+        )
+        .unwrap();
+        assert_eq!(built.registry_bytes, reference.registry_bytes);
+        assert_eq!(built.codec_idx_map, reference.codec_idx_map);
+
+        // Trailing bytes.
+        let mut trailing = good.clone();
+        trailing.push(0);
+        let e = encode_registry_for_table(&trailing, &registry).unwrap_err();
+        assert!(e.to_string().contains("trailing bytes"), "{e}");
+
+        // A table that lacks a chain op.
+        let other = ChainRegistry {
+            chains: vec![(0, make_minimal_chain(0))],
+        };
+        let only_passthrough = table_bytes_for(&other, CodecSet::Only(&[]));
+        let e = encode_registry_for_table(&only_passthrough, &registry).unwrap_err();
+        assert!(e.to_string().contains("missing from the table"), "{e}");
+
+        // Embedded WASM entries.
+        let mut table = ExtensionTable::from_bytes(&good).unwrap();
+        table.entries[0].embedded_wasm_offset = Some(0);
+        table.entries[0].embedded_wasm_length = Some(1);
+        let wasm = table.to_bytes().unwrap();
+        let e = encode_registry_for_table(&wasm, &registry).unwrap_err();
+        assert!(e.to_string().contains("embedded WASM"), "{e}");
+
+        // Garbage.
+        assert!(encode_registry_for_table(b"\xff\xff\xff\xff", &registry).is_err());
+    }
+
+    /// A raw table is written verbatim; the registry indices resolve
+    /// against it, here a table whose ops come after its codecs.
+    #[test]
+    fn raw_extension_table_is_written_verbatim() {
+        use crate::extension::{Kind, builtin_entries};
+        let registry = ChainRegistry {
+            chains: vec![(0, v3_passthrough_chain(4))],
+        };
+        let mut entries: Vec<_> = builtin_entries()
+            .into_iter()
+            .filter(|e| e.kind == Kind::PlaneCodec)
+            .collect();
+        entries
+            .push(crate::extension::builtin_entry_at_version("byte_passthrough", "1.0.0").unwrap());
+        entries.push(crate::extension::builtin_entry_at_version("source", "1.0.0").unwrap());
+        let raw = ExtensionTable { entries }.to_bytes().unwrap();
+
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut w = ContainerWriter::new(&mut buf).unwrap();
+            w.set_raw_extension_table(&raw, registry.clone()).unwrap();
+            let identity = crate::extension::builtin_canonical_id("identity");
+            assert_eq!(w.codec_table_idx_for(&identity), Some(0));
+            let mut rec = sample_tensor_record("t");
+            rec.chain_ref = 0;
+            rec.orig_size = 4;
+            rec.terminals[0].codec_id = CodecId::Identity;
+            rec.terminals[0].codec_table_idx = 0;
+            rec.terminals[0].payload_bytes = vec![1, 2, 3, 4];
+            rec.terminals[0].payload_len = 4;
+            rec.terminals[0].crc32 = None;
+            w.append_tensor(&rec).unwrap();
+            w.finalize().unwrap();
+        }
+        let blob = buf.into_inner();
+        let reader = ContainerReader::open(&blob).unwrap();
+        let et = &blob[reader.header.extension_table_offset as usize..][..raw.len()];
+        assert_eq!(et, raw.as_slice());
+        assert_eq!(reader.chain_registry, registry);
+        assert_eq!(reader.decode_tensor("t").unwrap(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
     fn writer_rejects_duplicate_tensor_names() {
         let mut buf = Cursor::new(Vec::new());
         let mut w = ContainerWriter::new(&mut buf).unwrap();
@@ -1781,10 +2068,10 @@ mod tests {
         let bytes = buf.into_inner();
         let reader = ContainerReader::open(&bytes).unwrap();
         assert_eq!(reader.chain_registry.chains.len(), 1);
-        let header = reader.header.clone();
+        let header = reader.header;
 
         let patch = |len: u64| {
-            let mut h = header.clone();
+            let mut h = header;
             h.shared_prelude_length = len;
             let mut b = bytes.clone();
             b[..HEADER_LEN].copy_from_slice(&h.to_bytes().unwrap());
@@ -1793,7 +2080,7 @@ mod tests {
 
         // Section ends one byte early: the registry is truncated.
         let short = patch(header.shared_prelude_length - 1);
-        let err = ContainerReader::open(&short).err().expect("must fail");
+        let err = ContainerReader::open(&short).expect_err("must fail");
         assert!(err.to_string().contains("ChainRegistry"), "{err}");
 
         // Section holds only the prelude: no registry is read.
@@ -1802,11 +2089,11 @@ mod tests {
         assert!(reader.chain_registry.chains.is_empty());
 
         // Section shorter than the prelude count.
-        let err = ContainerReader::open(&patch(2)).err().expect("must fail");
+        let err = ContainerReader::open(&patch(2)).expect_err("must fail");
         assert!(err.to_string().contains("prelude"), "{err}");
 
         // A zero-length section has no prelude at all and is rejected.
-        let err = ContainerReader::open(&patch(0)).err().expect("must fail");
+        let err = ContainerReader::open(&patch(0)).expect_err("must fail");
         assert!(err.to_string().contains("prelude"), "{err}");
 
         // An intact section puts the tensor records right after it.
@@ -1816,9 +2103,7 @@ mod tests {
         );
 
         // Section runs past the end of the buffer.
-        let err = ContainerReader::open(&patch(u64::MAX))
-            .err()
-            .expect("must fail");
+        let err = ContainerReader::open(&patch(u64::MAX)).expect_err("must fail");
         assert!(err.to_string().contains("shared prelude"), "{err}");
     }
 

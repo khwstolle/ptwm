@@ -8,8 +8,8 @@
 use crate::chain::Chain;
 use crate::chain::wire::{read_chain, write_chain};
 use crate::error::PtwmCoreError;
-use crate::extension::ExtensionTableBuilder;
 use crate::extension::table::ExtensionTable;
+use crate::extension::{CURRENT_BUILTIN_VERSION, ExtensionTableBuilder, normalize_builtin_ids};
 use crate::plane_record::{PlaneRecord, parse_plane_record, write_plane_record};
 
 pub const TENSOR_FLAG_DEPENDENCIES: u8 = 0x01;
@@ -95,8 +95,19 @@ pub(crate) fn checked_len<T: TryFrom<usize>>(n: usize, what: &str) -> Result<T, 
 /// On error, `out` is truncated back to its length before the call, so a
 /// failed write never leaves a partial record behind.
 pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), PtwmCoreError> {
+    write_tensor_record_with_builtin_version(rec, out, CURRENT_BUILTIN_VERSION)
+}
+
+/// [`write_tensor_record`] with the inline chain's Extension Table written
+/// with the built-in ids and labels of `builtin_version`. The transcoder
+/// uses it to reproduce records written by other releases.
+pub fn write_tensor_record_with_builtin_version(
+    rec: &TensorRecord,
+    out: &mut Vec<u8>,
+    builtin_version: &str,
+) -> Result<(), PtwmCoreError> {
     let start = out.len();
-    let result = write_tensor_record_unchecked(rec, out);
+    let result = write_tensor_record_unchecked(rec, out, builtin_version);
     if result.is_err() {
         out.truncate(start);
     }
@@ -106,6 +117,7 @@ pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), 
 fn write_tensor_record_unchecked(
     rec: &TensorRecord,
     out: &mut Vec<u8>,
+    builtin_version: &str,
 ) -> Result<(), PtwmCoreError> {
     // Validate inline_chain vs chain_ref consistency.
     let has_inline = rec.chain_ref & CHAIN_REF_INLINE_BIT != 0;
@@ -183,7 +195,7 @@ fn write_tensor_record_unchecked(
     //   inline_et_entries: [ExtensionTableEntry; count]
     //   chain_bytes:      (num_nodes, ..., nodes_section, edges_section, terminals_section)
     if let Some(chain) = &rec.inline_chain {
-        let mut builder = ExtensionTableBuilder::new();
+        let mut builder = ExtensionTableBuilder::with_builtin_version(builtin_version);
         let mut chain_bytes = Vec::new();
         write_chain(chain, &mut builder, &mut chain_bytes)?;
         let inline_table = ExtensionTable {
@@ -249,6 +261,19 @@ pub fn peek_tensor_record_name(buf: &[u8]) -> Result<&str, PtwmCoreError> {
 }
 
 pub fn parse_tensor_record(buf: &[u8]) -> Result<(TensorRecord, usize), PtwmCoreError> {
+    parse_tensor_record_with_builtin_version(buf).map(|(rec, consumed, _)| (rec, consumed))
+}
+
+/// [`parse_tensor_record`] that also returns the built-in version of the
+/// inline chain's Extension Table (see
+/// [`crate::extension::normalize_builtin_ids`]), or `None` when the record
+/// has no inline chain or its table holds no built-in entry.
+///
+/// Inline tables written by another release are mapped to the current
+/// built-in ids before the chain is resolved.
+pub fn parse_tensor_record_with_builtin_version(
+    buf: &[u8],
+) -> Result<(TensorRecord, usize, Option<String>), PtwmCoreError> {
     if buf.len() < 18 {
         return Err(PtwmCoreError::InvalidContainer(
             "tensor record header truncated".into(),
@@ -314,6 +339,7 @@ pub fn parse_tensor_record(buf: &[u8]) -> Result<(TensorRecord, usize), PtwmCore
     //
     // Wire layout: a local extension table precedes the chain
     // bytes. Read it first, then pass it to `read_chain`.
+    let mut inline_version = None;
     let inline_chain = if chain_ref & CHAIN_REF_INLINE_BIT != 0 {
         // Read the inline extension table (count: u32 + entries) directly
         // from the buffer slice via a Cursor. The cursor's position tells
@@ -322,10 +348,11 @@ pub fn parse_tensor_record(buf: &[u8]) -> Result<(TensorRecord, usize), PtwmCore
         // tables — count is already bounded by MAX_TABLE_ENTRIES, but
         // the re-serialize was redundant work either way).
         let mut cursor = std::io::Cursor::new(&buf[pos..]);
-        let inline_table = ExtensionTable::read(&mut cursor).map_err(|e| {
+        let mut inline_table = ExtensionTable::read(&mut cursor).map_err(|e| {
             PtwmCoreError::InvalidContainer(format!("inline chain extension table: {e}"))
         })?;
         pos += cursor.position() as usize;
+        inline_version = normalize_builtin_ids(&mut inline_table);
         let (chain, consumed) = read_chain(&buf[pos..], &inline_table).map_err(|e| {
             PtwmCoreError::InvalidContainer(format!("inline chain parse error: {e}"))
         })?;
@@ -411,6 +438,7 @@ pub fn parse_tensor_record(buf: &[u8]) -> Result<(TensorRecord, usize), PtwmCore
             terminals,
         },
         pos,
+        inline_version,
     ))
 }
 

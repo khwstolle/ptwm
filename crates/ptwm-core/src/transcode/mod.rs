@@ -24,17 +24,19 @@ use std::io::Cursor;
 use crate::chain::graph::{Chain, ChainEdge, ChainNode, TerminalRef};
 use crate::codec::{CodecId, StateSource};
 use crate::container::{
-    ChainRegistry, CodecSet, ContainerReader, ContainerWriter, build_extension_table,
+    BuiltExtensionTable, ChainRegistry, CodecSet, ContainerReader, ContainerWriter,
+    build_extension_table, encode_registry_for_table,
 };
 use crate::error::PtwmCoreError;
-use crate::extension::ExtensionTable;
+use crate::extension::{CURRENT_BUILTIN_VERSION, CanonicalId, ExtensionTable};
 use crate::header::FLAG_PTWX;
 use crate::layout::PlaneLayout;
 use crate::metadata::{decode_shape_metadata, encode_shape_metadata};
 use crate::plane_record::{ChunkEntry, ExternalStateRef, PlaneRecord};
-use crate::prelude::PreludeEntry;
+use crate::prelude::{PreludeEntry, write_prelude};
 use crate::tensor_record::{
-    CHAIN_REF_INLINE_BIT, Dependency, RefKind, TensorRecord, parse_tensor_record,
+    CHAIN_REF_INLINE_BIT, Dependency, RefKind, TensorRecord,
+    parse_tensor_record_with_builtin_version,
 };
 use crate::transforms::op::OpId;
 use crate::types::PlaneRole;
@@ -232,6 +234,73 @@ fn shared_state_key(shared_state_id: u16) -> String {
     format!("shared/s{shared_state_id:05}.bin")
 }
 
+// ── Extension Table reconstruction ────────────────────────────────────────────
+
+/// Which table builder reproduced a container's Extension Table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableLayout {
+    /// Chain ops plus the codecs the planes use (current writers).
+    Trimmed,
+    /// Chain ops plus every built-in codec (v1.1 and earlier).
+    AllBuiltins,
+}
+
+/// Current canonical ids of the manifest's codec list. The list is
+/// archive-wide, so a one-tensor implode still rebuilds the archive's table.
+fn used_codec_ids(codecs: &[CodecEntry]) -> Vec<CanonicalId> {
+    codecs
+        .iter()
+        .filter_map(|c| CodecId::from_u16(c.id))
+        .map(crate::compressor::codec_canonical_id)
+        .collect()
+}
+
+/// Header-style hash of serialized table bytes.
+fn table_hash(bytes: &[u8]) -> [u8; 32] {
+    if bytes.is_empty() {
+        [0u8; 32]
+    } else {
+        ExtensionTable::hash(bytes)
+    }
+}
+
+/// Rebuild the Extension Table from the chain registry, trying the trimmed
+/// layout and then the all-built-ins layout, both with built-in entries of
+/// `version`. Returns the first layout whose table bytes hash to
+/// `expected_hash`, or `None`.
+fn rebuild_extension_table(
+    registry: &ChainRegistry,
+    used_codecs: &[CanonicalId],
+    version: &str,
+    expected_hash: &[u8; 32],
+) -> Option<(TableLayout, BuiltExtensionTable)> {
+    [
+        (TableLayout::Trimmed, CodecSet::Only(used_codecs)),
+        (TableLayout::AllBuiltins, CodecSet::AllBuiltins),
+    ]
+    .into_iter()
+    .find_map(|(layout, codecs)| {
+        let built = build_extension_table(registry, codecs, version).ok()?;
+        let bytes = built.table.to_bytes().ok()?;
+        (table_hash(&bytes) == *expected_hash).then_some((layout, built))
+    })
+}
+
+/// The container's on-disk Extension Table bytes.
+fn extension_table_bytes<'a>(
+    reader: &ContainerReader<'_>,
+    blob: &'a [u8],
+) -> Result<&'a [u8], PtwmCoreError> {
+    let start = usize::try_from(reader.header.extension_table_offset)
+        .map_err(|_| err("extension_table_offset overflows usize"))?;
+    let len = usize::try_from(reader.header.extension_table_length)
+        .map_err(|_| err("extension_table_length overflows usize"))?;
+    start
+        .checked_add(len)
+        .and_then(|end| blob.get(start..end))
+        .ok_or_else(|| err("extension table region exceeds buffer"))
+}
+
 // ── Explode ───────────────────────────────────────────────────────────────────
 
 /// Parse a `.ptwm` container into a registry manifest, per-tensor manifests,
@@ -285,6 +354,7 @@ pub fn explode(blob: &[u8]) -> Result<Exploded, PtwmCoreError> {
 
     let mut codec_ids: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
     let mut tensors: Vec<ExplodedTensor> = Vec::with_capacity(index.len());
+    let mut inline_builtin_version: Option<String> = None;
 
     for (file_idx, entry) in index.iter().enumerate() {
         // `usize` is ≥ 32 bits on every supported platform; widening these
@@ -294,7 +364,24 @@ pub fn explode(blob: &[u8]) -> Result<Exploded, PtwmCoreError> {
             .checked_add(entry.tensor_len as usize)
             .filter(|e| *e <= blob.len())
             .ok_or_else(|| err("tensor record slice out of bounds"))?;
-        let (record, _) = parse_tensor_record(&blob[start..end])?;
+        let (record, _, inline_version) =
+            parse_tensor_record_with_builtin_version(&blob[start..end])?;
+        // `implode` writes every inline-chain table with one built-in
+        // version, so they must agree.
+        if let Some(v) = inline_version {
+            match &inline_builtin_version {
+                None => inline_builtin_version = Some(v),
+                Some(b) if *b != v => {
+                    return Err(err(format!(
+                        "tensor {:?}: inline chain built-in version {v} differs from \
+                         {b} in an earlier inline chain; the container cannot be \
+                         transcoded byte-exactly",
+                        record.name
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
         for plane in &record.terminals {
             codec_ids.insert(plane.codec_id.as_u16());
         }
@@ -331,16 +418,59 @@ pub fn explode(blob: &[u8]) -> Result<Exploded, PtwmCoreError> {
         })
         .collect();
 
+    // `implode` writes built-in entries with one version. Inline-chain
+    // tables are always re-encoded, so their version wins; the file-level
+    // table is rebuilt with it when that reproduces the bytes.
+    let builtin_version = inline_builtin_version.or_else(|| reader.builtin_version.clone());
+    let version = builtin_version
+        .as_deref()
+        .unwrap_or(CURRENT_BUILTIN_VERSION);
+
+    // Check that implode can rebuild the Extension Table and the
+    // shared-prelude section byte-exactly. When no table builder reproduces
+    // the table, carry its bytes in the manifest.
+    let used_codecs = used_codec_ids(&codecs);
+    let et_bytes = extension_table_bytes(&reader, blob)?;
+    let (built, extension_table_b64) = match rebuild_extension_table(
+        &reader.chain_registry,
+        &used_codecs,
+        version,
+        &reader.header.extension_table_hash,
+    ) {
+        Some((_, built)) => (built, None),
+        None => (
+            encode_registry_for_table(et_bytes, &reader.chain_registry)?,
+            Some(base64::encode(et_bytes)),
+        ),
+    };
+    let mut section = Vec::new();
+    write_prelude(&reader.prelude, &mut section)?;
+    section.extend_from_slice(&built.registry_bytes);
+    let prelude_off = usize::try_from(reader.header.shared_prelude_offset)
+        .map_err(|_| err("shared_prelude_offset overflows usize"))?;
+    let prelude_end = usize::try_from(reader.tensors_offset)
+        .map_err(|_| err("tensors_offset overflows usize"))?;
+    if blob.get(prelude_off..prelude_end) != Some(section.as_slice()) {
+        return Err(err(
+            "the shared prelude or chain registry differs from its re-encoding; \
+             the container cannot be transcoded byte-exactly",
+        ));
+    }
+
     let registry = RegistryManifest {
         ptwm_format: PTWM_MANIFEST_FORMAT.to_string(),
         manifest_version: MANIFEST_VERSION,
-        container_flags: ContainerFlags { embedded_wasm },
+        container_flags: ContainerFlags {
+            embedded_wasm,
+            builtin_version: builtin_version.filter(|v| v != CURRENT_BUILTIN_VERSION),
+        },
         registry_hash_blake3: hex::encode(reader.header.extension_table_hash),
         registry: Registry {
             ops,
             codecs,
             shared_state,
             chains,
+            extension_table_b64,
         },
     };
     let registry_value =
@@ -502,19 +632,32 @@ pub fn implode(
     tensor_jsons: &[String],
     mut members: HashMap<String, &[u8]>,
 ) -> Result<Vec<u8>, PtwmCoreError> {
-    let registry: RegistryManifest = serde_json::from_str(registry_json)
+    // Check the format and version before the strict parse, so a manifest
+    // of another format or version gets a clear error.
+    let value: serde_json::Value = serde_json::from_str(registry_json)
         .map_err(|e| err(format!("parse registry manifest: {e}")))?;
-    if registry.ptwm_format != PTWM_MANIFEST_FORMAT {
+    let format = value.get("ptwm_format").and_then(|v| v.as_str());
+    let version = value.get("manifest_version").and_then(|v| v.as_u64());
+    if format != Some(PTWM_MANIFEST_FORMAT) || version != Some(u64::from(MANIFEST_VERSION)) {
         return Err(err(format!(
-            "unexpected ptwm_format {:?}",
-            registry.ptwm_format
+            "unsupported manifest: ptwm_format {format:?}, manifest_version {version:?} \
+             (this reader handles {PTWM_MANIFEST_FORMAT:?} version {MANIFEST_VERSION})"
         )));
     }
+    let registry: RegistryManifest =
+        serde_json::from_value(value).map_err(|e| err(format!("parse registry manifest: {e}")))?;
     if registry.container_flags.embedded_wasm {
         return Err(err(
             "embedded-WASM (.ptwx) containers are not supported by the transcoder",
         ));
     }
+    let expected_hash = parse_hash32(&registry.registry_hash_blake3)
+        .map_err(|_| err("registry_hash_blake3 must be 32 bytes of hex"))?;
+    let builtin_version = registry
+        .container_flags
+        .builtin_version
+        .as_deref()
+        .unwrap_or(CURRENT_BUILTIN_VERSION);
 
     // Rebuild the shared-state prelude (order preserved).
     let mut prelude_entries: Vec<PreludeEntry> =
@@ -560,33 +703,47 @@ pub fn implode(
     {
         let mut writer = ContainerWriter::new(&mut cursor)?;
         writer.set_prelude(&prelude_entries)?;
+        // Built-in entries (file-level and inline-chain tables) carry the
+        // ids and labels of the release that wrote the container.
+        writer.set_builtin_version(builtin_version)?;
         // Containers written by v1.1 and earlier intern every built-in codec;
         // later writers intern only the codecs the planes reference. Rebuild
         // whichever layout reproduces the recorded table hash, so the planes'
-        // `codec_table_idx` values resolve to the same entries.
+        // `codec_table_idx` values resolve to the same entries. A table that
+        // neither layout reproduces travels as `extension_table_b64`.
         //
         // Take the codec set from the archive-wide registry, not from
         // `records`: a caller may implode a subset of the tensors (the
         // exploded store layouts rebuild one tensor at a time).
-        let used_codecs: Vec<crate::extension::CanonicalId> = registry
-            .registry
-            .codecs
-            .iter()
-            .filter_map(|c| CodecId::from_u16(c.id))
-            .map(crate::compressor::codec_canonical_id)
-            .collect();
-        let trimmed = build_extension_table(&chain_registry, CodecSet::Only(&used_codecs)).ok();
-        let trimmed_matches = trimmed.is_some_and(|built| {
-            built
-                .table
-                .to_bytes()
-                .map(|b| hex::encode(ExtensionTable::hash(&b)) == registry.registry_hash_blake3)
-                .unwrap_or(false)
-        });
-        if trimmed_matches {
-            writer.set_chain_registry_with_codecs(chain_registry, &used_codecs)?;
+        if let Some(b64) = &registry.registry.extension_table_b64 {
+            let bytes =
+                base64::decode(b64).ok_or_else(|| err("extension_table_b64 not valid base64"))?;
+            if table_hash(&bytes) != expected_hash {
+                return Err(err(
+                    "extension_table_b64 does not match registry_hash_blake3",
+                ));
+            }
+            writer.set_raw_extension_table(&bytes, chain_registry)?;
         } else {
-            writer.set_chain_registry(chain_registry)?;
+            let used_codecs = used_codec_ids(&registry.registry.codecs);
+            match rebuild_extension_table(
+                &chain_registry,
+                &used_codecs,
+                builtin_version,
+                &expected_hash,
+            ) {
+                Some((TableLayout::Trimmed, _)) => {
+                    writer.set_chain_registry_with_codecs(chain_registry, &used_codecs)?;
+                }
+                Some((TableLayout::AllBuiltins, _)) => writer.set_chain_registry(chain_registry)?,
+                None => {
+                    return Err(err(format!(
+                        "no Extension Table layout reproduces registry_hash_blake3 {} \
+                         (built-in version {builtin_version})",
+                        registry.registry_hash_blake3
+                    )));
+                }
+            }
         }
         for record in &records {
             writer.append_tensor(record)?;

@@ -358,3 +358,196 @@ fn round_trip_trimmed_codec_table() {
         "imploded subset must resolve b.weight's plane to rANS"
     );
 }
+
+fn minimal_container() -> Vec<u8> {
+    let registry = ChainRegistry {
+        chains: vec![(0u16, passthrough_chain())],
+    };
+    let rec = TensorRecord {
+        chain_ref: 0,
+        dtype_code: 6,
+        input_format: 2,
+        flags: 0,
+        orig_size: 8,
+        name: "w".to_string(),
+        payload_hash: None,
+        inline_chain: None,
+        dependencies: Vec::new(),
+        tensor_metadata: None,
+        terminals: vec![flat_plane(
+            PlaneRole::Value,
+            CodecId::Identity,
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+        )],
+    };
+    build_container(&[], registry, &[rec])
+}
+
+/// Implode `registry` (a JSON value) with the tensors and members of
+/// `exploded`.
+fn implode_value(
+    exploded: &Exploded,
+    registry: &serde_json::Value,
+) -> Result<Vec<u8>, PtwmCoreError> {
+    implode(
+        &registry.to_string(),
+        &tensor_jsons(exploded),
+        members_map(exploded),
+    )
+}
+
+#[test]
+fn implode_rejects_other_manifest_format_or_version() {
+    let blob = minimal_container();
+    let exploded = explode(&blob).unwrap();
+    let reg: serde_json::Value = serde_json::from_str(&exploded.registry_json).unwrap();
+    assert_eq!(implode_value(&exploded, &reg).unwrap(), blob);
+
+    for (field, value) in [
+        ("ptwm_format", serde_json::json!("ptwm-manifest-c")),
+        ("manifest_version", serde_json::json!(2)),
+        ("manifest_version", serde_json::json!(0)),
+    ] {
+        let mut bad = reg.clone();
+        bad[field] = value.clone();
+        let e = implode_value(&exploded, &bad).unwrap_err();
+        assert!(
+            e.to_string().contains("unsupported manifest"),
+            "{field}={value}: {e}"
+        );
+    }
+    let mut missing = reg.clone();
+    missing.as_object_mut().unwrap().remove("manifest_version");
+    assert!(implode_value(&exploded, &missing).is_err());
+}
+
+#[test]
+fn implode_rejects_unknown_fields() {
+    let blob = minimal_container();
+    let exploded = explode(&blob).unwrap();
+    let reg: serde_json::Value = serde_json::from_str(&exploded.registry_json).unwrap();
+
+    let mut cases = Vec::new();
+    let mut top = reg.clone();
+    top["layout"] = serde_json::json!("compact");
+    cases.push(top);
+    let mut flags = reg.clone();
+    flags["container_flags"]["layout"] = serde_json::json!("compact");
+    cases.push(flags);
+    let mut registry = reg.clone();
+    registry["registry"]["extension_table"] = serde_json::json!([]);
+    cases.push(registry);
+    let mut chain = reg.clone();
+    chain["registry"]["chains"][0]["extra"] = serde_json::json!(1);
+    cases.push(chain);
+    for bad in cases {
+        let e = implode_value(&exploded, &bad).unwrap_err();
+        assert!(e.to_string().contains("unknown field"), "{e}");
+    }
+
+    // Unknown fields in a tensor manifest are rejected too.
+    let mut tm: serde_json::Value =
+        serde_json::from_str(&exploded.tensors[0].manifest_json).unwrap();
+    tm["planes"][0]["extra"] = serde_json::json!(true);
+    let e = implode(
+        &exploded.registry_json,
+        &[tm.to_string()],
+        members_map(&exploded),
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("unknown field"), "{e}");
+}
+
+/// When no table layout reproduces the recorded hash, implode errors
+/// instead of writing a container with another table.
+#[test]
+fn implode_rejects_unreproducible_table_hash() {
+    let blob = minimal_container();
+    let exploded = explode(&blob).unwrap();
+    let mut reg: serde_json::Value = serde_json::from_str(&exploded.registry_json).unwrap();
+    reg["registry_hash_blake3"] = serde_json::json!("00".repeat(32));
+    let e = implode_value(&exploded, &reg).unwrap_err();
+    assert!(e.to_string().contains("no Extension Table layout"), "{e}");
+
+    // The wrong built-in version does not reproduce the hash either.
+    let mut reg: serde_json::Value = serde_json::from_str(&exploded.registry_json).unwrap();
+    reg["container_flags"]["builtin_version"] = serde_json::json!("0.9.0");
+    let e = implode_value(&exploded, &reg).unwrap_err();
+    assert!(e.to_string().contains("no Extension Table layout"), "{e}");
+}
+
+#[test]
+fn implode_writes_raw_extension_table() {
+    let blob = minimal_container();
+    let exploded = explode(&blob).unwrap();
+    let reader = ContainerReader::open(&blob).unwrap();
+    let et = extension_table_bytes(&reader, &blob).unwrap();
+
+    // A raw table equal to the on-disk one reproduces the container.
+    let mut reg: serde_json::Value = serde_json::from_str(&exploded.registry_json).unwrap();
+    reg["registry"]["extension_table_b64"] = serde_json::json!(base64::encode(et));
+    assert_eq!(implode_value(&exploded, &reg).unwrap(), blob);
+
+    // Raw bytes that do not match the recorded hash are rejected.
+    let mut other = et.to_vec();
+    other.push(0);
+    reg["registry"]["extension_table_b64"] = serde_json::json!(base64::encode(&other));
+    let e = implode_value(&exploded, &reg).unwrap_err();
+    assert!(e.to_string().contains("does not match"), "{e}");
+
+    // So are bytes that match a forged hash but do not parse cleanly.
+    reg["registry_hash_blake3"] = serde_json::json!(hex::encode(ExtensionTable::hash(&other)));
+    let e = implode_value(&exploded, &reg).unwrap_err();
+    assert!(e.to_string().contains("trailing bytes"), "{e}");
+}
+
+/// A container written with the built-ins of another release explodes with
+/// that version and implodes to the same bytes.
+#[test]
+fn round_trip_other_builtin_version() {
+    let registry = ChainRegistry {
+        chains: vec![(0u16, passthrough_chain())],
+    };
+    let rec = |name: &str, inline: bool| TensorRecord {
+        chain_ref: if inline { CHAIN_REF_INLINE_BIT } else { 0 },
+        dtype_code: 6,
+        input_format: 2,
+        flags: 0,
+        orig_size: 8,
+        name: name.to_string(),
+        payload_hash: None,
+        inline_chain: inline.then(passthrough_chain),
+        dependencies: Vec::new(),
+        tensor_metadata: None,
+        terminals: vec![flat_plane(PlaneRole::Value, CodecId::Identity, vec![9; 8])],
+    };
+    let mut cursor = Cursor::new(Vec::<u8>::new());
+    {
+        let mut writer = ContainerWriter::new(&mut cursor).unwrap();
+        writer.set_builtin_version("0.9.0").unwrap();
+        writer.set_chain_registry(registry).unwrap();
+        let idx = writer
+            .codec_table_idx_for(&crate::compressor::codec_canonical_id(CodecId::Identity))
+            .unwrap();
+        for (name, inline) in [("a", false), ("b", true)] {
+            let mut r = rec(name, inline);
+            r.terminals[0].codec_table_idx = idx;
+            writer.append_tensor(&r).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+    let blob = cursor.into_inner();
+    assert!(
+        blob.windows(b"@0.9.0".len()).any(|w| w == b"@0.9.0"),
+        "labels carry the requested version"
+    );
+    let reader = ContainerReader::open(&blob).unwrap();
+    assert_eq!(reader.builtin_version.as_deref(), Some("0.9.0"));
+    assert_eq!(reader.decode_tensor("b").unwrap(), vec![9; 8]);
+
+    let exploded = explode(&blob).unwrap();
+    let reg: serde_json::Value = serde_json::from_str(&exploded.registry_json).unwrap();
+    assert_eq!(reg["container_flags"]["builtin_version"], "0.9.0");
+    assert!(reg["registry"].get("extension_table_b64").is_none());
+    assert_round_trip(&blob);
+}

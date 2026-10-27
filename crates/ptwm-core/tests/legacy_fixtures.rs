@@ -14,9 +14,10 @@
 //!
 //! The tests check that every fixture decodes to the expected bytes and that
 //! `implode(explode(x)) == x`. The expected bytes are stored as
-//! `(length, xxh64)` pairs in [`EXPECTED`]. Fixtures with built-in ids of
-//! another version are checked after [`rederive_builtins`] maps the ids to
-//! the crate version, until the reader accepts older built-in ids.
+//! `(length, xxh64)` pairs in [`EXPECTED`]. The reader maps built-in ids
+//! of other releases to the crate version
+//! (`ptwm_core::extension::normalize_builtin_ids`), so fixtures with
+//! v1.0.0 ids decode and transcode as they are.
 //!
 //! # Regenerating
 //!
@@ -821,13 +822,11 @@ fn v1_1_0_fixture_has_expected_features() {
 }
 
 #[test]
-#[ignore = "cross-version builtins: fixed in stage 3"]
 fn v1_0_0_fixture_decodes() {
     assert_decodes(V1_0_0);
 }
 
 #[test]
-#[ignore = "cross-version builtins: fixed in stage 3"]
 fn v1_0_0_fixture_transcode_round_trip() {
     assert_transcode_round_trip(V1_0_0);
 }
@@ -905,13 +904,11 @@ fn p4_v1_1_0_layout_writer_output_is_golden() {
 }
 
 #[test]
-#[ignore = "cross-version builtins: fixed in stage 3"]
 fn v1_0_0_native_fixture_decodes() {
     assert_decodes(V1_0_0_NATIVE);
 }
 
 #[test]
-#[ignore = "cross-version builtins: fixed in stage 3"]
 fn v1_0_0_native_fixture_transcode_round_trip() {
     assert_transcode_round_trip(V1_0_0_NATIVE);
 }
@@ -1078,4 +1075,268 @@ fn regenerate_fixtures() {
     for (name, bytes) in files {
         println!("{name}: {} B", bytes.len());
     }
+}
+
+// ── Cross-version built-ins ──────────────────────────────────────────────────
+
+fn explode_implode(blob: &[u8]) -> (String, Vec<u8>) {
+    let exploded = explode(blob).expect("explode");
+    let members: HashMap<String, &[u8]> = exploded
+        .members
+        .iter()
+        .map(|(k, v)| (k.clone(), v.as_slice()))
+        .collect();
+    let tensor_jsons: Vec<String> = exploded
+        .tensors
+        .iter()
+        .map(|t| t.manifest_json.clone())
+        .collect();
+    let rebuilt = implode(&exploded.registry_json, &tensor_jsons, members).expect("implode");
+    (exploded.registry_json, rebuilt)
+}
+
+/// Offset of the Extension Table entry whose label is `label`, as
+/// `(id_start, label_start)`.
+fn find_label(blob: &[u8], label: &str) -> (usize, usize) {
+    let label_start = find(blob, label.as_bytes()).unwrap_or_else(|| panic!("no {label}"));
+    (label_start - 34, label_start)
+}
+
+/// Recompute the header's Extension Table hash after an in-place edit.
+fn fix_table_hash(blob: &mut [u8]) {
+    let u64_at = |b: &[u8], off: usize| u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+    let et_off = u64_at(blob, 11) as usize;
+    let et_len = u64_at(blob, 19) as usize;
+    let hash = blake3::hash(&blob[et_off..et_off + et_len]);
+    blob[27..59].copy_from_slice(hash.as_bytes());
+}
+
+#[test]
+fn v1_0_0_fixture_reader_reports_builtin_version() {
+    for fixture in [V1_0_0, V1_0_0_NATIVE] {
+        let blob = load(fixture);
+        let reader = ContainerReader::open(&blob).unwrap();
+        assert_eq!(
+            reader.builtin_version.as_deref(),
+            Some("1.0.0"),
+            "{fixture}"
+        );
+        // The in-memory table holds current built-in ids.
+        assert!(
+            reader
+                .extension_table
+                .entries
+                .iter()
+                .all(|e| ptwm_core::extension::is_builtin(&e.canonical_id)),
+            "{fixture}"
+        );
+    }
+    let blob = load(V1_1_0);
+    let reader = ContainerReader::open(&blob).unwrap();
+    assert_eq!(reader.builtin_version.as_deref(), Some("1.1.0"));
+}
+
+#[test]
+fn v1_0_0_fixture_manifest_records_builtin_version() {
+    let blob = load(V1_0_0);
+    let (registry_json, rebuilt) = explode_implode(&blob);
+    assert!(rebuilt == blob);
+    let reg: serde_json::Value = serde_json::from_str(&registry_json).unwrap();
+    let want = if env!("CARGO_PKG_VERSION") == "1.0.0" {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String("1.0.0".into())
+    };
+    assert_eq!(reg["container_flags"]["builtin_version"], want);
+    // The table is rebuilt from the chains, so its bytes are not carried.
+    assert!(reg["registry"].get("extension_table_b64").is_none());
+
+    // A crate-version file carries neither field.
+    let (registry_json, _) = explode_implode(&main_container());
+    let reg: serde_json::Value = serde_json::from_str(&registry_json).unwrap();
+    assert!(reg["container_flags"].get("builtin_version").is_none());
+    assert!(reg["registry"].get("extension_table_b64").is_none());
+}
+
+/// The exploded stores implode one tensor at a time with the archive-wide
+/// registry; that must work for files of other releases too.
+#[test]
+fn v1_0_0_fixture_single_tensor_implode_decodes() {
+    let blob = load(V1_0_0);
+    let exploded = explode(&blob).unwrap();
+    let members: HashMap<String, &[u8]> = exploded
+        .members
+        .iter()
+        .map(|(k, v)| (k.clone(), v.as_slice()))
+        .collect();
+    let want: HashMap<&str, (usize, u64)> = expected(V1_0_0)
+        .iter()
+        .map(|(n, l, h)| (*n, (*l, *h)))
+        .collect();
+    for t in &exploded.tensors {
+        let one = implode(
+            &exploded.registry_json,
+            std::slice::from_ref(&t.manifest_json),
+            members.clone(),
+        )
+        .unwrap_or_else(|e| panic!("implode {}: {e}", t.name));
+        let reader = ContainerReader::open(&one).unwrap();
+        assert_eq!(reader.builtin_version.as_deref(), Some("1.0.0"));
+        let got = reader.decode_tensor(&t.name).unwrap();
+        assert_eq!(
+            (got.len(), xxh64(&got, 0)),
+            want[t.name.as_str()],
+            "{}",
+            t.name
+        );
+    }
+}
+
+/// A table that mixes built-in versions is not rebuilt by any table
+/// builder; its bytes travel in the manifest and implode stays byte-exact.
+#[test]
+fn mixed_version_table_round_trips_through_raw_bytes() {
+    let mut blob = load(V1_1_0);
+    // Move the file-level `identity` codec entry (and only it) to 1.0.0.
+    let (id_start, label_start) = find_label(&blob, "io.ptwm.builtin.identity@1.1.0");
+    let et_end = {
+        let u64_at = |off: usize| u64::from_le_bytes(blob[off..off + 8].try_into().unwrap());
+        (u64_at(11) + u64_at(19)) as usize
+    };
+    assert!(label_start < et_end, "entry is in the file-level table");
+    let new = CanonicalId::derive(&BUILTIN_PUBKEY, "identity", "1.0.0");
+    blob[id_start..id_start + 32].copy_from_slice(new.as_bytes());
+    let ver = label_start + "io.ptwm.builtin.identity@".len();
+    blob[ver..ver + 5].copy_from_slice(b"1.0.0");
+    fix_table_hash(&mut blob);
+
+    assert_blob_decodes("mixed", &blob, expected(V1_1_0));
+    let (registry_json, rebuilt) = explode_implode(&blob);
+    let reg: serde_json::Value = serde_json::from_str(&registry_json).unwrap();
+    assert!(reg["registry"]["extension_table_b64"].is_string());
+    assert!(rebuilt == blob, "implode(explode(x)) != x");
+}
+
+/// An entry with a built-in label whose id does not re-derive from that
+/// label is not a built-in: the reader treats it as a missing third-party
+/// contribution.
+#[test]
+fn forged_builtin_label_stays_non_builtin() {
+    let mut blob = load(V1_0_0);
+    let (id_start, _) = find_label(&blob, "io.ptwm.builtin.huffman@1.0.0");
+    blob[id_start..id_start + 32].copy_from_slice(&[0x5A; 32]);
+    fix_table_hash(&mut blob);
+
+    match ContainerReader::open(&blob) {
+        Err(ptwm_core::error::PtwmCoreError::MissingFlavor { needs }) => {
+            assert_eq!(needs.len(), 1);
+            assert_eq!(needs[0].id, CanonicalId::from_bytes([0x5A; 32]));
+        }
+        other => panic!("expected MissingFlavor, got {other:?}"),
+    }
+    let reader = ContainerReader::open_partial(&blob).unwrap();
+    assert_eq!(reader.missing_extensions.len(), 1);
+    assert!(
+        !reader.extension_table.entries.iter().any(|e| e.canonical_id
+            == CanonicalId::derive(&BUILTIN_PUBKEY, "huffman", env!("CARGO_PKG_VERSION"))),
+        "the forged entry is not mapped to the current huffman id"
+    );
+}
+
+/// Rewrite every built-in label (and id) at or after `from` to `to`.
+fn rederive_labels_after(blob: &mut [u8], from: usize, to: &str) -> usize {
+    let prefix = b"io.ptwm.builtin.";
+    let mut p = from;
+    let mut n = 0;
+    while let Some(pos) = find(&blob[p..], prefix) {
+        let label_start = p + pos;
+        let label_len = u16::from_le_bytes([blob[label_start - 2], blob[label_start - 1]]) as usize;
+        let label = std::str::from_utf8(&blob[label_start..label_start + label_len])
+            .unwrap()
+            .to_string();
+        let (name, ver) = label[prefix.len()..].split_once('@').unwrap();
+        assert_eq!(ver.len(), to.len());
+        let id = CanonicalId::derive(&BUILTIN_PUBKEY, name, to);
+        blob[label_start - 34..label_start - 2].copy_from_slice(id.as_bytes());
+        blob[label_start + label_len - to.len()..label_start + label_len]
+            .copy_from_slice(to.as_bytes());
+        p = label_start + label_len;
+        n += 1;
+    }
+    n
+}
+
+fn table_end(blob: &[u8]) -> usize {
+    let u64_at = |off: usize| u64::from_le_bytes(blob[off..off + 8].try_into().unwrap());
+    (u64_at(11) + u64_at(19)) as usize
+}
+
+/// An inline chain whose table version differs from the file-level table:
+/// the inline version is used for implode and the file-level table travels
+/// as raw bytes.
+#[test]
+fn inline_chain_of_another_version_round_trips() {
+    let mut blob = load(V1_1_0);
+    let end = table_end(&blob);
+    assert!(
+        rederive_labels_after(&mut blob, end, "1.0.0") > 0,
+        "fixture has an inline chain"
+    );
+    assert_blob_decodes("inline-1.0.0", &blob, expected(V1_1_0));
+    let (registry_json, rebuilt) = explode_implode(&blob);
+    let reg: serde_json::Value = serde_json::from_str(&registry_json).unwrap();
+    assert_eq!(reg["container_flags"]["builtin_version"], "1.0.0");
+    assert!(reg["registry"]["extension_table_b64"].is_string());
+    assert!(rebuilt == blob, "implode(explode(x)) != x");
+}
+
+/// Inline chains of two different built-in versions cannot be rebuilt with
+/// one version, so explode refuses the container instead of producing
+/// different bytes.
+#[test]
+fn explode_rejects_inline_chains_of_two_versions() {
+    let blob = load(V1_1_0);
+    let reader = ContainerReader::open(&blob).unwrap();
+    let mut records = records_in_file_order(&reader);
+    // Store a second registry chain inline, on the last record.
+    let last = records.last_mut().unwrap();
+    assert!(last.inline_chain.is_none());
+    last.inline_chain = Some(
+        reader
+            .chain_registry
+            .lookup(last.chain_ref)
+            .unwrap()
+            .clone(),
+    );
+    last.chain_ref = CHAIN_REF_INLINE_BIT;
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut w = ContainerWriter::new(&mut cursor).unwrap();
+        w.set_prelude(&reader.prelude).unwrap();
+        w.set_chain_registry(reader.chain_registry.clone()).unwrap();
+        for r in &records {
+            w.append_tensor(r).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+    let mut blob = cursor.into_inner();
+    // The last record's inline table is the last run of built-in labels.
+    let last_off = ContainerReader::open(&blob)
+        .unwrap()
+        .index
+        .iter()
+        .map(|e| e.tensor_offset)
+        .max()
+        .unwrap() as usize;
+    let from = env!("CARGO_PKG_VERSION");
+    let to = if from == "1.0.0" { "1.0.1" } else { "1.0.0" };
+    if to.len() != from.len() {
+        return; // `rederive_labels_after` needs equal-length versions.
+    }
+    assert!(rederive_labels_after(&mut blob, last_off, to) > 0);
+    let e = explode(&blob).err().expect("explode must fail");
+    assert!(
+        e.to_string().contains("inline chain built-in version"),
+        "{e}"
+    );
 }

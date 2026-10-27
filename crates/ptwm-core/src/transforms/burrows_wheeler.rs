@@ -83,9 +83,17 @@ impl Op for BurrowsWheeler {
         }
         let d = &inputs[0];
         require_byte_plane(d, "propagate_descriptors")?;
-        let n = d.length_bytes as usize;
+        // Checked: a corrupt chain can declare a length near `u64::MAX`.
+        let n = d.length_bytes;
+        let headers = n
+            .div_ceil(BWT_BLOCK_SIZE as u64)
+            .checked_mul(HEADER_BYTES as u64);
         let mut out = d.clone();
-        out.length_bytes = (n + HEADER_BYTES * block_count(n)) as u64;
+        out.length_bytes = headers.and_then(|h| n.checked_add(h)).ok_or_else(|| {
+            PtwmCoreError::InvalidContainer(format!(
+                "BurrowsWheeler.propagate_descriptors: output length overflows for {n} input bytes"
+            ))
+        })?;
         Ok(vec![out])
     }
 
@@ -498,5 +506,22 @@ mod tests {
             .propagate_descriptors(&[plane(vec![0u8; 100]).descriptor])
             .unwrap();
         assert_eq!(d1[0].length_bytes, 100 + HEADER_BYTES as u64);
+    }
+
+    #[test]
+    fn descriptor_length_overflow_is_an_error() {
+        // A corrupt chain can declare a length near u64::MAX; the header
+        // bytes must not overflow (a panic under overflow checks).
+        let d = PlaneDescriptor {
+            role: Role::Raw,
+            element_width: ElementWidth::Byte,
+            length_bytes: u64::MAX,
+            layout: Layout::Flat,
+            derives_from_tensor: None,
+            residual_of: None,
+            is_nibble_packed: false,
+            vendor_bytes: vec![],
+        };
+        assert!(BurrowsWheeler::new().propagate_descriptors(&[d]).is_err());
     }
 }

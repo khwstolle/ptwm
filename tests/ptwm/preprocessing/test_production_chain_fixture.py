@@ -61,7 +61,10 @@ def _builders() -> list[tuple[str, _chains.ChainBuilder]]:
             if id(b) not in seen:
                 seen.add(id(b))
                 named.append((f"production[{dtype_code},{role.name}][{i}]", b))
-    opts = ExploreOptions(max_candidates_per_dtype=8, time_budget_ms=2000)
+    # The candidate cap bounds the work. The time budget is effectively
+    # unlimited so that a slow machine still returns all 8 candidates and the
+    # bytes stay equal to the checked-in fixture.
+    opts = ExploreOptions(max_candidates_per_dtype=8, time_budget_ms=10**9)
     for dtype_code in (1, 4, 6, 13, 29, 30, 31):
         for i, b in enumerate(
             explore_chains(dtype_code, ClassifierRole.STANDARD, opts)

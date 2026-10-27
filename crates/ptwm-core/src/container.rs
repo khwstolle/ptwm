@@ -1244,6 +1244,25 @@ impl<'a> ContainerReader<'a> {
             })?
         };
 
+        // Bound the chain by the record's `orig_size` before any plane is
+        // sized from it, and before `validate_chain`, which calls every op's
+        // `propagate_descriptors` on lengths derived from the Source. The
+        // Source may overstate the raw size by up to 8×: the Python
+        // byte-input path wrote such chains before the P4 fix, and those
+        // files must keep decoding. A Source declaring more is corrupt;
+        // rejecting it here keeps codecs from pre-allocating gigabytes for a
+        // small tensor. `chain_source_descriptor` checks node 0 itself and
+        // needs no prior validation.
+        let source_desc = chain_source_descriptor(chain)?;
+        let max_source = rec.orig_size.saturating_mul(8);
+        if source_desc.length_bytes > max_source {
+            return Err(PtwmCoreError::InvalidContainer(format!(
+                "decode_tensor: chain Source declares {} bytes for a {}-byte tensor \
+                 (at most {max_source} accepted)",
+                source_desc.length_bytes, rec.orig_size
+            )));
+        }
+
         // Validate the chain structurally before handing it to the runtime.
         // A malformed wire-derived chain (out-of-range edge nodes, missing
         // Source, cycles, …) would otherwise reach `topo_sort` /
@@ -1255,22 +1274,6 @@ impl<'a> ContainerReader<'a> {
             ))
         })?;
         validate_chain(chain, n_dependencies)?;
-
-        // Bound the chain by the record's `orig_size` before any plane is
-        // sized from it. The Source may overstate the raw size by up to 8×:
-        // the Python byte-input path wrote such chains before the P4 fix,
-        // and those files must keep decoding. A Source declaring more is
-        // corrupt; rejecting it here keeps codecs from pre-allocating
-        // gigabytes for a small tensor.
-        let source_desc = chain_source_descriptor(chain)?;
-        let max_source = rec.orig_size.saturating_mul(8);
-        if source_desc.length_bytes > max_source {
-            return Err(PtwmCoreError::InvalidContainer(format!(
-                "decode_tensor: chain Source declares {} bytes for a {}-byte tensor \
-                 (at most {max_source} accepted)",
-                source_desc.length_bytes, rec.orig_size
-            )));
-        }
         let plane_bound = max_plane_len(rec.orig_size);
 
         // Discover the descriptor of every terminal by walking the chain's
@@ -3170,11 +3173,25 @@ label = "test-author"
         chunk_size: Option<u32>,
         edit: impl FnOnce(&mut TensorRecord),
     ) -> Vec<u8> {
+        identity_container_with_chain(
+            raw,
+            v3_passthrough_chain(raw.len() as u32),
+            chunk_size,
+            edit,
+        )
+    }
+
+    /// [`identity_container_with`] for a given single-terminal chain.
+    fn identity_container_with_chain(
+        raw: &[u8],
+        chain: Chain,
+        chunk_size: Option<u32>,
+        edit: impl FnOnce(&mut TensorRecord),
+    ) -> Vec<u8> {
         use crate::compressor::{CompressorOptions, InputTensor, compress_model};
         use crate::tensor_record::{CHAIN_REF_INLINE_BIT, parse_tensor_record};
         use std::io::Cursor;
 
-        let chain = v3_passthrough_chain(raw.len() as u32);
         let inputs = vec![InputTensor {
             name: "t".into(),
             candidate_chains: vec![chain.clone()],
@@ -3257,6 +3274,29 @@ label = "test-author"
             assert!(err.contains("Source declares"), "{err}");
             assert!(t0.elapsed() < std::time::Duration::from_secs(1));
         }
+    }
+
+    #[test]
+    fn huge_source_is_rejected_before_op_descriptor_arithmetic() {
+        // Source [u32::MAX, u32::MAX] int8 (about 2^64 bytes) feeding
+        // BurrowsWheeler, whose output length adds a block header per
+        // 256 KiB. The Source bound must reject the chain before
+        // `validate_chain` walks the op descriptors; before the fix, a build
+        // with overflow checks (debug, cargo-fuzz) panicked inside
+        // `BurrowsWheeler::propagate_descriptors`.
+        use crate::transforms::op::OpId;
+        let raw: Vec<u8> = (0..64u8).collect();
+        let mut chain = v3_passthrough_chain(raw.len() as u32);
+        chain.nodes[1].op = OpId::BurrowsWheeler;
+        let buf = identity_container_with_chain(&raw, chain, None, |rec| {
+            set_source_shape(rec, &[u32::MAX, u32::MAX], 0x0005)
+        });
+        let err = ContainerReader::open(&buf)
+            .unwrap()
+            .decode_tensor("t")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Source declares"), "{err}");
     }
 
     #[test]

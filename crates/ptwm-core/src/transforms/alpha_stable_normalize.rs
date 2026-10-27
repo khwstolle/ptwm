@@ -248,19 +248,28 @@ impl Op for AlphaStableNormalize {
             ));
         }
         let rows = d.length_bytes / (row_len * w);
+        // Checked: a corrupt chain can declare a length near `u64::MAX`.
+        let overflow = || {
+            PtwmCoreError::InvalidContainer(format!(
+                "AlphaStableNormalize: output length overflows for {} input bytes",
+                d.length_bytes
+            ))
+        };
+        let scale_len = rows
+            .checked_mul(SCALE_BYTES_PER_ROW as u64)
+            .ok_or_else(overflow)?;
+        let normalized_len = rows
+            .checked_mul(row_len)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(overflow)?;
         Ok(vec![
             // scale: (γ, δ) f32 pair per row = SCALE_BYTES_PER_ROW bytes/row
-            Self::raw_descriptor(
-                Role::Raw,
-                ElementWidth::Word4,
-                rows * SCALE_BYTES_PER_ROW as u64,
-                Layout::Flat,
-            ),
+            Self::raw_descriptor(Role::Raw, ElementWidth::Word4, scale_len, Layout::Flat),
             // normalized: bf16 per element
             Self::raw_descriptor(
                 Role::Raw,
                 ElementWidth::Word2,
-                rows * row_len * 2,
+                normalized_len,
                 Layout::Rows {
                     row_len: row_len as u32,
                 },
@@ -550,5 +559,22 @@ mod tests {
         let mut inp = input_plane(1, 8, 0, &[1.0; 8]);
         inp.descriptor.layout = Layout::Flat;
         assert!(op.forward(&[inp]).is_err());
+    }
+
+    #[test]
+    fn propagate_descriptors_overflow_is_an_error() {
+        // 16-bit rows of one element: the scale plane is four times the input.
+        let op = AlphaStableNormalize::new(0, 2).unwrap();
+        let d = PlaneDescriptor {
+            role: Role::Raw,
+            element_width: ElementWidth::Word2,
+            length_bytes: u64::MAX - 1,
+            layout: Layout::Rows { row_len: 1 },
+            derives_from_tensor: None,
+            residual_of: None,
+            is_nibble_packed: false,
+            vendor_bytes: vec![],
+        };
+        assert!(op.propagate_descriptors(&[d]).is_err());
     }
 }

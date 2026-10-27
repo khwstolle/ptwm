@@ -118,6 +118,8 @@ _CHAIN_STORAGE_BYTES: dict[int, int] = {
 }
 
 _MAX_SOURCE_DIM = 0xFFFF_FFFF
+# Largest number of row counts _byte_passthrough_shape tries.
+_PASSTHROUGH_ROW_SEARCH = 1 << 16
 
 
 def chain_storage_bytes(internal_dtype: int) -> int:
@@ -1033,6 +1035,29 @@ def source_shape_for(
     return out
 
 
+def _byte_passthrough_shape(nbytes: int) -> list[int]:
+    """Source shape, in bytes, for a passthrough over ``nbytes`` raw bytes.
+
+    ``[nbytes]`` when it fits in ``u32``; otherwise ``[rows, cols]`` with
+    ``rows * cols == nbytes`` and both dimensions in ``u32``, using the
+    smallest such ``rows``. The search tries at most
+    ``_PASSTHROUGH_ROW_SEARCH`` values of ``rows``; real tensor byte counts
+    have small factors. Raises :class:`ValueError` when no split is found
+    (for example ``nbytes`` is a prime above ``u32``).
+    """
+    if nbytes <= _MAX_SOURCE_DIM:
+        return [nbytes]
+    first = -(-nbytes // _MAX_SOURCE_DIM)
+    for rows in range(first, min(first + _PASSTHROUGH_ROW_SEARCH, _MAX_SOURCE_DIM + 1)):
+        if nbytes % rows == 0:
+            return [rows, nbytes // rows]
+    msg = (
+        f"cannot express {nbytes} bytes as a chain Source shape: no split into "
+        "two dimensions of at most 2**32 - 1"
+    )
+    raise ValueError(msg)
+
+
 def build_chain_blobs(
     builders: Sequence[ChainBuilder],
     *,
@@ -1050,9 +1075,19 @@ def build_chain_blobs(
     for example 4094 bytes for an fp32 chain.
 
     When no builder remains, the result is the byte passthrough chain over
-    all ``nbytes``, which fits any buffer.
+    all ``nbytes``. Its Source is 1-D when ``nbytes`` fits in one ``u32``
+    dimension and 2-D otherwise; a byte count with no such 2-D split
+    raises :class:`ValueError`.
+
+    Each builder is first called once with a probe shape to learn its Source
+    dtype. The probe clamps every dimension to ``u32`` so that it can always
+    be serialised: for byte input of 4 GiB or more, ``[nbytes]`` does not
+    fit, while the real Source shape of a multi-byte dtype often does.
     """
-    probe_shape = list(shape) if shape is not None else [nbytes]
+    if shape is None:
+        probe_shape = [min(nbytes, _MAX_SOURCE_DIM)]
+    else:
+        probe_shape = [min(int(d), _MAX_SOURCE_DIM) for d in shape]
     blobs: list[bytes] = []
     for builder in builders:
         chain = builder(probe_shape)
@@ -1070,7 +1105,7 @@ def build_chain_blobs(
     if not blobs:
         src_shape = source_shape_for(shape, nbytes, 1)
         if src_shape is None:
-            src_shape = [nbytes]
+            src_shape = _byte_passthrough_shape(nbytes)
         chain = CHAIN_BYTE_PASSTHROUGH_VALUE(src_shape)
         if chain is None:  # pragma: no cover - the passthrough never declines
             msg = "byte passthrough chain declined its shape"
@@ -1101,11 +1136,18 @@ PRODUCTION_CHAINS: dict[tuple[int, ClassifierRole], list[ChainBuilder]] = {
     # PredictorXor variants compete with the plain split chain via
     # trial-encode; the dispatcher only commits to a variant when it
     # beats the baseline on byte count.
+    #
+    # CHAIN_BF16_MICROSCALE_REPACK is not a candidate. Until the encoder
+    # took the element width from the chain's Source, the chain failed on
+    # every bf16 tensor (the public bf16 code mapped to byte elements and
+    # BlockMicroscalingRepack needs 16-bit ones), so files never used it.
+    # Now that it works it often wins trial-encode, which would change the
+    # legacy writer's output; that output stays byte-identical. Callers can
+    # still pass the builder explicitly.
     (_DT.BFLOAT16.code, ClassifierRole.STANDARD): [
         CHAIN_BF16_SPLIT,
         CHAIN_BF16_SPLIT_INTDELTA,
         CHAIN_BF16_SPLIT_PREDICTOR_XOR,
-        CHAIN_BF16_MICROSCALE_REPACK,
         CHAIN_BF16_SPLIT_MZS_K1,
         CHAIN_BF16_SPLIT_MZS_K2,
         CHAIN_BF16_SPLIT_MZS_K3,

@@ -104,7 +104,7 @@ def test_incompressible_input_is_stored_with_small_overhead() -> None:
 
 @pytest.mark.parametrize("framing", [Framing.COMPACT, Framing.CONTAINER])
 def test_integrity_fields_can_be_disabled(framing: Framing) -> None:
-    t = torch.randn(512).to(torch.bfloat16)
+    t = torch.randn(512, generator=torch.Generator().manual_seed(0)).to(torch.bfloat16)
     full = Compressor(_torch_cfg(framing=framing)).compress(t)
     bare = Compressor(
         _torch_cfg(framing=framing, emit_payload_hash=False, emit_plane_crc=False)

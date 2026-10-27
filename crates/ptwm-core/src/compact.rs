@@ -379,10 +379,10 @@ fn decode_body(
     }
     let (chain, consumed) = read_chain(r.rest(), &table)?;
     r.pos += consumed;
-    validate_chain(&chain, 0)?;
     // Writers check that the chain's Source declares exactly the raw byte
     // count, so a frame whose Source disagrees with `orig_size` is corrupt.
-    // Checking before the descriptor walk keeps a corrupt chain from sizing
+    // Checking before `validate_chain` and the descriptor walk (both call
+    // every op's `propagate_descriptors`) keeps a corrupt chain from sizing
     // planes (and codec allocations) beyond the tensor.
     let source = chain_source_descriptor(&chain)?;
     if source.length_bytes != orig_size {
@@ -391,6 +391,7 @@ fn decode_body(
             source.length_bytes
         )));
     }
+    validate_chain(&chain, 0)?;
     let descriptors = propagate_terminal_descriptors_bounded(&chain, max_plane_len(orig_size))?;
 
     let mut terminal_planes: Vec<Plane> = Vec::with_capacity(descriptors.len());
@@ -727,6 +728,39 @@ mod tests {
         let err = decode_compact(&b).unwrap_err().to_string();
         assert!(err.contains("Source declares"), "{err}");
         assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn huge_source_is_rejected_before_op_descriptor_arithmetic() {
+        // Source [2, 1500] int8 → BurrowsWheeler, then the dims are patched
+        // in place to [u32::MAX, u32::MAX] (about 2^64 bytes). The Source
+        // check must run before `validate_chain`, which calls
+        // `BurrowsWheeler::propagate_descriptors`; before the fix, a build
+        // with overflow checks panicked there.
+        let raw: Vec<u8> = (0..3000u32).map(|i| (i % 5) as u8).collect();
+        let mut chain = passthrough_chain(raw.len() as u32);
+        chain.nodes[0].params = [&[2u8][..], &2u32.to_le_bytes(), &1500u32.to_le_bytes()]
+            .concat()
+            .into_iter()
+            .chain(17u16.to_le_bytes())
+            .collect();
+        chain.nodes[1].op = OpId::BurrowsWheeler;
+        let mut inp = input(&raw, None, None);
+        inp.candidate_chains = vec![chain];
+        let blob = compress_compact(&inp, &opts(false, false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(blob[FLAGS_AT] & FLAG_STORED, 0);
+        assert_eq!(decode_compact(&blob).unwrap().raw, raw);
+        let needle: Vec<u8> = [&[2u8][..], &2u32.to_le_bytes(), &1500u32.to_le_bytes()].concat();
+        let at = blob
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
+            .unwrap();
+        let mut b = blob.clone();
+        b[at + 1..at + 9].copy_from_slice(&[0xFF; 8]);
+        let err = decode_compact(&b).unwrap_err().to_string();
+        assert!(err.contains("Source declares"), "{err}");
     }
 
     #[test]

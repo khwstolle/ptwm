@@ -193,7 +193,6 @@ class TestChainsFor:
             CHAIN_BF16_SPLIT,
             CHAIN_BF16_SPLIT_INTDELTA,
             CHAIN_BF16_SPLIT_PREDICTOR_XOR,
-            CHAIN_BF16_MICROSCALE_REPACK,
             CHAIN_BF16_SPLIT_MZS_K1,
             CHAIN_BF16_SPLIT_MZS_K2,
             CHAIN_BF16_SPLIT_MZS_K3,

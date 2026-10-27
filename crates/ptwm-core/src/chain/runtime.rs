@@ -297,12 +297,23 @@ pub fn chain_source_descriptor(chain: &Chain) -> Result<PlaneDescriptor, PtwmCor
 /// Largest plane, at any node of a chain, that a decoder accepts for a
 /// tensor of `orig_size` raw bytes.
 ///
-/// The factor 16 covers a Source that overstates the raw size by up to 8×
-/// (files written by the Python byte-input path before the P4 fix) followed
-/// by ops that at most double a plane (MxFp4 values, spherical and
-/// alpha-stable radius planes for 16-bit rows). The constant covers block
-/// padding such as the BurrowsWheeler index (4 bytes per 256 KiB block).
-/// Decoders use this one helper so the bound cannot drift between layouts.
+/// The factor 16 is the product of two cases that existing files can
+/// combine:
+///
+/// - A Source that overstates the raw size by up to 8×. Only files written
+///   by the Python byte-input path before the P4 fix do this, and their
+///   chains are 1-D byte passthroughs or byte splits, whose planes are no
+///   larger than the Source.
+/// - Ops that expand a plane. MxFp4 deinterleave at most doubles it. The
+///   spherical and alpha-stable scale planes can reach 4× their input (one
+///   8-byte scale per row of a single 16-bit element), but their builders
+///   accept only 2-D shapes, which the Python path always sizes exactly.
+///
+/// So no chain a writer emits multiplies the two, and 16× leaves 2× of
+/// headroom over the largest case (8× overstated Source, or a 4× scale
+/// plane). The constant 4096 covers block padding such as the
+/// BurrowsWheeler index (4 bytes per 256 KiB block). Decoders use this one
+/// helper so the bound cannot drift between layouts.
 pub fn max_plane_len(orig_size: u64) -> u64 {
     orig_size.saturating_mul(16).saturating_add(4096)
 }

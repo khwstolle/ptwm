@@ -163,3 +163,16 @@ def test_decode_compact_reports_metadata() -> None:
     assert input_format == Format.TORCH.value
     assert delta is None
     assert 0 < payload_len < len(blob)
+
+
+@pytest.mark.parametrize("framing", [Framing.COMPACT, Framing.CONTAINER])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("shape", [(5, 0), (0, 5)])
+def test_empty_matrix_round_trips(framing: Framing, dtype: torch.dtype, shape) -> None:
+    # The row-normalizing chains reject a matrix with an empty dimension;
+    # the builders drop them so the tensor still compresses.
+    t = torch.empty(shape, dtype=dtype)
+    blob = Compressor(_torch_cfg(framing=framing)).compress(t)
+    back = Decompressor().decompress(blob)
+    assert back.dtype == dtype
+    assert back.shape == t.shape

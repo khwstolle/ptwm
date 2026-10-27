@@ -109,8 +109,27 @@ impl PlaneCodec for ZstdDict {
         state_format_version: u8,
         state_bytes: &[u8],
         payload: &[u8],
+        layout: &PlaneLayout,
+        decoded_len: usize,
+    ) -> Result<Vec<u8>, PtwmCoreError> {
+        self.decode_bounded(
+            state_format_version,
+            state_bytes,
+            payload,
+            layout,
+            decoded_len,
+            usize::MAX,
+        )
+    }
+
+    fn decode_bounded(
+        &self,
+        state_format_version: u8,
+        state_bytes: &[u8],
+        payload: &[u8],
         _layout: &PlaneLayout,
         decoded_len: usize,
+        max_len: usize,
     ) -> Result<Vec<u8>, PtwmCoreError> {
         #[cfg(feature = "codec-zstd")]
         {
@@ -127,18 +146,24 @@ impl PlaneCodec for ZstdDict {
                 return Ok(Vec::new());
             }
             if state_bytes.is_empty() {
-                zstd::decode_all(payload)
-            } else {
-                decode_with_dict(payload, state_bytes, decoded_len)
+                return crate::codec_tagged::zstd_decode_bounded(payload, decoded_len, max_len);
             }
-            .map_err(|e| PtwmCoreError::CodecDecode {
-                codec: "zstd_dict",
-                msg: e.to_string(),
+            decode_with_dict(payload, state_bytes, decoded_len, max_len).map_err(|e| {
+                PtwmCoreError::CodecDecode {
+                    codec: "zstd_dict",
+                    msg: e.to_string(),
+                }
             })
         }
         #[cfg(not(feature = "codec-zstd"))]
         {
-            let _ = (state_format_version, state_bytes, payload, decoded_len);
+            let _ = (
+                state_format_version,
+                state_bytes,
+                payload,
+                decoded_len,
+                max_len,
+            );
             Err(PtwmCoreError::InvalidContainer(
                 "codec-zstd feature is disabled".into(),
             ))
@@ -161,20 +186,27 @@ fn encode_with_dict(plane: &[u8], dict: &[u8], level: i32) -> std::io::Result<Ve
 }
 
 #[cfg(feature = "codec-zstd")]
-fn decode_with_dict(payload: &[u8], dict: &[u8], decoded_len: usize) -> std::io::Result<Vec<u8>> {
+fn decode_with_dict(
+    payload: &[u8],
+    dict: &[u8],
+    decoded_len: usize,
+    max_len: usize,
+) -> std::io::Result<Vec<u8>> {
     let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict)?;
     // The bulk Decompressor writes into a buffer of exactly the
     // capacity we pass in. The dispatcher knows the decoded length
     // from the propagated terminal descriptor and forwards it via the
     // `decoded_len` argument. When that is zero (older callers that
     // don't propagate it), fall back to the frame's pledged source
-    // size if present, then to an 8x heuristic.
+    // size if present, then to an 8x heuristic. The capacity never
+    // exceeds `max_len`: a frame that needs more fails instead.
     let capacity = if decoded_len > 0 {
         decoded_len
     } else {
         zstd::bulk::Decompressor::upper_bound(payload)
             .unwrap_or_else(|| payload.len().saturating_mul(8))
-    };
+    }
+    .min(max_len);
     decompressor.decompress(payload, capacity)
 }
 

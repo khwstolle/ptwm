@@ -82,6 +82,28 @@ impl PlaneCodec for Zstd {
             ))
         }
     }
+
+    fn decode_bounded(
+        &self,
+        _state_format_version: u8,
+        _state_bytes: &[u8],
+        payload: &[u8],
+        _layout: &PlaneLayout,
+        decoded_len: usize,
+        max_len: usize,
+    ) -> Result<Vec<u8>, PtwmCoreError> {
+        #[cfg(feature = "codec-zstd")]
+        {
+            crate::codec_tagged::zstd_decode_bounded(payload, decoded_len, max_len)
+        }
+        #[cfg(not(feature = "codec-zstd"))]
+        {
+            let _ = (payload, decoded_len, max_len);
+            Err(PtwmCoreError::InvalidContainer(
+                "codec-zstd feature is disabled".into(),
+            ))
+        }
+    }
 }
 
 #[cfg(test)]

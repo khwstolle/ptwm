@@ -138,6 +138,25 @@ impl PlaneCodec for ArithmeticO0 {
         let mut model = Order0Static::deserialize(state_bytes)?;
         Ok(decode_bytes(&mut model, body, n))
     }
+
+    fn decode_bounded(
+        &self,
+        state_format_version: u8,
+        state_bytes: &[u8],
+        payload: &[u8],
+        layout: &PlaneLayout,
+        decoded_len: usize,
+        max_len: usize,
+    ) -> Result<Vec<u8>, PtwmCoreError> {
+        length_prefix::check_within(payload, max_len, "arithmetic_o0")?;
+        self.decode(
+            state_format_version,
+            state_bytes,
+            payload,
+            layout,
+            decoded_len,
+        )
+    }
 }
 
 /// Order-0 adaptive arithmetic coder. No inline state.
@@ -198,6 +217,25 @@ impl PlaneCodec for ArithmeticO0Adaptive {
         }
         let (n, body) = unframe_payload(payload, "arithmetic_o0_adaptive")?;
         Ok(decode_bytes(&mut Order0Adaptive::new(), body, n))
+    }
+
+    fn decode_bounded(
+        &self,
+        state_format_version: u8,
+        state_bytes: &[u8],
+        payload: &[u8],
+        layout: &PlaneLayout,
+        decoded_len: usize,
+        max_len: usize,
+    ) -> Result<Vec<u8>, PtwmCoreError> {
+        length_prefix::check_within(payload, max_len, "arithmetic_o0_adaptive")?;
+        self.decode(
+            state_format_version,
+            state_bytes,
+            payload,
+            layout,
+            decoded_len,
+        )
     }
 }
 
@@ -272,6 +310,25 @@ impl PlaneCodec for ArithmeticO1 {
         }
         let (n, body) = unframe_payload(payload, "arithmetic_o1")?;
         Ok(decode_bytes(&mut Order1Adaptive::new(), body, n))
+    }
+
+    fn decode_bounded(
+        &self,
+        state_format_version: u8,
+        state_bytes: &[u8],
+        payload: &[u8],
+        layout: &PlaneLayout,
+        decoded_len: usize,
+        max_len: usize,
+    ) -> Result<Vec<u8>, PtwmCoreError> {
+        length_prefix::check_within(payload, max_len, "arithmetic_o1")?;
+        self.decode(
+            state_format_version,
+            state_bytes,
+            payload,
+            layout,
+            decoded_len,
+        )
     }
 }
 

@@ -214,6 +214,53 @@ pub fn zstd_decode(blob: &[u8]) -> Result<Vec<u8>, PtwmCoreError> {
     })
 }
 
+/// Decode a Zstd blob (one or more frames) to at most `max_len` bytes.
+///
+/// The output buffer starts at `size_hint.min(max_len)` bytes and the
+/// decoder stops reading one byte past `max_len`, so a small frame that
+/// expands to gigabytes fails after at most `max_len + 1` decoded bytes.
+/// `size_hint` is the expected length; a plane that turns out longer is
+/// still read, up to the bound.
+#[cfg(feature = "codec-zstd")]
+pub fn zstd_decode_bounded(
+    blob: &[u8],
+    size_hint: usize,
+    max_len: usize,
+) -> Result<Vec<u8>, PtwmCoreError> {
+    use std::io::Read;
+    if blob.is_empty() {
+        return Ok(Vec::new());
+    }
+    let err = |e: std::io::Error| PtwmCoreError::CodecDecode {
+        codec: "zstd",
+        msg: e.to_string(),
+    };
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(blob).map_err(err)?;
+    let first = size_hint.min(max_len);
+    let mut out = Vec::with_capacity(first);
+    // Read the expected length into the exact-size buffer first, then probe
+    // for more. In the usual case the probe reads nothing and the buffer is
+    // never grown.
+    (&mut decoder)
+        .take(first as u64)
+        .read_to_end(&mut out)
+        .map_err(err)?;
+    if out.len() == first {
+        let rest = ((max_len - first) as u64).saturating_add(1);
+        (&mut decoder)
+            .take(rest)
+            .read_to_end(&mut out)
+            .map_err(err)?;
+    }
+    if out.len() > max_len {
+        return Err(PtwmCoreError::CodecDecode {
+            codec: "zstd",
+            msg: format!("frame decodes to more than {max_len} bytes"),
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

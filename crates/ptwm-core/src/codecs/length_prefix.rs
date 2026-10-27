@@ -32,6 +32,29 @@ pub(crate) fn accepted(decoded_len: usize, body_len: usize) -> bool {
         && (decoded_len <= RATIO_FREE_LEN || decoded_len <= body_len.saturating_mul(MAX_RATIO))
 }
 
+/// Error when the `u32` length prefix at the start of `prefixed` declares
+/// more than `max_len` decoded bytes.
+///
+/// Used by the bounded decode paths before the decode loop runs. A payload
+/// shorter than the prefix passes; the codec's own decoder reports it.
+pub(crate) fn check_within(
+    prefixed: &[u8],
+    max_len: usize,
+    codec: &'static str,
+) -> Result<(), crate::error::PtwmCoreError> {
+    let Some(prefix) = prefixed.first_chunk::<4>() else {
+        return Ok(());
+    };
+    let declared = u32::from_le_bytes(*prefix) as usize;
+    if declared > max_len {
+        return Err(crate::error::PtwmCoreError::CodecDecode {
+            codec,
+            msg: format!("payload declares {declared} decoded bytes, bound is {max_len}"),
+        });
+    }
+    Ok(())
+}
+
 /// Bytes from a skewed distribution (about 2 bits per byte), long enough to
 /// exercise lengths above [`RATIO_FREE_LEN`] while staying far below
 /// [`MAX_RATIO`].

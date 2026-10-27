@@ -142,6 +142,27 @@ impl PlaneCodec for Rans {
             }),
         }
     }
+
+    fn decode_bounded(
+        &self,
+        state_format_version: u8,
+        state_bytes: &[u8],
+        payload: &[u8],
+        layout: &PlaneLayout,
+        decoded_len: usize,
+        max_len: usize,
+    ) -> Result<Vec<u8>, PtwmCoreError> {
+        if let Some((&TAG_RANS, rest)) = payload.split_first() {
+            length_prefix::check_within(rest, max_len, "rans")?;
+        }
+        self.decode(
+            state_format_version,
+            state_bytes,
+            payload,
+            layout,
+            decoded_len,
+        )
+    }
 }
 
 #[cfg(test)]

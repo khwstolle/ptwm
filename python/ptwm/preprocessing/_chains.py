@@ -762,7 +762,9 @@ def _make_spherical_normalize_chain(
         # meaningful (rows, embedding-dim) factorization to normalize.
         # Returning None drops this candidate so the op never runs on 1D
         # (bias/norm) or higher-rank tensors, bounding trial-encode cost.
-        if len(shape) != 2:
+        # An empty dimension leaves no row to normalize, and the op rejects
+        # it, so the candidate is dropped as well.
+        if len(shape) != 2 or 0 in shape:
             return None
         return Chain(
             nodes=[
@@ -818,7 +820,9 @@ def _make_alpha_stable_normalize_chain(
         # meaningful (rows, embedding-dim) factorization to normalize.
         # Returning None drops this candidate so the op never runs on 1D
         # (bias/norm) or higher-rank tensors, bounding trial-encode cost.
-        if len(shape) != 2:
+        # An empty dimension leaves no row to normalize, and the op rejects
+        # it, so the candidate is dropped as well.
+        if len(shape) != 2 or 0 in shape:
             return None
         return Chain(
             nodes=[

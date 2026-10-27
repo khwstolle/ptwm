@@ -1418,11 +1418,14 @@ impl<'a> ContainerReader<'a> {
                         }
                         let state_bytes = &frame[5..5 + state_len];
                         let chunk_payload = &frame[5 + state_len..];
-                        let decoded = codec.decode(
+                        // The table's decoded size is bounded above; the codec
+                        // stops at it, so a corrupt chunk cannot decode past it.
+                        let decoded = codec.decode_bounded(
                             state_version,
                             state_bytes,
                             chunk_payload,
                             &plane_rec.layout,
+                            entry.decoded_size as usize,
                             entry.decoded_size as usize,
                         )?;
                         if decoded.len() != entry.decoded_size as usize {
@@ -1501,20 +1504,25 @@ impl<'a> ContainerReader<'a> {
                 let decoded_len = usize::try_from(descriptor.length_bytes).map_err(|_| {
                     PtwmCoreError::InvalidContainer("plane length overflows usize".into())
                 })?;
-                codec.decode(
+                // Self-delimiting codecs may return a length other than the
+                // descriptor's: older files carry Sources that overstate
+                // (Python byte input) or understate (byte passthrough over an
+                // element shape) the raw size. So the codec's hard limit is
+                // `plane_bound`, derived from `orig_size`, not `decoded_len`;
+                // the length check after `inverse_chain` and the payload hash
+                // cover the rest. The codec stops at the limit, so a corrupt
+                // payload cannot allocate past it.
+                codec.decode_bounded(
                     state_version,
                     &state_bytes,
                     &plane_rec.payload_bytes,
                     &plane_rec.layout,
                     decoded_len,
+                    usize::try_from(plane_bound).unwrap_or(usize::MAX),
                 )?
             };
-            // Self-delimiting codecs may return a length other than the
-            // descriptor's: older files carry Sources that overstate (Python
-            // byte input) or understate (byte passthrough over an element
-            // shape) the raw size. Bound the result by `orig_size` instead;
-            // the length check after `inverse_chain` and the payload hash
-            // cover the rest.
+            // The codecs enforce the bound; this check keeps it for any
+            // codec that does not.
             if plane_bytes.len() as u64 > plane_bound {
                 return Err(PtwmCoreError::InvalidContainer(format!(
                     "decoded plane is {} bytes, bound is {plane_bound} for a {}-byte tensor",

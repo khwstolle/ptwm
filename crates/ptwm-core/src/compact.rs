@@ -422,9 +422,17 @@ fn decode_body(
         let layout = legacy_plane_layout(descriptor.layout);
         let decoded_len = usize::try_from(descriptor.length_bytes)
             .map_err(|_| bad("plane length overflows usize"))?;
-        let bytes = codec.decode(state_version, state, payload, &layout, decoded_len)?;
         // The Source is exact, so every plane decodes to its descriptor's
-        // length.
+        // length. The codec stops at that length, so a corrupt payload cannot
+        // allocate past it.
+        let bytes = codec.decode_bounded(
+            state_version,
+            state,
+            payload,
+            &layout,
+            decoded_len,
+            decoded_len,
+        )?;
         if bytes.len() != decoded_len {
             return Err(bad(&format!(
                 "plane decoded to {} bytes, chain says {decoded_len}",

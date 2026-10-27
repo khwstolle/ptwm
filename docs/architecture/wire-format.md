@@ -199,10 +199,11 @@ a compact frame instead, with its own magic `\x89PTWS`:
 ```
 magic          [u8;5]    \x89PTWS
 flags          u8        payload hash, plane CRC, shape, dtype name,
-                         delta reference, stored; unknown bits rejected
+                         delta reference, stored, size; unknown bits
+                         rejected
 dtype_code     varint
 input_format   u8
-orig_size      varint
+orig_size      varint                             (if flagged)
 shape          varint ndim + varint dims          (if flagged)
 dtype_name     varint length + utf8               (if flagged)
 delta_ref      [u8;32]   blake3 of the reference  (if flagged)
@@ -210,21 +211,59 @@ payload_hash   u64       xxh64 of the raw bytes   (if flagged)
 body
 ```
 
-The body is either the raw bytes (the stored flag, written when no
-codec makes the tensor smaller) or a coded tensor: a list of op wire
-ids, the chain in the wire form the chain registry uses (its op
-indices refer to that list), and one record per terminal plane
-(codec id, inline state, payload length, optional CRC32, payload).
-The frame does not store plane layouts, plane lengths or the plane
-count, because the decoder derives them from the chain. The dtype
-name is stored only when it differs from the canonical name of
-`dtype_code`.
+`orig_size` is stored only when the shape does not give it as
+`product(shape) × element_size(dtype_code)`. The dtype name is stored
+only when it differs from the canonical name of `dtype_code`. Varints
+are minimal unsigned LEB128, and a reader rejects any field written
+in a form the writer would not produce, so each tensor has one frame
+encoding.
 
-The fixed cost is 10 to 130 bytes, depending on the chain and on
-which integrity fields are on. A tensor whose planes need shared
-state (a prelude) or chunked encoding cannot use the frame; the
-compressor writes a full container for it. The frame holds no
-extension table, so it can reference built-in ops and codecs only.
+The body is either the raw bytes (the stored flag, written when no
+codec makes the tensor smaller) or a coded tensor: the chain in the
+compact chain wire (CW2, below), then one record per terminal plane:
+a varint `codec_id << 2 | state` (state 0 none, 1 inline with a
+version byte and length-prefixed bytes, 2 inline with version 0 and
+no bytes), the payload length (omitted on the last plane, whose
+payload runs to the end of the frame), an optional CRC32 and the
+payload. The frame does not store plane layouts, plane lengths or
+the plane count, because the decoder derives them from the chain.
+
+The fixed cost is 10 to 70 bytes, depending on the chain and on
+which integrity fields are on: about 48 bytes for a bf16 tensor and
+68 bytes for an fp32 tensor with the payload hash and plane CRCs on.
+A tensor whose planes need shared state (a prelude) or chunked
+encoding cannot use the frame; the compressor writes a full
+container for it. The frame holds no extension table, so it can
+reference built-in ops and codecs only.
+
+### Compact chain wire (CW2)
+
+`chain::wire_compact` stores a chain in about 15 to 20 bytes, against
+50 to 70 for the registry wire form:
+
+```
+n_nodes, n_edges, n_terms    varint each (n_nodes 1..=255, others <= 255)
+node:      op_ref varint, param_len varint (<= 255), params
+n_spine    varint (<= n_edges; only when n_edges > 0)
+edge:      src, src_out, dst, dst_in varint; etag u8 (bit0 role,
+           bit1 vendor); [compact role]; [varint length + vendor bytes]
+terminal:  ref u8 (node << 4 | out, or 0xFF + node u8 + out u8);
+           compact role
+```
+
+- `op_ref` is the `OpId` wire id in the compact frame.
+- The first `n_spine` edges are `(i, 0) → (i + 1, 0)` with no role
+  override and no vendor bytes, and are not stored.
+- A Source node with `param_len = 0` is a bound Source: its params
+  are those of the frame's shape and dtype (`u8` ndim, `u32` dims,
+  `u16` chain dtype). The writer binds a Source exactly when its
+  params equal these, so chains that differ only in shape encode to
+  the same bytes.
+- A compact role is one byte for every role production chains use
+  (scale formats, nibble kinds, mantissa and integer bytes up to 8,
+  `IntN` up to 32 bits, raw, index, exponent byte, fp4 value, XOR
+  residual), and `0xFF` followed by the registry role encoding for
+  the rest.
 
 The frame follows the same versioning rule as the container: no
 numeric version field, and a new magic for an incompatible layout.

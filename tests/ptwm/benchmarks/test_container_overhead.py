@@ -24,6 +24,11 @@ from benchmarks.container_overhead import (
 # codec payload is smaller than zstd-19's output.
 SLACK = 64
 
+# Largest compact-frame non-payload bytes (header, compact chain, plane heads,
+# payload hash and plane CRCs) per dtype. fp32 frames carry four planes, bf16
+# frames two. Measured maxima over SIZES: fp32 68 B, bf16 48 B.
+COMPACT_OVERHEAD = {"bf16": 55, "fp32": 70}
+
 
 def test_constant_64_byte_bf16_tensor_is_at_most_128_bytes() -> None:
     t = torch.full((32,), 0.5, dtype=torch.bfloat16)
@@ -42,6 +47,7 @@ def test_random_normal_overhead_is_bounded(
     assert row.out <= row.raw + SLACK, row
     if row.payload < row.zstd19:
         assert row.out <= row.zstd19 + SLACK, row
+    assert row.non_payload <= COMPACT_OVERHEAD[dname], row
 
 
 @pytest.mark.parametrize(("dname", "dtype"), DTYPES)
@@ -53,7 +59,7 @@ def test_constant_overhead_is_bounded(
         make_tensor(dtype, "constant", nbytes), Framing.COMPACT, dname, "constant"
     )
     assert row.out <= row.raw + SLACK, row
-    # Four-plane fp32 frames carry about 120 B of chain and plane metadata.
+    assert row.non_payload <= COMPACT_OVERHEAD[dname], row
     assert row.out <= 256, row
 
 

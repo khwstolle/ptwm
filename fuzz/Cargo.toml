@@ -101,3 +101,9 @@ name = "compact_decode"
 path = "fuzz_targets/compact_decode.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "chain_wire_compact"
+path = "fuzz_targets/chain_wire_compact.rs"
+test = false
+doc = false

@@ -13,7 +13,7 @@ pub enum ScaleFormat {
 }
 
 impl ScaleFormat {
-    fn as_u8(self) -> u8 {
+    pub(crate) fn as_u8(self) -> u8 {
         match self {
             ScaleFormat::E8M0 => 0,
             ScaleFormat::E4M3 => 1,
@@ -22,7 +22,7 @@ impl ScaleFormat {
             ScaleFormat::F16 => 4,
         }
     }
-    fn from_u8(v: u8) -> Result<Self, PtwmCoreError> {
+    pub(crate) fn from_u8(v: u8) -> Result<Self, PtwmCoreError> {
         match v {
             0 => Ok(ScaleFormat::E8M0),
             1 => Ok(ScaleFormat::E4M3),
@@ -83,14 +83,14 @@ pub enum NibbleKind {
 }
 
 impl NibbleKind {
-    fn as_u8(self) -> u8 {
+    pub(crate) fn as_u8(self) -> u8 {
         match self {
             NibbleKind::Exponent => 0,
             NibbleKind::SignMantissa => 1,
             NibbleKind::Value => 2,
         }
     }
-    fn from_u8(v: u8) -> Result<Self, PtwmCoreError> {
+    pub(crate) fn from_u8(v: u8) -> Result<Self, PtwmCoreError> {
         match v {
             0 => Ok(NibbleKind::Exponent),
             1 => Ok(NibbleKind::SignMantissa),

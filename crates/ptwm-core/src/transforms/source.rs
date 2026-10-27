@@ -63,6 +63,47 @@ pub fn storage_bytes_per_element(dtype_code: u16) -> u64 {
     element_width_for(dtype_code).bits_per_element() as u64 / 8
 }
 
+/// Chain-internal Source dtype for a public dtype code (`Dtype` registry),
+/// mirroring `_CHAIN_DTYPE` in `python/ptwm/preprocessing/_chains.py`.
+/// `None` for codes without a chain dtype (for example `bool`).
+pub fn chain_dtype_for_public(dtype_code: u16) -> Option<u16> {
+    Some(match dtype_code {
+        1 | 2 => 0x0003,   // float32, float
+        4 | 5 => 0x0002,   // float16, half
+        6 => 0x000F,       // bfloat16
+        13 => 0x0006,      // uint8
+        15 => 0x000A,      // uint32
+        17 => 0x0005,      // int8
+        18 | 19 => 0x0007, // int16, short
+        20 | 21 => 0x0009, // int32, int
+        22 | 23 => 0x000B, // int64, long
+        29 => 0x0010,      // float8_e4m3fn
+        30 => 0x0011,      // float8_e5m2
+        31 => DTYPE_FP4_E2M1FN_X2,
+        _ => return None,
+    })
+}
+
+/// Source params for a tensor's own shape and public dtype code: the params
+/// a *bound* Source stands for in the compact chain wire
+/// (`chain::wire_compact`). Same layout as [`Source::write_params`]:
+/// `u8` ndim, `u32` LE dims, `u16` LE chain dtype.
+///
+/// `None` when the tensor cannot bind a Source: more than
+/// [`MAX_SOURCE_DIMS`] dimensions, a dimension above `u32::MAX`, or a dtype
+/// without a chain dtype.
+pub fn bound_source_params(shape: &[u64], dtype_code: u16) -> Option<Vec<u8>> {
+    let chain_dtype = chain_dtype_for_public(dtype_code)?;
+    let ndim = u8::try_from(shape.len()).ok()?;
+    let mut out = Vec::with_capacity(3 + 4 * shape.len());
+    out.push(ndim);
+    for &d in shape {
+        out.extend_from_slice(&u32::try_from(d).ok()?.to_le_bytes());
+    }
+    out.extend_from_slice(&chain_dtype.to_le_bytes());
+    Some(out)
+}
+
 /// Mandatory entry node of every PPG chain. Takes no inputs (the runtime
 /// injects raw tensor bytes externally) and emits one `Role::Raw` plane
 /// whose descriptor follows from the tensor `shape` and `dtype_code`.
@@ -232,6 +273,37 @@ mod tests {
             shape: vec![4, 8, 16],
             // Float16 → chain-internal code 0x0002 (matches Python _CHAIN_DTYPE).
             dtype_code: 0x0002,
+        }
+    }
+
+    #[test]
+    fn bound_source_params_match_write_params() {
+        let params = bound_source_params(&[4, 8, 16], 4).unwrap();
+        let mut expected = Vec::new();
+        make_source().write_params(&mut expected);
+        assert_eq!(params, expected);
+        // 0-d tensor: no dims.
+        assert_eq!(
+            bound_source_params(&[], 1).unwrap(),
+            [0u8, 0x03, 0x00].to_vec()
+        );
+        // Unbindable: no chain dtype, a dim above u32, too many dims.
+        assert_eq!(bound_source_params(&[4], 24), None);
+        assert_eq!(bound_source_params(&[1 << 32], 1), None);
+        assert_eq!(bound_source_params(&[1; 256], 1), None);
+        // Every public dtype with a chain dtype maps to a code whose element
+        // width matches the public element size.
+        for code in 0..=255u8 {
+            let Ok(d) = crate::dtype::Dtype::from_code(code) else {
+                continue;
+            };
+            if let Some(c) = chain_dtype_for_public(u16::from(code)) {
+                assert_eq!(
+                    storage_bytes_per_element(c),
+                    u64::from(d.element_size()),
+                    "{d:?}"
+                );
+            }
         }
     }
 

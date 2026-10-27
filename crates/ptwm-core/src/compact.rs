@@ -8,37 +8,53 @@
 //! ```text
 //!     magic:          [u8; 5]   \x89PTWS
 //!     flags:          u8        see FLAG_*; unknown bits are rejected
-//!     dtype_code:     varint
+//!     dtype_code:     varint    at most u16::MAX
 //!     input_format:   u8
-//!     orig_size:      varint    raw byte count
-//!     [shape]         varint ndim, then varint per dimension   (FLAG_SHAPE)
-//!     [dtype_name]    varint len, then UTF-8 bytes           (FLAG_DTYPE_NAME)
+//!     [orig_size]     varint    raw byte count                  (FLAG_SIZE)
+//!     [shape]         varint ndim (<= 64), then varint per dimension
+//!                                                              (FLAG_SHAPE)
+//!     [dtype_name]    varint len, then UTF-8 bytes          (FLAG_DTYPE_NAME)
 //!     [delta_ref]     [u8; 32]  BLAKE3 of the delta reference (FLAG_DELTA_REF)
-//!     [payload_hash]  u64       xxh64 of the raw bytes      (FLAG_PAYLOAD_HASH)
+//!     [payload_hash]  u64       xxh64 of the raw bytes     (FLAG_PAYLOAD_HASH)
 //!     body
 //! ```
+//!
+//! `orig_size` is stored only when the shape does not give it: without
+//! `FLAG_SHAPE`, for a dtype code without a known element size, or when
+//! `product(shape) × element_size` differs from the raw byte count (for
+//! example a byte buffer with a shape in other units). A reader rejects
+//! `FLAG_SIZE` when the shape gives the same value. `FLAG_DTYPE_NAME`
+//! requires `FLAG_SHAPE` and a name that differs from the canonical name of
+//! `dtype_code`; `FLAG_SHAPE` without it requires a known dtype code.
 //!
 //! When `FLAG_STORED` is set, the body is the `orig_size` raw bytes. Else the
 //! body is a coded tensor:
 //!
 //! ```text
-//!     n_ops:          u8
-//!     op_ids:         [u16; n_ops]    OpId wire ids; the chain's u16 op
-//!                                     indices refer to this list
-//!     chain:          chain::wire::write_chain bytes
+//!     chain:          CW2 chain (chain::wire_compact); op_ref is the OpId
+//!                     wire id, and a bound Source takes the frame's shape
+//!                     and dtype_code
 //!     per terminal plane, in chain terminal order:
-//!         codec_id:       varint      CodecId wire id
-//!         state_source:   u8          0 = none, 1 = inline
-//!         [state_version] u8          (inline only)
-//!         [state_len]     varint      (inline only)
-//!         [state]         bytes       (inline only)
-//!         payload_len:    varint
+//!         head:           varint      CodecId wire id << 2 | state
+//!                                     state 0 = none, 1 = inline,
+//!                                     2 = inline, version 0, empty;
+//!                                     3 is rejected
+//!         [state_version] u8          (state 1)
+//!         [state_len]     varint      (state 1)
+//!         [state]         bytes       (state 1)
+//!         [payload_len]   varint      every plane but the last; the last
+//!                                     payload runs to the end of the frame
 //!         [crc32]         u32         CRC32 of the raw plane (FLAG_PLANE_CRC)
 //!         payload:        bytes
 //! ```
 //!
-//! All integers are little-endian; varints are unsigned LEB128. The frame
-//! ends exactly after the body; trailing bytes are rejected.
+//! State 1 with version 0 and an empty state is rejected: state 2 is its
+//! only encoding. All integers are little-endian; varints are canonical
+//! unsigned LEB128 ([`crate::varint`]). Every header and chain field has
+//! exactly one encoding. A stored body must be exactly `orig_size` bytes,
+//! and a coded body ends with the last plane's payload, so bytes appended to
+//! a coded frame reach the last plane's codec, which rejects them or ignores
+//! them; the plane CRC and payload hash still guard the decoded bytes.
 //!
 //! The plane layout, the decoded plane length and the plane count all come
 //! from the chain, so the frame does not store them. Planes that need shared
@@ -56,14 +72,16 @@ use crate::chain::runtime::{
     propagate_terminal_descriptors_bounded,
 };
 use crate::chain::validate::validate_chain;
-use crate::chain::wire::{read_chain, write_chain};
+use crate::chain::wire_compact::{
+    op_from_wire_ref, op_wire_ref, read_chain_compact, write_chain_compact,
+};
 use crate::codec::{CodecId, StateSource, codec_for};
 use crate::compressor::{CompressorOptions, InputTensor, legacy_plane_layout, plan_model};
 use crate::dtype::Dtype;
 use crate::error::PtwmCoreError;
-use crate::extension::dispatch::{BuiltinKind, dispatch_builtin};
-use crate::extension::{ExtensionTable, ExtensionTableBuilder, builtin_entries};
-use crate::transforms::op::{OpId, Plane};
+use crate::transforms::op::Plane;
+use crate::transforms::source::bound_source_params;
+use crate::varint::{Cursor, write_varint};
 
 use std::sync::Arc;
 use xxhash_rust::xxh64::xxh64;
@@ -84,16 +102,24 @@ pub const FLAG_DTYPE_NAME: u8 = 0x08;
 pub const FLAG_DELTA_REF: u8 = 0x10;
 /// The body is the raw bytes, not a coded tensor.
 pub const FLAG_STORED: u8 = 0x20;
+/// The frame stores `orig_size` because the shape does not give it.
+pub const FLAG_SIZE: u8 = 0x40;
 const KNOWN_FLAGS: u8 = FLAG_PAYLOAD_HASH
     | FLAG_PLANE_CRC
     | FLAG_SHAPE
     | FLAG_DTYPE_NAME
     | FLAG_DELTA_REF
-    | FLAG_STORED;
+    | FLAG_STORED
+    | FLAG_SIZE;
 
 /// Upper bound on the dimension count, so a corrupt `ndim` cannot drive a
 /// large allocation.
 const MAX_NDIM: u64 = 64;
+
+/// Plane state codes in the plane head.
+const STATE_NONE: u64 = 0;
+const STATE_INLINE: u64 = 1;
+const STATE_INLINE_EMPTY: u64 = 2;
 
 /// A tensor decoded from a compact frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,8 +129,7 @@ pub struct CompactTensor {
     /// Shape, when the writer supplied one.
     pub shape: Option<Vec<u64>>,
     /// Dtype name paired with `shape`. When the frame does not store a name,
-    /// this is the canonical name of `dtype_code` (or `None` if the code is
-    /// unknown).
+    /// this is the canonical name of `dtype_code`.
     pub dtype_name: Option<String>,
     /// BLAKE3 hash of the delta reference, when the tensor is delta-coded.
     pub delta_reference_blake3: Option<[u8; 32]>,
@@ -128,6 +153,18 @@ fn canonical_dtype_name(dtype_code: u16) -> Option<&'static str> {
         .map(Dtype::canonical_name)
 }
 
+/// Raw byte count implied by a shape and a public dtype code:
+/// `product(shape) × element_size`. `None` for an unknown dtype code or on
+/// overflow.
+pub fn size_from_shape(shape: &[u64], dtype_code: u16) -> Option<u64> {
+    let dtype = Dtype::from_code(u8::try_from(dtype_code).ok()?).ok()?;
+    shape
+        .iter()
+        .try_fold(u64::from(dtype.element_size()), |acc, &d| {
+            acc.checked_mul(d)
+        })
+}
+
 /// Encode one tensor as a compact frame.
 ///
 /// Runs the same chain and codec search as
@@ -143,6 +180,7 @@ pub fn compress_compact(
         return Ok(None);
     }
     let raw = input.raw_bytes;
+    let orig_size = raw.len() as u64;
 
     let mut out = Vec::with_capacity(64);
     out.extend_from_slice(&MAGIC_COMPACT);
@@ -151,10 +189,22 @@ pub fn compress_compact(
     let mut flags = 0u8;
     write_varint(&mut out, u64::from(input.dtype_code));
     out.push(input.input_format);
-    write_varint(&mut out, raw.len() as u64);
     // Shape metadata is recorded only when both shape and dtype name are
     // known, matching the full container's tensor metadata.
-    if let (Some(shape), Some(name)) = (&input.shape, &input.dtype_name) {
+    let shape = match (&input.shape, &input.dtype_name) {
+        (Some(shape), Some(_)) => Some(shape.as_slice()),
+        _ => None,
+    };
+    if shape.and_then(|s| size_from_shape(s, input.dtype_code)) != Some(orig_size) {
+        flags |= FLAG_SIZE;
+        write_varint(&mut out, orig_size);
+    }
+    let mut bound_source = None;
+    if let (Some(shape), Some(name)) = (shape, &input.dtype_name) {
+        if shape.len() as u64 > MAX_NDIM {
+            // The full container has no such limit.
+            return Ok(None);
+        }
         flags |= FLAG_SHAPE;
         write_varint(&mut out, shape.len() as u64);
         for &d in shape {
@@ -165,6 +215,7 @@ pub fn compress_compact(
             write_varint(&mut out, name.len() as u64);
             out.extend_from_slice(name.as_bytes());
         }
+        bound_source = bound_source_params(shape, input.dtype_code);
     }
     if let Some(h) = &input.delta_reference_blake3 {
         flags |= FLAG_DELTA_REF;
@@ -175,7 +226,7 @@ pub fn compress_compact(
         out.extend_from_slice(&xxh64(raw, 0).to_le_bytes());
     }
 
-    let coded = encode_body(input, opts)?;
+    let coded = encode_body(input, opts, bound_source.as_deref())?;
     match coded {
         None => return Ok(None),
         Some(body) if body.len() < raw.len() => {
@@ -193,11 +244,12 @@ pub fn compress_compact(
     Ok(Some(out))
 }
 
-/// Encode the coded body (ops, chain, planes). `Ok(None)` when a plane needs
-/// shared state.
+/// Encode the coded body (chain, planes). `Ok(None)` when a plane needs
+/// shared or external state.
 fn encode_body(
     input: &InputTensor<'_>,
     opts: &CompressorOptions,
+    bound_source: Option<&[u8]>,
 ) -> Result<Option<Vec<u8>>, PtwmCoreError> {
     let plan = plan_model(std::slice::from_ref(input), opts)?;
     if !plan.prelude_entries.is_empty() {
@@ -206,51 +258,34 @@ fn encode_body(
     let chain: &Chain = &input.candidate_chains[plan.pass1[0].chain_idx];
     let planes = &plan.chosen_per_tensor[0];
 
-    let mut builder = ExtensionTableBuilder::new();
-    let mut chain_bytes = Vec::new();
-    write_chain(chain, &mut builder, &mut chain_bytes)?;
-    let entries = builder.finish();
-    let n_ops = u8::try_from(entries.len()).map_err(|_| {
-        PtwmCoreError::InvalidContainer(format!(
-            "compact frame: chain uses {} ops (max 255)",
-            entries.len()
-        ))
-    })?;
-
     let mut body = Vec::with_capacity(
-        16 + chain_bytes.len()
-            + planes
-                .iter()
-                .map(|p| p.payload_bytes.len() + 16)
-                .sum::<usize>(),
+        64 + planes
+            .iter()
+            .map(|p| p.payload_bytes.len() + p.encoded_state_bytes.len() + 16)
+            .sum::<usize>(),
     );
-    body.push(n_ops);
-    for entry in &entries {
-        let op = match dispatch_builtin(&entry.canonical_id) {
-            Some(BuiltinKind::Op(op)) => op,
-            _ => {
-                return Err(PtwmCoreError::InvalidContainer(
-                    "compact frame: chain op is not a built-in transform".into(),
-                ));
-            }
-        };
-        body.extend_from_slice(&op.as_u16().to_le_bytes());
-    }
-    body.extend_from_slice(&chain_bytes);
+    write_chain_compact(chain, bound_source, op_wire_ref, &mut body)?;
 
-    for cp in planes {
-        write_varint(&mut body, u64::from(cp.codec_id.as_u16()));
+    for (i, cp) in planes.iter().enumerate() {
+        let codec = u64::from(cp.codec_id.as_u16()) << 2;
         match cp.state_source {
-            StateSource::None => body.push(0),
+            StateSource::None => write_varint(&mut body, codec | STATE_NONE),
+            StateSource::Inline
+                if cp.encoded_state_version == 0 && cp.encoded_state_bytes.is_empty() =>
+            {
+                write_varint(&mut body, codec | STATE_INLINE_EMPTY)
+            }
             StateSource::Inline => {
-                body.push(1);
+                write_varint(&mut body, codec | STATE_INLINE);
                 body.push(cp.encoded_state_version);
                 write_varint(&mut body, cp.encoded_state_bytes.len() as u64);
                 body.extend_from_slice(&cp.encoded_state_bytes);
             }
             StateSource::Shared | StateSource::External => return Ok(None),
         }
-        write_varint(&mut body, cp.payload_bytes.len() as u64);
+        if i + 1 < planes.len() {
+            write_varint(&mut body, cp.payload_bytes.len() as u64);
+        }
         if opts.emit_plane_crc {
             body.extend_from_slice(&crc32fast::hash(&cp.raw_plane_for_crc).to_le_bytes());
         }
@@ -259,32 +294,42 @@ fn encode_body(
     Ok(Some(body))
 }
 
-/// Decode a compact frame. Verifies the payload hash and plane CRCs when the
-/// frame carries them.
-pub fn decode_compact(buf: &[u8]) -> Result<CompactTensor, PtwmCoreError> {
-    let mut r = Reader { buf, pos: 0 };
-    if !is_compact(buf) {
-        return Err(bad("bad magic"));
+/// The frame fields before the body.
+struct FrameHeader {
+    flags: u8,
+    dtype_code: u16,
+    input_format: u8,
+    orig_size: u64,
+    shape: Option<Vec<u64>>,
+    dtype_name: Option<String>,
+    delta_reference_blake3: Option<[u8; 32]>,
+    payload_hash: Option<u64>,
+}
+
+fn read_header(r: &mut Cursor<'_>) -> Result<FrameHeader, PtwmCoreError> {
+    if !is_compact(r.rest()) {
+        return Err(r.err("bad magic"));
     }
-    r.pos = MAGIC_COMPACT.len();
+    r.take(MAGIC_COMPACT.len())?;
     let flags = r.u8()?;
     if flags & !KNOWN_FLAGS != 0 {
-        return Err(bad(&format!(
+        return Err(r.err(format_args!(
             "unknown flag bits {:#04x}",
             flags & !KNOWN_FLAGS
         )));
     }
-    let dtype_code = u16::try_from(r.varint()?).map_err(|_| bad("dtype_code exceeds u16"))?;
+    let dtype_code = r.varint_max(u64::from(u16::MAX), "dtype_code")? as u16;
     let input_format = r.u8()?;
-    let orig_size = r.varint()?;
+    let stored_size = if flags & FLAG_SIZE != 0 {
+        Some(r.varint()?)
+    } else {
+        None
+    };
 
     let mut shape = None;
     let mut dtype_name = None;
     if flags & FLAG_SHAPE != 0 {
-        let ndim = r.varint()?;
-        if ndim > MAX_NDIM {
-            return Err(bad(&format!("ndim {ndim} exceeds {MAX_NDIM}")));
-        }
+        let ndim = r.varint_max(MAX_NDIM, "ndim")?;
         let mut dims = Vec::with_capacity(ndim as usize);
         for _ in 0..ndim {
             dims.push(r.varint()?);
@@ -294,35 +339,69 @@ pub fn decode_compact(buf: &[u8]) -> Result<CompactTensor, PtwmCoreError> {
     }
     if flags & FLAG_DTYPE_NAME != 0 {
         if flags & FLAG_SHAPE == 0 {
-            return Err(bad("dtype name without shape"));
+            return Err(r.err("dtype name without shape"));
         }
-        let len = r.len_varint()?;
-        let bytes = r.take(len)?;
-        let name = std::str::from_utf8(bytes).map_err(|_| bad("dtype name is not UTF-8"))?;
+        let bytes = r.len_bytes()?;
+        let name = std::str::from_utf8(bytes).map_err(|_| r.err("dtype name is not UTF-8"))?;
+        if dtype_name.as_deref() == Some(name) {
+            return Err(r.err("stored dtype name equals the canonical name"));
+        }
         dtype_name = Some(name.to_owned());
+    } else if shape.is_some() && dtype_name.is_none() {
+        return Err(r.err(format_args!(
+            "shape without a dtype name for unknown dtype_code {dtype_code}"
+        )));
     }
+
+    let derived_size = shape
+        .as_deref()
+        .and_then(|s| size_from_shape(s, dtype_code));
+    let orig_size = match (stored_size, derived_size) {
+        (Some(s), Some(d)) if s == d => {
+            return Err(r.err("stored orig_size equals the size the shape gives"));
+        }
+        (Some(s), _) => s,
+        (None, Some(d)) => d,
+        (None, None) => return Err(r.err("no orig_size and no shape that gives it")),
+    };
+
     let delta_reference_blake3 = if flags & FLAG_DELTA_REF != 0 {
-        let mut h = [0u8; 32];
-        h.copy_from_slice(r.take(32)?);
-        Some(h)
+        Some(r.array::<32>()?)
     } else {
         None
     };
     let payload_hash = if flags & FLAG_PAYLOAD_HASH != 0 {
-        Some(u64::from_le_bytes(r.take(8)?.try_into().unwrap()))
+        Some(r.u64_le()?)
     } else {
         None
     };
+    Ok(FrameHeader {
+        flags,
+        dtype_code,
+        input_format,
+        orig_size,
+        shape,
+        dtype_name,
+        delta_reference_blake3,
+        payload_hash,
+    })
+}
+
+/// Decode a compact frame. Verifies the payload hash and plane CRCs when the
+/// frame carries them.
+pub fn decode_compact(buf: &[u8]) -> Result<CompactTensor, PtwmCoreError> {
+    let mut r = Cursor::new(buf, "compact frame");
+    let h = read_header(&mut r)?;
+    let orig_size = h.orig_size;
 
     let mut payload_len = 0u64;
-    let raw = if flags & FLAG_STORED != 0 {
-        if flags & FLAG_PLANE_CRC != 0 {
-            return Err(bad("stored frame with plane CRC flag"));
+    let raw = if h.flags & FLAG_STORED != 0 {
+        if h.flags & FLAG_PLANE_CRC != 0 {
+            return Err(r.err("stored frame with plane CRC flag"));
         }
-        let rest = r.rest();
-        r.pos = buf.len();
+        let rest = r.take(r.remaining())?;
         if rest.len() as u64 != orig_size {
-            return Err(bad(&format!(
+            return Err(r.err(format_args!(
                 "stored body is {} bytes, header says {orig_size}",
                 rest.len()
             )));
@@ -330,55 +409,45 @@ pub fn decode_compact(buf: &[u8]) -> Result<CompactTensor, PtwmCoreError> {
         payload_len = orig_size;
         rest.to_vec()
     } else {
+        let bound = h
+            .shape
+            .as_deref()
+            .and_then(|s| bound_source_params(s, h.dtype_code));
         decode_body(
             &mut r,
-            flags & FLAG_PLANE_CRC != 0,
+            h.flags & FLAG_PLANE_CRC != 0,
             orig_size,
+            bound.as_deref(),
             &mut payload_len,
         )?
     };
-    if r.pos != buf.len() {
-        return Err(bad("trailing bytes after body"));
-    }
+    r.finish("body")?;
 
-    if let Some(expected) = payload_hash
+    if let Some(expected) = h.payload_hash
         && xxh64(&raw, 0) != expected
     {
-        return Err(bad("payload hash mismatch"));
+        return Err(r.err("payload hash mismatch"));
     }
 
     Ok(CompactTensor {
-        dtype_code,
-        input_format,
-        shape,
-        dtype_name,
-        delta_reference_blake3,
+        dtype_code: h.dtype_code,
+        input_format: h.input_format,
+        shape: h.shape,
+        dtype_name: h.dtype_name,
+        delta_reference_blake3: h.delta_reference_blake3,
         raw,
         payload_len,
     })
 }
 
 fn decode_body(
-    r: &mut Reader<'_>,
+    r: &mut Cursor<'_>,
     has_crc: bool,
     orig_size: u64,
+    bound_source: Option<&[u8]>,
     payload_len_out: &mut u64,
 ) -> Result<Vec<u8>, PtwmCoreError> {
-    let n_ops = r.u8()? as usize;
-    let all = builtin_entries();
-    let mut table = ExtensionTable::empty();
-    for _ in 0..n_ops {
-        let wire = u16::from_le_bytes(r.take(2)?.try_into().unwrap());
-        let op = OpId::from_u16(wire)?;
-        let id = op.canonical_id();
-        let entry = all
-            .iter()
-            .find(|e| e.canonical_id == id)
-            .ok_or_else(|| bad(&format!("op {wire:#06x} has no built-in entry")))?;
-        table.entries.push(entry.clone());
-    }
-    let (chain, consumed) = read_chain(r.rest(), &table)?;
-    r.pos += consumed;
+    let chain = read_chain_compact(r, bound_source, op_from_wire_ref)?;
     // Writers check that the chain's Source declares exactly the raw byte
     // count, so a frame whose Source disagrees with `orig_size` is corrupt.
     // Checking before `validate_chain` and the descriptor walk (both call
@@ -386,7 +455,7 @@ fn decode_body(
     // planes (and codec allocations) beyond the tensor.
     let source = chain_source_descriptor(&chain)?;
     if source.length_bytes != orig_size {
-        return Err(bad(&format!(
+        return Err(r.err(format_args!(
             "chain Source declares {} bytes, header says {orig_size}",
             source.length_bytes
         )));
@@ -394,34 +463,36 @@ fn decode_body(
     validate_chain(&chain, 0)?;
     let descriptors = propagate_terminal_descriptors_bounded(&chain, max_plane_len(orig_size))?;
 
-    let mut terminal_planes: Vec<Plane> = Vec::with_capacity(descriptors.len());
-    for descriptor in descriptors {
-        let wire = u16::try_from(r.varint()?).map_err(|_| bad("codec id exceeds u16"))?;
-        let codec_id =
-            CodecId::from_u16(wire).ok_or_else(|| bad(&format!("unknown codec {wire:#06x}")))?;
-        let (state_version, state) = match r.u8()? {
-            0 => (0u8, &[][..]),
-            1 => {
+    let n_planes = descriptors.len();
+    let mut terminal_planes: Vec<Plane> = Vec::with_capacity(n_planes);
+    for (i, descriptor) in descriptors.into_iter().enumerate() {
+        let head = r.varint()?;
+        let wire = u16::try_from(head >> 2).map_err(|_| r.err("codec id exceeds u16"))?;
+        let codec_id = CodecId::from_u16(wire)
+            .ok_or_else(|| r.err(format_args!("unknown codec {wire:#06x}")))?;
+        let (state_version, state) = match head & 3 {
+            STATE_NONE | STATE_INLINE_EMPTY => (0u8, &[][..]),
+            STATE_INLINE => {
                 let v = r.u8()?;
-                let len = r.len_varint()?;
-                (v, r.take(len)?)
+                let state = r.len_bytes()?;
+                if v == 0 && state.is_empty() {
+                    return Err(r.err("empty version-0 inline state must use state code 2"));
+                }
+                (v, state)
             }
-            s => return Err(bad(&format!("unknown state source {s}"))),
+            s => return Err(r.err(format_args!("unknown state code {s}"))),
         };
-        let payload_len = r.len_varint()?;
-        let crc = if has_crc {
-            Some(u32::from_le_bytes(r.take(4)?.try_into().unwrap()))
-        } else {
-            None
-        };
-        let payload = r.take(payload_len)?;
+        let last = i + 1 == n_planes;
+        let payload_len = if last { None } else { Some(r.len_varint()?) };
+        let crc = if has_crc { Some(r.u32_le()?) } else { None };
+        let payload = r.take(payload_len.unwrap_or(r.remaining()))?;
         *payload_len_out += (state.len() + payload.len()) as u64;
 
         let codec = codec_for(codec_id)
-            .ok_or_else(|| bad(&format!("no codec implementation for {codec_id:?}")))?;
+            .ok_or_else(|| r.err(format_args!("no codec implementation for {codec_id:?}")))?;
         let layout = legacy_plane_layout(descriptor.layout);
         let decoded_len = usize::try_from(descriptor.length_bytes)
-            .map_err(|_| bad("plane length overflows usize"))?;
+            .map_err(|_| r.err("plane length overflows usize"))?;
         // The Source is exact, so every plane decodes to its descriptor's
         // length. The codec stops at that length, so a corrupt payload cannot
         // allocate past it.
@@ -434,7 +505,7 @@ fn decode_body(
             decoded_len,
         )?;
         if bytes.len() != decoded_len {
-            return Err(bad(&format!(
+            return Err(r.err(format_args!(
                 "plane decoded to {} bytes, chain says {decoded_len}",
                 bytes.len()
             )));
@@ -442,7 +513,7 @@ fn decode_body(
         if let Some(expected) = crc
             && crc32fast::hash(&bytes) != expected
         {
-            return Err(bad("plane CRC mismatch"));
+            return Err(r.err("plane CRC mismatch"));
         }
         terminal_planes.push(Plane {
             bytes: Arc::from(bytes.into_boxed_slice()),
@@ -456,7 +527,7 @@ fn decode_body(
     };
     let source = inverse_chain(&chain, &ctx)?;
     if source.bytes.len() as u64 != orig_size {
-        return Err(bad(&format!(
+        return Err(r.err(format_args!(
             "decoded {} bytes, header says {orig_size}",
             source.bytes.len()
         )));
@@ -464,74 +535,11 @@ fn decode_body(
     Ok(source.bytes.as_ref().to_vec())
 }
 
-fn bad(msg: &str) -> PtwmCoreError {
-    PtwmCoreError::InvalidContainer(format!("compact frame: {msg}"))
-}
-
-fn write_varint(out: &mut Vec<u8>, mut v: u64) {
-    while v >= 0x80 {
-        out.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
-
-struct Reader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], PtwmCoreError> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .filter(|&e| e <= self.buf.len())
-            .ok_or_else(|| bad("truncated"))?;
-        let s = &self.buf[self.pos..end];
-        self.pos = end;
-        Ok(s)
-    }
-
-    fn u8(&mut self) -> Result<u8, PtwmCoreError> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn rest(&self) -> &'a [u8] {
-        &self.buf[self.pos..]
-    }
-
-    fn varint(&mut self) -> Result<u64, PtwmCoreError> {
-        let mut v: u64 = 0;
-        for i in 0..10 {
-            let b = self.u8()?;
-            let bits = u64::from(b & 0x7F);
-            if i == 9 && b > 1 {
-                return Err(bad("varint overflows u64"));
-            }
-            v |= bits << (7 * i);
-            if b & 0x80 == 0 {
-                return Ok(v);
-            }
-        }
-        Err(bad("varint overflows u64"))
-    }
-
-    /// A varint used as a byte length; must fit in the remaining buffer.
-    fn len_varint(&mut self) -> Result<usize, PtwmCoreError> {
-        let v = self.varint()?;
-        let remaining = (self.buf.len() - self.pos) as u64;
-        if v > remaining {
-            return Err(bad("length exceeds remaining bytes"));
-        }
-        Ok(v as usize)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chain::graph::{ChainEdge, ChainNode, TerminalRef};
+    use crate::transforms::op::OpId;
     use crate::types::role::Role;
 
     const FLAGS_AT: usize = MAGIC_COMPACT.len();
@@ -793,14 +801,273 @@ mod tests {
         }
     }
 
+    /// Source(fp32, bound) → BitReorderIeee32 → ByteSplit(4), the
+    /// production fp32 split chain.
+    fn fp32_chain(shape: &[u64]) -> Chain {
+        let mut terminals: Vec<TerminalRef> = (0..3)
+            .map(|i| TerminalRef {
+                node_idx: 2,
+                output_idx: i,
+                role: Role::MantissaByte { index: i, of: 4 },
+            })
+            .collect();
+        terminals.push(TerminalRef {
+            node_idx: 2,
+            output_idx: 3,
+            role: Role::ExponentByte,
+        });
+        let spine = |i: u8| ChainEdge {
+            src_node: i,
+            src_output_idx: 0,
+            dst_node: i + 1,
+            dst_input_idx: 0,
+            role_override: None,
+            vendor_bytes: Vec::new(),
+        };
+        Chain {
+            nodes: vec![
+                ChainNode {
+                    op: OpId::Source,
+                    params: bound_source_params(shape, 1).unwrap(),
+                },
+                ChainNode {
+                    op: OpId::BitReorderIeee32,
+                    params: Vec::new(),
+                },
+                ChainNode {
+                    op: OpId::ByteSplit,
+                    params: vec![4],
+                },
+            ],
+            edges: vec![spine(0), spine(1)],
+            terminals,
+        }
+    }
+
+    fn fp32_raw(n: usize) -> Vec<u8> {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..n)
+            .flat_map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                // Normal-ish magnitudes: a narrow exponent range.
+                let v = ((x >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 4.0;
+                v.to_le_bytes()
+            })
+            .collect()
+    }
+
+    fn fp32_input<'a>(raw: &'a [u8], shape: &[u64]) -> InputTensor<'a> {
+        InputTensor {
+            name: "_".into(),
+            candidate_chains: vec![fp32_chain(shape)],
+            dtype_code: 1,
+            input_format: 1,
+            raw_bytes: raw,
+            shape: Some(shape.to_vec()),
+            dtype_name: Some("float32".into()),
+            delta_reference_blake3: None,
+        }
+    }
+
+    /// Byte offset where the frame body starts.
+    fn body_start(blob: &[u8]) -> usize {
+        let mut r = Cursor::new(blob, "test");
+        read_header(&mut r).unwrap();
+        r.pos()
+    }
+
+    /// Byte offset of the first plane head (after the chain).
+    fn planes_start(blob: &[u8]) -> usize {
+        let mut r = Cursor::new(blob, "test");
+        let h = read_header(&mut r).unwrap();
+        let bound = bound_source_params(h.shape.as_deref().unwrap_or(&[]), h.dtype_code);
+        let bound = h.shape.as_ref().and(bound);
+        read_chain_compact(&mut r, bound.as_deref(), op_from_wire_ref).unwrap();
+        r.pos()
+    }
+
     #[test]
-    fn varint_round_trips() {
-        for v in [0u64, 1, 127, 128, 300, u32::MAX as u64, u64::MAX] {
-            let mut out = Vec::new();
-            write_varint(&mut out, v);
-            let mut r = Reader { buf: &out, pos: 0 };
-            assert_eq!(r.varint().unwrap(), v);
-            assert_eq!(r.pos, out.len());
+    fn fp32_frame_binds_source_and_stays_small() {
+        let raw = fp32_raw(4096);
+        for (h, c) in [(true, true), (false, false)] {
+            let blob = compress_compact(&fp32_input(&raw, &[64, 64]), &opts(h, c))
+                .unwrap()
+                .unwrap();
+            let flags = blob[FLAGS_AT];
+            assert_eq!(flags & (FLAG_STORED | FLAG_SIZE), 0, "{flags:#04x}");
+            let t = decode_compact(&blob).unwrap();
+            assert_eq!(t.raw, raw);
+            assert_eq!(t.shape, Some(vec![64, 64]));
+            assert_eq!(t.dtype_name.as_deref(), Some("float32"));
+            let overhead = blob.len() as u64 - t.payload_len;
+            // magic 5, flags 1, dtype 1, format 1, shape 3, chain 19,
+            // 4 plane heads, 3 payload lengths; plus hash 8 and 4 CRCs.
+            let limit = if h { 33 + 8 + 4 + 16 + 8 } else { 33 + 4 + 8 };
+            assert!(
+                overhead <= limit,
+                "overhead {overhead} > {limit} (hash {h})"
+            );
+            // The Source dims are not stored.
+            let dims: Vec<u8> = [&64u32.to_le_bytes()[..], &64u32.to_le_bytes()].concat();
+            assert!(!blob.windows(8).any(|w| w == dims.as_slice()));
+        }
+        // Chains for other shapes encode to the same bytes.
+        let raw2 = fp32_raw(1000);
+        let a = compress_compact(&fp32_input(&raw, &[64, 64]), &opts(false, false))
+            .unwrap()
+            .unwrap();
+        let b = compress_compact(&fp32_input(&raw2, &[10, 100]), &opts(false, false))
+            .unwrap()
+            .unwrap();
+        let chain = |blob: &[u8]| blob[body_start(blob)..planes_start(blob)].to_vec();
+        assert_eq!(chain(&a), chain(&b));
+    }
+
+    #[test]
+    fn bound_source_needs_the_frame_shape() {
+        let raw = fp32_raw(256);
+        let blob = compress_compact(&fp32_input(&raw, &[256]), &opts(false, false))
+            .unwrap()
+            .unwrap();
+        // magic, flags, dtype 1, format 1, shape (1, 256 = 0x80 0x02), body.
+        assert_eq!(
+            &blob[FLAGS_AT..FLAGS_AT + 7],
+            &[FLAG_SHAPE, 1, 1, 1, 0x80, 0x02, 3]
+        );
+        // The same body in a frame without a shape: the size is explicit and
+        // the bound Source has nothing to bind to.
+        let mut b = blob[..FLAGS_AT].to_vec();
+        b.extend_from_slice(&[FLAG_SIZE, 1, 1]);
+        write_varint(&mut b, raw.len() as u64);
+        b.extend_from_slice(&blob[FLAGS_AT + 6..]);
+        let err = decode_compact(&b).unwrap_err().to_string();
+        assert!(err.contains("bound Source"), "{err}");
+    }
+
+    #[test]
+    fn orig_size_is_stored_only_when_the_shape_does_not_give_it() {
+        // A byte count the shape does not give: stored.
+        let raw = vec![3u8; 64];
+        let mut inp = input(&raw, Some(vec![10]), Some("float32"));
+        inp.dtype_code = 1;
+        let blob = compress_compact(&inp, &opts(true, true)).unwrap().unwrap();
+        assert_ne!(blob[FLAGS_AT] & FLAG_SIZE, 0);
+        let t = decode_compact(&blob).unwrap();
+        assert_eq!((t.raw, t.shape), (raw.clone(), Some(vec![10])));
+
+        // Packed fp4 and 0-d tensors derive it.
+        for (shape, code, name, len) in [
+            (vec![16u64], 31u16, "float4_e2m1fn_x2", 16usize),
+            (vec![], 1, "float32", 4),
+            (vec![0, 7], 6, "bfloat16", 0),
+        ] {
+            let raw = vec![0x11u8; len];
+            let mut inp = input(&raw, Some(shape.clone()), Some(name));
+            inp.dtype_code = code;
+            let blob = compress_compact(&inp, &opts(true, false)).unwrap().unwrap();
+            assert_eq!(blob[FLAGS_AT] & FLAG_SIZE, 0, "{shape:?}");
+            let t = decode_compact(&blob).unwrap();
+            assert_eq!((t.raw, t.shape), (raw, Some(shape)));
+        }
+    }
+
+    #[test]
+    fn non_canonical_headers_are_rejected() {
+        let raw = fp32_raw(256);
+        let blob = compress_compact(&fp32_input(&raw, &[256]), &opts(false, false))
+            .unwrap()
+            .unwrap();
+        let rest = &blob[FLAGS_AT + 6..];
+        let frame = |head: &[u8]| [&MAGIC_COMPACT[..], head, rest].concat();
+        let check = |head: &[u8], needle: &str| {
+            let err = decode_compact(&frame(head)).unwrap_err().to_string();
+            assert!(err.contains(needle), "{head:02x?}: {err}");
+        };
+        // The original decodes.
+        decode_compact(&frame(&[FLAG_SHAPE, 1, 1, 1, 0x80, 0x02])).unwrap();
+        // orig_size stored although the shape gives it.
+        check(
+            &[FLAG_SHAPE | FLAG_SIZE, 1, 1, 0x80, 0x08, 1, 0x80, 0x02],
+            "equals the size",
+        );
+        // Neither orig_size nor shape.
+        check(&[0, 1, 1], "no orig_size");
+        // Dtype name equal to the canonical name.
+        let mut h = vec![FLAG_SHAPE | FLAG_DTYPE_NAME, 1, 1, 1, 0x80, 0x02, 7];
+        h.extend_from_slice(b"float32");
+        check(&h, "canonical name");
+        // Shape without a name for a dtype code with no canonical name.
+        check(
+            &[
+                FLAG_SHAPE | FLAG_SIZE,
+                0xC8,
+                0x01,
+                1,
+                0x80,
+                0x08,
+                1,
+                0x80,
+                0x02,
+            ],
+            "dtype name",
+        );
+        // Non-minimal varints.
+        check(&[FLAG_SHAPE, 0x81, 0x00, 1, 1, 0x80, 0x02], "non-minimal");
+        check(&[FLAG_SHAPE, 1, 1, 0x81, 0x00, 0x80, 0x02], "non-minimal");
+        // dtype_code above u16, unknown flag bit.
+        check(&[FLAG_SIZE, 0x80, 0x80, 0x04, 1, 0x80, 0x08], "dtype_code");
+        check(&[FLAG_SHAPE | 0x80, 1, 1, 1, 0x80, 0x02], "unknown flag");
+        // ndim above 64.
+        check(&[FLAG_SHAPE, 1, 1, 65], "ndim");
+    }
+
+    #[test]
+    fn plane_state_codes_are_canonical() {
+        let raw: Vec<u8> = (0..4096u32).map(|i| (i % 7) as u8).collect();
+        let mut o = opts(false, false);
+        o.forced_codec = Some(CodecId::Zstd);
+        let blob = compress_compact(&input(&raw, None, None), &o)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode_compact(&blob).unwrap().raw, raw);
+        let at = planes_start(&blob);
+        // Zstd carries an empty version-0 inline state: state code 2.
+        assert_eq!(blob[at], (4 << 2) | 2);
+        let with_head = |head: &[u8]| [&blob[..at], head, &blob[at + 1..]].concat();
+        // The same plane with state code 0 decodes (decode treats both alike).
+        assert_eq!(decode_compact(&with_head(&[4 << 2])).unwrap().raw, raw);
+        // State code 1 with an empty version-0 state is non-canonical.
+        let err = decode_compact(&with_head(&[(4 << 2) | 1, 0, 0]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("state code 2"), "{err}");
+        let err = decode_compact(&with_head(&[(4 << 2) | 3]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown state code"), "{err}");
+    }
+
+    #[test]
+    fn last_plane_runs_to_the_end_of_the_frame() {
+        let raw = fp32_raw(1024);
+        let blob = compress_compact(&fp32_input(&raw, &[1024]), &opts(true, true))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode_compact(&blob).unwrap().raw, raw);
+        // Every truncation fails: a short last payload fails its codec, CRC
+        // or the payload hash.
+        for cut in 0..blob.len() {
+            assert!(decode_compact(&blob[..cut]).is_err(), "cut at {cut}");
+        }
+        // A byte appended to the frame becomes part of the last payload.
+        // Whether that fails depends on the codec; it must never return
+        // other data.
+        let mut longer = blob.clone();
+        longer.push(0);
+        if let Ok(t) = decode_compact(&longer) {
+            assert_eq!(t.raw, raw);
         }
     }
 }

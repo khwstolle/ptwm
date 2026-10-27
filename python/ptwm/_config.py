@@ -46,7 +46,7 @@ class Framing(Enum):
     r"""Byte layout of a single-tensor :meth:`Compressor.compress` output.
 
     ``COMPACT`` writes a compact single-tensor frame (magic ``\x89PTWS``)
-    with a fixed cost of about 10 to 130 bytes, and stores the raw bytes when
+    with a fixed cost of about 10 to 70 bytes, and stores the raw bytes when
     no codec makes them smaller. It falls back to ``CONTAINER`` when the
     tensor cannot use the frame (streaming, or a plane that selects shared
     codec state). ``CONTAINER`` writes a full ``.ptwm`` container (magic

@@ -48,6 +48,7 @@ pub mod transcode;
 pub mod transforms;
 pub mod trust;
 pub mod types;
+pub mod varint;
 
 pub use dtype::{Dtype, PreprocessingModes};
 pub use error::PtwmCoreError;

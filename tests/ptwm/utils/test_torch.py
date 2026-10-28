@@ -341,3 +341,30 @@ def test_enum_from_dtype_name_fallback() -> None:
     assert DType.from_dtype(_FakeNpDtype("float8_e5m2")) is DType.FLOAT8_E5M2
     # Unknown name still falls through.
     assert DType.from_dtype(_FakeNpDtype("not_a_dtype")) is DType.NONE
+
+
+@pytest.mark.parametrize(
+    ("name", "member"),
+    [
+        ("float64", DType.FLOAT64),
+        ("int64", DType.INT64),
+        ("float32", DType.FLOAT32),
+        ("float16", DType.FLOAT16),
+        ("int32", DType.INT32),
+        ("int16", DType.INT16),
+        ("int8", DType.INT8),
+        ("uint8", DType.UINT8),
+        ("uint64", DType.UINT64),
+        ("complex64", DType.COMPLEX64),
+        ("complex128", DType.COMPLEX128),
+        ("bool", DType.BOOL),
+    ],
+)
+def test_from_dtype_maps_numpy_dtype_instances(name: str, member: DType) -> None:
+    """``np.dtype`` instances map like their scalar types.
+
+    ``np.dtype("float64") == None`` and ``np.dtype("int64") == int`` are
+    true in numpy, so these once mapped to NONE and INT32.
+    """
+    assert DType.from_dtype(np.dtype(name)) is member
+    assert DType.from_dtype(np.dtype(name).type) is member

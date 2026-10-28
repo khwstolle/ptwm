@@ -19,7 +19,7 @@ from ptwm import (
     Framing,
     _rust,
 )
-from ptwm._exceptions import Error, HeaderParseError
+from ptwm._exceptions import Error, HeaderParseError, InvalidDTypeError
 
 COMPACT = b"\x89PTWS"
 # A full container has the default (compact) layout unless the config pins
@@ -116,6 +116,25 @@ def test_numpy_round_trip() -> None:
     assert isinstance(back, np.ndarray)
     assert back.shape == a.shape
     assert np.array_equal(back, a)
+
+
+@pytest.mark.parametrize("dtype", [np.float64, np.int64, np.float32, np.int32])
+@pytest.mark.parametrize("framing", [Framing.COMPACT, Framing.CONTAINER])
+def test_numpy_round_trip_keeps_64_bit_dtypes(dtype, framing: Framing) -> None:
+    """float64 and int64 arrays once stored dtype code 0 and INT32."""
+    a = np.arange(6, dtype=dtype).reshape(2, 3)
+    cfg = CompressionConfig(input_format=Format.NUMPY, framing=framing)
+    out = Decompressor().decompress(Compressor(cfg).compress(a))
+    assert isinstance(out, np.ndarray)
+    assert out.dtype == a.dtype
+    np.testing.assert_array_equal(out, a)
+
+
+def test_numpy_dtype_without_code_is_rejected() -> None:
+    """An array whose dtype has no code fails before anything is written."""
+    a = np.zeros(4, dtype="datetime64[s]")
+    with pytest.raises(InvalidDTypeError, match="unsupported dtype"):
+        Compressor(CompressionConfig(input_format=Format.NUMPY)).compress(a)
 
 
 def test_byte_round_trip() -> None:

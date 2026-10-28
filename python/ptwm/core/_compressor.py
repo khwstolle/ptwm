@@ -5,7 +5,7 @@ import torch
 
 from .. import _rust
 from .._config import CompressionConfig, Format, Framing, Method
-from .._exceptions import CompressionMethodNotSupportedError
+from .._exceptions import CompressionMethodNotSupportedError, InvalidDTypeError
 from ..delta import encode as delta_encode
 from ..preprocessing._chains import (
     ClassifierRole,
@@ -122,6 +122,11 @@ class Compressor:
             shape: tuple[int, ...] | None = None
         else:
             dtype_code = DType.from_dtype(data.dtype).code
+            if dtype_code == DType.NONE.code:
+                # Code 0 has no dtype mapping, so the frame could not be
+                # decoded back to a tensor or array.
+                msg = f"unsupported dtype {data.dtype} for {self.config.input_format}"
+                raise InvalidDTypeError(msg)
             shape = tuple(data.shape)
         ba_bytes = _to_raw_bytes(data)
 

@@ -581,13 +581,13 @@ fn decode_compact<'py>(
 }
 
 // The functions below open a temporary `ContainerHandle` per call (see
-// `handle.rs`): `blob` is any buffer, borrowed when read-only and
-// C-contiguous. Open one `ContainerHandle` instead for several queries.
+// `handle.rs`): `blob` is any buffer, borrowed when its memory cannot
+// change (see `ContainerHandle::open`) and copied otherwise. Open one `ContainerHandle` instead for several queries.
 
 /// Decode a single tensor from a container blob (either layout).
 ///
 /// `blob` is the full container (any buffer; ``bytes`` is borrowed without a
-/// copy). `name` is the tensor name string. Returns the raw decompressed
+/// copy, other buffers may be copied). `name` is the tensor name string. Returns the raw decompressed
 /// ``bytes`` via the chain-based decode path.
 ///
 /// `skip_missing` — when ``True`` open the container even if non-builtin
@@ -602,7 +602,7 @@ fn decode_compact<'py>(
 #[pyo3(signature = (blob, name, skip_missing = false))]
 fn decode_tensor<'py>(
     py: Python<'py>,
-    blob: PyBuffer<u8>,
+    blob: &Bound<'_, PyAny>,
     name: &str,
     skip_missing: bool,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
@@ -618,7 +618,7 @@ fn decode_tensor<'py>(
 #[pyo3(signature = (blob, skip_missing = false))]
 fn decode_model<'py>(
     py: Python<'py>,
-    blob: PyBuffer<u8>,
+    blob: &Bound<'_, PyAny>,
     skip_missing: bool,
 ) -> PyResult<Vec<(String, Bound<'py, pyo3::types::PyBytes>)>> {
     ContainerHandle::open(py, blob, skip_missing)?.decode_all(py)
@@ -632,7 +632,7 @@ fn decode_model<'py>(
 #[pyo3(signature = (blob, name, skip_missing = false))]
 fn decode_tensor_info(
     py: Python<'_>,
-    blob: PyBuffer<u8>,
+    blob: &Bound<'_, PyAny>,
     name: &str,
     skip_missing: bool,
 ) -> PyResult<Option<handle::TensorInfo>> {
@@ -646,7 +646,7 @@ fn decode_tensor_info(
 #[pyo3(signature = (blob, name, skip_missing = false))]
 fn decode_tensor_delta_hash<'py>(
     py: Python<'py>,
-    blob: PyBuffer<u8>,
+    blob: &Bound<'_, PyAny>,
     name: &str,
     skip_missing: bool,
 ) -> PyResult<Option<Bound<'py, pyo3::types::PyBytes>>> {
@@ -659,7 +659,7 @@ fn decode_tensor_delta_hash<'py>(
 #[pyo3(signature = (blob, skip_missing = false))]
 fn list_tensor_names(
     py: Python<'_>,
-    blob: PyBuffer<u8>,
+    blob: &Bound<'_, PyAny>,
     skip_missing: bool,
 ) -> PyResult<Vec<String>> {
     ContainerHandle::open(py, blob, skip_missing)?.names_vec(py)
@@ -673,7 +673,7 @@ fn list_tensor_names(
 #[pyo3(signature = (blob, name, skip_missing = false))]
 fn decode_tensor_shape(
     py: Python<'_>,
-    blob: PyBuffer<u8>,
+    blob: &Bound<'_, PyAny>,
     name: &str,
     skip_missing: bool,
 ) -> PyResult<Option<(Vec<u64>, String)>> {
@@ -689,7 +689,7 @@ fn decode_tensor_shape(
 #[pyo3(signature = (blob, skip_missing = false))]
 fn list_plane_summaries(
     py: Python<'_>,
-    blob: PyBuffer<u8>,
+    blob: &Bound<'_, PyAny>,
     skip_missing: bool,
 ) -> PyResult<Vec<handle::PlaneSummary>> {
     ContainerHandle::open(py, blob, skip_missing)?.plane_summary_rows(py)

@@ -14,8 +14,8 @@ from .._config import ContainerLayout, container_layout_name
 from ._errors import translate_errors
 
 Buffer = bytes | bytearray | memoryview
-"""A byte buffer the container functions accept. ``bytes`` and read-only
-buffers are borrowed without a copy; writable ones are copied once."""
+"""A byte buffer the container functions accept. ``bytes`` and a read-only
+``mmap`` are borrowed without a copy; every other buffer is copied once."""
 
 __all__ = [
     "ContainerHandle",
@@ -384,9 +384,13 @@ class ContainerHandle:
     ...) when a container is queried more than once: each free function
     opens the container again.
 
-    ``blob`` is any buffer. ``bytes``, a read-only ``memoryview`` and a
-    read-only ``mmap`` are borrowed without a copy (the handle keeps them
-    alive); a writable buffer such as ``bytearray`` is copied once.
+    ``blob`` is any buffer. ``bytes`` and an ``mmap`` opened with
+    ``ACCESS_READ`` (directly or through a ``memoryview``) are borrowed
+    without a copy; the handle keeps them alive. Every other buffer is
+    copied once, including a read-only view of mutable memory such as
+    ``memoryview(bytearray).toreadonly()``, because its owner could still
+    change it. The file behind a borrowed ``mmap`` must not change while
+    the handle exists.
     ``skip_missing`` opens the container even when non-builtin extensions it
     references are not installed; tensors that need them fail at decode.
 

@@ -21,7 +21,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
-from .._config import ContainerLayout
+from .._config import ContainerLayout, container_layout_name
 from ..sharding import compress_ptwm_blob, plan_shards
 from ._common import (
     ExplodedModel,
@@ -80,8 +80,11 @@ def write_webdataset(
     via :func:`ptwm.sharding.plan_shards` so a tensor never straddles a shard.
     ``container_layout`` (``"legacy"`` or ``"compact"``) selects the
     container the tensors are compressed into; the registry manifest records
-    it, and readers rebuild each tensor in that layout.
+    it, and readers rebuild each tensor in that layout. An unknown
+    ``container_layout`` raises :class:`ValueError` before ``out_dir`` is
+    created.
     """
+    container_layout = container_layout_name(container_layout)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 

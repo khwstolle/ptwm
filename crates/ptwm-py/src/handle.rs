@@ -6,16 +6,24 @@
 //! free functions in `lib.rs` (`decode_tensor`, `list_tensor_names`, ...)
 //! open a temporary handle per call.
 //!
-//! A read-only, C-contiguous buffer (``bytes``, a read-only ``memoryview`` or
-//! ``mmap``) is borrowed without a copy: the handle holds the buffer export,
-//! which keeps the object alive and its memory pinned. A writable or
-//! non-contiguous buffer (``bytearray``, a writable ``mmap`` or numpy array)
-//! is copied once, because the caller could change it while the reader
-//! holds slices into it.
+//! A buffer is borrowed without a copy only when its memory cannot change
+//! while the handle exists: a C-contiguous export of ``bytes``, or of an
+//! ``mmap`` opened with ``ACCESS_READ``, directly or through any chain of
+//! ``memoryview`` objects. The handle holds the buffer export, which keeps
+//! the object alive and its memory pinned. Every other buffer is copied
+//! once, including read-only views of mutable objects (for example
+//! ``memoryview(bytearray).toreadonly()`` or a numpy array with
+//! ``writeable=False`` over a writable base): a read-only export only says
+//! that the export cannot be written through, not that the owner cannot
+//! write the memory, and the reader runs with the GIL released.
+//!
+//! A read-only ``mmap`` maps a file with ``MAP_SHARED``. Another process (or
+//! a second, writable mapping of the same file) can still change the file;
+//! the caller must not modify a file while a handle borrows it.
 
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyMemoryView};
 
 use ptwm_core::PtwmCoreError;
 use ptwm_core::container::{ContainerLayout, ContainerReader};
@@ -31,8 +39,9 @@ pub type PlaneSummary = (String, u32, u8, u16, u8, u64);
 
 /// The memory a handle's reader points into.
 enum Backing {
-    /// A read-only, C-contiguous buffer export. Holding it keeps the
-    /// exporting object alive and its memory unchanged.
+    /// A C-contiguous export of immutable memory (see
+    /// [`immutable_backing`]). Holding it keeps the exporting object alive
+    /// and its memory pinned.
     Borrowed(#[allow(dead_code)] PyBuffer<u8>),
     /// A private copy of a buffer that could change under the reader.
     Owned(#[allow(dead_code)] Box<[u8]>),
@@ -56,18 +65,60 @@ fn runtime_err(e: PtwmCoreError) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
 }
 
+/// Whether the memory behind `obj`'s buffer cannot change for as long as
+/// an export of it is held.
+///
+/// True for an exact ``bytes`` object and for an exact ``mmap.mmap`` whose
+/// own export is read-only (``ACCESS_READ``), reached directly or through
+/// ``memoryview.obj`` links. Everything else (``bytearray``, writable
+/// ``mmap``, numpy arrays, subclasses that could override the buffer
+/// protocol, memoryviews without an owner object) is treated as mutable.
+fn immutable_backing(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let py = obj.py();
+    let mut cur = obj.clone();
+    // `memoryview.obj` of a memoryview over a memoryview names the base
+    // object, so the loop ends after one step in practice; the bound guards
+    // against an unexpected cycle.
+    for _ in 0..16 {
+        if cur.is_exact_instance_of::<PyMemoryView>() {
+            let base = cur.getattr("obj")?;
+            if base.is_none() {
+                return Ok(false);
+            }
+            cur = base;
+            continue;
+        }
+        if cur.is_exact_instance_of::<PyBytes>() {
+            return Ok(true);
+        }
+        let mmap_type = py.import("mmap")?.getattr("mmap")?;
+        if cur.get_type().is(&mmap_type) {
+            return Ok(PyBuffer::<u8>::get(&cur)?.readonly());
+        }
+        return Ok(false);
+    }
+    Ok(false)
+}
+
 impl ContainerHandle {
-    /// Open `buffer`, borrowing it when it is read-only and C-contiguous.
-    pub fn open(py: Python<'_>, buffer: PyBuffer<u8>, skip_missing: bool) -> PyResult<Self> {
-        let (bytes, backing): (&[u8], Backing) = if buffer.readonly() && buffer.is_c_contiguous() {
+    /// Open the buffer `obj` exports. The buffer is borrowed when its memory
+    /// cannot change (see [`immutable_backing`]) and is C-contiguous;
+    /// otherwise it is copied once.
+    pub fn open(py: Python<'_>, obj: &Bound<'_, PyAny>, skip_missing: bool) -> PyResult<Self> {
+        let buffer = PyBuffer::<u8>::get(obj)?;
+        let borrow = buffer.is_c_contiguous() && immutable_backing(obj)?;
+        let (bytes, backing): (&[u8], Backing) = if borrow {
             let len = buffer.len_bytes();
             let bytes: &[u8] = if len == 0 {
                 &[]
             } else {
                 // SAFETY: the buffer is C-contiguous and `len` bytes long.
-                // The export stays alive in `Backing::Borrowed` for as
-                // long as the reader, and a read-only export cannot be
-                // written through.
+                // The export stays alive in `Backing::Borrowed` for as long
+                // as the reader, which keeps the owner alive and (for
+                // `mmap`) prevents it from being closed or resized. The
+                // owner is `bytes` or a read-only `mmap`, so no Python code
+                // can write the memory while the reader holds slices into
+                // it, even with the GIL released.
                 unsafe { std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, len) }
             };
             (bytes, Backing::Borrowed(buffer))
@@ -181,7 +232,7 @@ impl ContainerHandle {
 impl ContainerHandle {
     #[new]
     #[pyo3(signature = (buffer, skip_missing = false))]
-    fn py_new(py: Python<'_>, buffer: PyBuffer<u8>, skip_missing: bool) -> PyResult<Self> {
+    fn py_new(py: Python<'_>, buffer: &Bound<'_, PyAny>, skip_missing: bool) -> PyResult<Self> {
         Self::open(py, buffer, skip_missing)
     }
 

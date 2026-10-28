@@ -55,9 +55,18 @@ def test_compress_ptwm_blob_honours_the_layout(tmp_path, store_tensors, layout):
     )
 
 
-def test_unknown_container_layout_is_rejected(store_tensors):
-    with pytest.raises(Error, match="container_layout"):
+def test_unknown_container_layout_is_rejected(store_tensors, tmp_path):
+    # Every public writer raises ValueError, before touching the filesystem.
+    with pytest.raises(ValueError, match="container_layout"):
         compress_ptwm_blob(store_tensors, container_layout="bogus")
+    out = tmp_path / "x.ptwm"
+    with pytest.raises(ValueError, match="container_layout"):
+        write_ptwm_shard(out, store_tensors, container_layout="bogus")
+    assert not out.exists()
+    out_dir = tmp_path / "wds"
+    with pytest.raises(ValueError, match="container_layout"):
+        write_webdataset(out_dir, store_tensors, container_layout="bogus")
+    assert not out_dir.exists()
 
 
 def test_compact_manifest_form_and_identity(store_tensors):

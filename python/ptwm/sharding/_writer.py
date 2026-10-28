@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import _rust
-from .._config import ContainerLayout
+from .._config import ContainerLayout, container_layout_name
 from ..preprocessing._chains import (
     ClassifierRole,
     build_chain_blobs,
@@ -52,8 +52,10 @@ def compress_ptwm_blob(
     ``method_hint``: 1=HUFFMAN, 2=ZSTD, 3=MICROSCALE, 4=RANS, 5=IDENTITY.
     ``container_layout``: ``"legacy"`` (``\x89PTWM``, readable by every
     release) or ``"compact"`` (``\x89PTWC``, v1.2 and later), as a string or
-    :class:`ptwm.ContainerLayout`. Other values raise :class:`ptwm.Error`.
+    :class:`ptwm.ContainerLayout`. Other values raise :class:`ValueError`
+    before anything is compressed.
     """
+    layout = container_layout_name(container_layout)
     records = []
     auto_chains: list[list[bytes]] = []
     for name, raw, dtype_in, shape in tensors:
@@ -82,7 +84,7 @@ def compress_ptwm_blob(
         emit_plane_crc,
         method_hint,
         streaming_chunk,
-        container_layout=container_layout,
+        container_layout=layout,
     )
 
 
@@ -99,7 +101,9 @@ def write_ptwm_shard(
 ) -> None:
     """Write a single ``.ptwm`` container holding ``tensors``.
 
-    See :func:`compress_ptwm_blob` for the parameter semantics.
+    See :func:`compress_ptwm_blob` for the parameter semantics. An unknown
+    ``container_layout`` raises :class:`ValueError` before ``out_path`` is
+    written.
     """
     blob = compress_ptwm_blob(
         tensors,

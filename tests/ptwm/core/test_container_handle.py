@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import mmap
 
+import numpy as np
 import pytest
 import torch
 from ptwm import (
@@ -284,6 +285,62 @@ def test_handle_borrows_read_only_buffers_and_copies_writable_ones(tmp_path) -> 
         assert h.zero_copy
         assert h.decode("beta") == expected
         del h
+
+
+def test_handle_copies_read_only_views_of_mutable_memory(tmp_path) -> None:
+    # A read-only export does not make the owner immutable: the handle must
+    # copy, so later writes to the owner cannot reach the reader.
+    blob = _blob("compact")
+    expected = _rust.ContainerHandle(blob).decode("beta")
+
+    ba = bytearray(blob)
+    h = _rust.ContainerHandle(memoryview(ba).toreadonly())
+    assert not h.zero_copy
+    ba[:] = bytes(len(ba))
+    assert h.decode("beta") == expected
+    assert "beta" in h.names()
+
+    arr = np.frombuffer(bytearray(blob), dtype=np.uint8)
+    view = arr.view()
+    view.flags.writeable = False
+    h = _rust.ContainerHandle(view)
+    assert not h.zero_copy
+    arr[:] = 0
+    assert h.decode("beta") == expected
+
+    # Views of immutable memory are still borrowed, through any chain of
+    # memoryviews.
+    assert _rust.ContainerHandle(memoryview(memoryview(blob))).zero_copy
+    assert _rust.ContainerHandle(memoryview(blob).toreadonly()).zero_copy
+
+    # A writable mmap is copied, also behind a read-only memoryview.
+    path = tmp_path / "w.ptwm"
+    path.write_bytes(blob)
+    with path.open("r+b") as fh, mmap.mmap(fh.fileno(), 0) as mm:
+        h = _rust.ContainerHandle(memoryview(mm).toreadonly())
+        assert not h.zero_copy
+        mm[:] = bytes(len(mm))
+        assert h.decode("beta") == expected
+        del h
+
+    # A read-only mmap behind a memoryview is borrowed.
+    path.write_bytes(blob)
+    with (
+        path.open("rb") as fh,
+        mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm,
+        memoryview(mm) as mv,
+    ):
+        h = _rust.ContainerHandle(mv)
+        assert h.zero_copy
+        assert h.decode("beta") == expected
+        del h
+
+
+def test_free_functions_copy_read_only_views_of_mutable_memory() -> None:
+    blob = _blob("legacy")
+    view = memoryview(bytearray(blob)).toreadonly()
+    assert _rust.list_tensor_names(view) == list(NAMES)
+    assert _rust.decode_tensor(view, "beta") == _rust.decode_tensor(blob, "beta")
 
 
 def test_handle_keeps_the_buffer_alive() -> None:

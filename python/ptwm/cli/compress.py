@@ -1135,20 +1135,21 @@ def _compress_safetensors_integration(args, mode: str) -> int:  # noqa: ANN001
         )
         out_dir = out_path
         out_dir.mkdir(parents=True, exist_ok=True)
-        is_existing_non_empty = any(out_dir.iterdir())
+        existing = [out_dir] if any(out_dir.iterdir()) else []
     else:
         out_path = (
             Path(args.out) if args.out else input_path.with_suffix(".ptwm.safetensors")
         )
         # The shards are written to a staging directory first and moved
-        # into place afterwards (see `_finish_mode_b`).
+        # into place afterwards (see `_finish_mode_b`). One shard becomes
+        # `out_path`; several become the directory `out_path` without its
+        # last suffix. Either may be replaced, so the guard covers both.
         out_dir = out_path.parent / (out_path.stem + "__staging")
-        is_existing_non_empty = out_path.exists()
+        existing = [p for p in (out_path, out_path.with_suffix("")) if p.exists()]
 
-    if not args.force and is_existing_non_empty:
-        user_input = (
-            input(f"{out_path} already exists; overwrite (y/n)? ").strip().lower()
-        )
+    if not args.force and existing:
+        shown = " and ".join(str(p) for p in existing)
+        user_input = input(f"{shown} already exists; overwrite (y/n)? ").strip().lower()
         if user_input not in ("yes", "y"):
             return 0
 
@@ -1198,16 +1199,22 @@ def _finish_mode_b(staging: Path, out_path: Path) -> Path:
     """
     shards = sorted(staging.glob("*.safetensors"))
     if len(shards) == 1:
-        if out_path.is_dir():
-            shutil.rmtree(out_path)
+        _remove_path(out_path)
         shards[0].replace(out_path)
         shutil.rmtree(staging)
         return out_path
     final_dir = out_path.with_suffix("")
-    if final_dir.exists():
-        shutil.rmtree(final_dir)
+    _remove_path(final_dir)
     staging.rename(final_dir)
     return final_dir
+
+
+def _remove_path(path: Path) -> None:
+    """Remove ``path``, a file or a directory, if it exists."""
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
 
 
 def _resolve_compress_mode(args) -> str | None:  # noqa: ANN001

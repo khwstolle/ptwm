@@ -318,3 +318,68 @@ def test_per_tensor_shell_honours_the_layout(
     else:
         assert kinds <= {"ptws", "ptwc"}
         assert b"\x89PTWM" not in whole
+
+
+def _fake_two_shard_compress(input_path, out_dir, **_kwargs):  # noqa: ANN001, ANN003
+    """Stand-in for the integration writer that emits two mode-b shards."""
+    out_dir = Path(out_dir)
+    for i in range(2):
+        (out_dir / f"model-{i:05d}-of-00002.safetensors").write_bytes(b"shard")
+    (out_dir / "model.safetensors.index.json").write_text("{}")
+
+
+def test_mode_b_guard_covers_the_multi_shard_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without --force, an existing multi-shard output directory is not
+    replaced unless the user agrees."""
+    from ptwm import integrations  # noqa: PLC0415
+
+    src = _safetensors_file(tmp_path)
+    out = tmp_path / "m.ptwm.safetensors"
+    previous = tmp_path / "m.ptwm"
+    previous.mkdir()
+    (previous / "keep.safetensors").write_bytes(b"old")
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        integrations,
+        "compress_safetensors_file",
+        lambda *a, **k: calls.append("compress") or _fake_two_shard_compress(*a, **k),
+    )
+    prompts: list[str] = []
+    monkeypatch.setattr("builtins.input", lambda msg: prompts.append(msg) or "n")
+    handle_compress(_parse([str(src), "--mode", "b", "--out", str(out)]))
+    assert len(prompts) == 1
+    assert str(previous) in prompts[0]
+    assert calls == []
+    assert (previous / "keep.safetensors").read_bytes() == b"old"
+
+    # Agreeing replaces the directory with the new shards.
+    monkeypatch.setattr("builtins.input", lambda _msg: "y")
+    handle_compress(_parse([str(src), "--mode", "b", "--out", str(out)]))
+    assert calls == ["compress"]
+    assert not (previous / "keep.safetensors").exists()
+    assert sorted(p.name for p in previous.iterdir()) == [
+        "model-00000-of-00002.safetensors",
+        "model-00001-of-00002.safetensors",
+        "model.safetensors.index.json",
+    ]
+
+
+def test_mode_b_replaces_a_file_in_the_multi_shard_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A regular file where the shard directory goes is replaced, not a
+    NotADirectoryError after the model was compressed."""
+    from ptwm import integrations  # noqa: PLC0415
+
+    src = _safetensors_file(tmp_path)
+    (tmp_path / "out").write_bytes(b"a file")
+    monkeypatch.setattr(
+        integrations, "compress_safetensors_file", _fake_two_shard_compress
+    )
+    argv = [str(src), "--mode", "b", "--out", str(tmp_path / "out.safetensors")]
+    handle_compress(_parse([*argv, "--force"]))
+    assert (tmp_path / "out").is_dir()
+    assert not (tmp_path / "out__staging").exists()

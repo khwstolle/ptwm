@@ -994,16 +994,26 @@ pub fn compress_model<W: Write + Seek>(
 
     let mut writer = ContainerWriter::with_layout(writer, opts.container_layout)?;
     writer.set_prelude(&prelude_entries)?;
-    // Intern only the codecs the planes reference: interning every built-in
-    // codec costs about 125 B per unused entry, which dominates small files.
-    let mut used_codecs: Vec<CanonicalId> = Vec::new();
-    for cp in chosen_per_tensor.iter().flatten() {
-        let id = codec_canonical_id(cp.codec_id);
-        if !used_codecs.contains(&id) {
-            used_codecs.push(id);
+    if compact {
+        // Intern only the codecs the planes reference: interning every
+        // built-in codec costs about 125 B per unused entry, which dominates
+        // small files.
+        let mut used_codecs: Vec<CanonicalId> = Vec::new();
+        for cp in chosen_per_tensor.iter().flatten() {
+            let id = codec_canonical_id(cp.codec_id);
+            if !used_codecs.contains(&id) {
+                used_codecs.push(id);
+            }
         }
+        writer.set_chain_registry_with_codecs(registry, &used_codecs)?;
+    } else {
+        // The legacy layout keeps the v1.1 table: every built-in codec, in
+        // built-in order. A v1.1 transcoder rebuilds exactly this table when
+        // it implodes an exploded store, and copies each plane's
+        // `codec_table_idx` unchanged, so a trimmed table would make those
+        // indices name the wrong codecs.
+        writer.set_chain_registry(registry)?;
     }
-    writer.set_chain_registry_with_codecs(registry, &used_codecs)?;
 
     // Pre-compute the chunked-path payloads in parallel before the sequential
     // write loop. Otherwise encode_plane_chunked runs inside the writer's

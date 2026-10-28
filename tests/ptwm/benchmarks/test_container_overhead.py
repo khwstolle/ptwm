@@ -3,8 +3,9 @@
 The fixed bytes per single-tensor output (header, tables, framing) used to be
 about 2.7 KB, so small tensors came out larger than their input. These tests
 hold the default (compact) framing and the compact container (PTWC) to the
-limits below, keep the legacy container's Extension Table trimmed, and bound
-the per-tensor overhead of multi-tensor containers. The sweeps match
+limits below, check that the legacy container keeps the v1.1.0 Extension
+Table, and bound the per-tensor overhead of multi-tensor containers. The
+sweeps match
 ``benchmarks/container_overhead``.
 """
 
@@ -114,10 +115,11 @@ def test_tiled_rows_ratio_is_at_least_60() -> None:
 
 
 @pytest.mark.parametrize(("dname", "dtype"), DTYPES)
-def test_container_framing_floor_stays_trimmed(dname: str, dtype: torch.dtype) -> None:
-    # v1.1 wrote about 2.5 KB of non-payload bytes per single-tensor
-    # container, 2.1 KB of it unreferenced codec entries. The bound is for
-    # the legacy layout, so the layout is pinned.
+def test_legacy_container_keeps_the_v1_1_table(dname: str, dtype: torch.dtype) -> None:
+    # The legacy layout interns all 16 built-in codecs (about 2.1 KB), as
+    # v1.1.0 did: the v1.1 transcoder rebuilds that table for exploded
+    # stores. A trimmed legacy table (about 1 KB in total) broke them. The
+    # upper bound keeps the rest of the legacy overhead from growing.
     row = measure(
         make_tensor(dtype, "normal", 4096),
         Framing.CONTAINER,
@@ -125,7 +127,8 @@ def test_container_framing_floor_stays_trimmed(dname: str, dtype: torch.dtype) -
         "normal",
         ContainerLayout.LEGACY,
     )
-    assert row.non_payload < 1100, row
+    assert row.framing == "ptwm", row
+    assert 2000 < row.non_payload < 3200, row
 
 
 def test_formats_write_the_expected_magic() -> None:
@@ -249,7 +252,7 @@ def test_multi_tensor_overhead_per_tensor(
     shape_of: ShapeFn, hashes: bool, limit: int
 ) -> None:
     # 64 fp32 (64,) bias vectors (synthesis cases A and B). Measured per
-    # tensor: 83.1 B, 82.6 B and 59.1 B, against 235 B, 288 B and 211 B for
+    # tensor: 83.1 B, 82.6 B and 59.1 B, against 262 B, 317 B and 238 B for
     # the legacy layout.
     compact = measure_multi(
         "fp32", "float32", shape_of, 64, ContainerLayout.COMPACT, hashes

@@ -51,19 +51,56 @@ def test_extension_table_is_present_for_huffman_chain():
     )
 
 
-def test_extension_table_holds_only_referenced_codecs():
-    """The writer interns the chain ops plus the codecs the planes use. The
-    v1.1 layout interned all 16 built-in plane codecs, about 2 KB."""
+V1_1_PLANE_CODECS = (
+    "identity",
+    "huffman",
+    "rans",
+    "zstd",
+    "zstd_dict",
+    "fpc",
+    "tans",
+    "order1_scale_ac",
+    "arithmetic_o0",
+    "arithmetic_o0_adaptive",
+    "arithmetic_o1",
+    "per_group_codebook",
+    "context_mixing_lite",
+    "huff_llm_5bit",
+    "order1_arithmetic",
+    "neural_predictor",
+)
+
+
+def test_legacy_extension_table_holds_every_builtin_codec():
+    """The legacy writer interns the chain ops plus all 16 built-in plane
+    codecs, as v1.1.0 did, about 2 KB. The v1.1 transcoder rebuilds that
+    table for exploded stores and keeps each plane's codec index, so a
+    table with only the referenced codecs decoded there with the wrong
+    codecs. The compact layout keeps only the referenced codecs."""
     tensor = torch.full((32,), 0.5, dtype=torch.bfloat16)
-    blob = Compressor(
-        CompressionConfig(
-            input_format=Format.TORCH,
-            framing=Framing.CONTAINER,
-            container_layout=ContainerLayout.LEGACY,
-        )
-    ).compress(tensor)
+
+    def compress(layout: ContainerLayout) -> bytes:
+        return Compressor(
+            CompressionConfig(
+                input_format=Format.TORCH,
+                framing=Framing.CONTAINER,
+                container_layout=layout,
+            )
+        ).compress(tensor)
+
+    blob = compress(ContainerLayout.LEGACY)
     assert blob[:5] == b"\x89PTWM"
     table_off = int.from_bytes(blob[11:19], "little")
-    count = int.from_bytes(blob[table_off : table_off + 4], "little")
-    assert count < 16, f"extension table has {count} entries"
-    assert len(blob) < 1024, f"single-tensor container is {len(blob)} bytes"
+    table_len = int.from_bytes(blob[19:27], "little")
+    table = blob[table_off : table_off + table_len]
+    count = int.from_bytes(table[:4], "little")
+    assert count > len(V1_1_PLANE_CODECS), f"extension table has {count} entries"
+    positions = [
+        table.index(f"io.ptwm.builtin.{name}@1.1.0".encode())
+        for name in V1_1_PLANE_CODECS
+    ]
+    assert positions == sorted(positions), "codecs out of built-in order"
+
+    compact = compress(ContainerLayout.COMPACT)
+    assert compact[:5] == b"\x89PTWC"
+    assert len(compact) < 1024, f"single-tensor container is {len(compact)} bytes"

@@ -8,9 +8,9 @@
 //! | `legacy_v1_1_0.ptwm` | Multi-tensor container with the v1.1.0 Extension Table layout (every built-in codec interned, `ContainerWriter::set_chain_registry`). Holds bf16, fp16, fp32, fp8 and int8 tensors, two scale tensors that share an `Order1ScaleAC` prelude state, a chunked bf16 tensor, an fp8 tensor with an inline chain, and a tensor with a dependency. Built by [`rewrite_as_v1_1`] from current `compress_model` output; built-in ids and labels are derived for version `1.1.0`. Byte-identical to what this generator writes when built against the v1.1.0 release, whose `compress_model` emits the same layout. |
 //! | `legacy_v1_0_0.ptwm` | The v1.1.0 fixture with every built-in id and label re-derived for version `1.0.0` and the Extension Table hash fixed up. It is not v1.0.0 writer output: for these inputs the v1.0.0 `compress_model` writes no shared `Order1ScaleAC` prelude state. It covers v1.0.0 ids on a file that has the v1.1.0 features. |
 //! | `legacy_v1_0_0_native.ptwm` | Written once by the v1.0.0 release (commit `a17d403`): this generator, built against that tree, run as `rewrite_as_v1_1(&[main, chunked], INLINE_TENSOR)`. Real v1.0.0 writer output, with v1.0.0 built-in ids. `regenerate_fixtures` does not rewrite it. |
-//! | `legacy_trimmed.ptwm` | `compress_model` output of the current writer, whose Extension Table holds only the codecs the planes use. Same tensors as the v1.1.0 file minus the two scale tensors and the chunked tensor. |
+//! | `legacy_trimmed.ptwm` | `compress_model` output of the current writer rewritten with an Extension Table that holds only the codecs the planes use (`set_chain_registry_with_codecs`, the layout pre-release v1.2 legacy writers used). Same tensors as the v1.1.0 file minus the two scale tensors and the chunked tensor. |
 //! | `legacy_p4_byte_fp32_v1_1_0.ptwm` | An fp32 tensor from `Format.BYTE` input, with the chain built the way the v1.1 Python path builds it: the Source node declares `[n_bytes]` fp32 elements, four times the real size. v1.1.0 layout (full Extension Table), built-in ids for `1.1.0`. This is the layout of P4 files written by v1.1.x; it is byte-identical to the v1.1.0 `compress_model` output for the same input. |
-//! | `legacy_p4_byte_fp32.ptwm` | The same tensor written by the current writer (trimmed Extension Table). |
+//! | `legacy_p4_byte_fp32.ptwm` | The same tensor with a trimmed Extension Table, as pre-release v1.2 legacy writers wrote it. |
 //!
 //! The tests check that every fixture decodes to the expected bytes and that
 //! `implode(explode(x)) == x`. The expected bytes are stored as
@@ -125,7 +125,7 @@ const EXPECTED: &[(&str, &[(&str, usize, u64)])] = &[
 /// blake3 of `compress_model` output for [`tensors`] with the options of
 /// [`main_options`] (see [`main_container`]). Printed by `regenerate_fixtures`.
 const LEGACY_WRITER_GOLDEN_BLAKE3: &str =
-    "b74c3fd1d81d5bbf4703fb55fb6427781d9aa6d2a92a44127cf4dc91ee4b9791";
+    "ec513f5c09f76d8f220a69dd3c47b96dec0ca7e3fcd1a075f601d3688b3ffc9a";
 
 // ── Inputs ───────────────────────────────────────────────────────────────────
 
@@ -485,10 +485,11 @@ fn trimmed_tensors() -> Vec<TensorData> {
         .collect()
 }
 
-/// The current legacy writer's output for [`trimmed_tensors`].
+/// The current legacy writer's output for [`trimmed_tensors`], rewritten
+/// with a trimmed Extension Table.
 fn trimmed_container() -> Vec<u8> {
     let data = trimmed_tensors();
-    compress(&inputs(&data), main_options(None))
+    rewrite_as_trimmed(&[&compress(&inputs(&data), main_options(None))])
 }
 
 // ── v1.1.0 layout rewrite ────────────────────────────────────────────────────
@@ -515,6 +516,18 @@ fn records_in_file_order(reader: &ContainerReader<'_>) -> Vec<TensorRecord> {
 /// entries are taken from the parts unchanged (ids must not clash). The
 /// record of `inline_tensor` gets its chain stored inline.
 fn rewrite_as_v1_1(parts: &[&[u8]], inline_tensor: &str) -> Vec<u8> {
+    rewrite_tables(parts, inline_tensor, false)
+}
+
+/// Like [`rewrite_as_v1_1`], but the Extension Table holds only the codecs
+/// the planes use (`set_chain_registry_with_codecs`). The legacy writer
+/// produced this layout before it went back to the v1.1.0 table; readers
+/// still accept it.
+fn rewrite_as_trimmed(parts: &[&[u8]]) -> Vec<u8> {
+    rewrite_tables(parts, "", true)
+}
+
+fn rewrite_tables(parts: &[&[u8]], inline_tensor: &str, trimmed: bool) -> Vec<u8> {
     let readers: Vec<ContainerReader<'_>> = parts
         .iter()
         .map(|b| ContainerReader::open(b).expect("open part"))
@@ -554,19 +567,34 @@ fn rewrite_as_v1_1(parts: &[&[u8]], inline_tensor: &str) -> Vec<u8> {
         }
     }
 
+    let registry = ChainRegistry {
+        chains: chains
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| (i as u16, c))
+            .collect(),
+    };
+    let mut used_codecs: Vec<CanonicalId> = Vec::new();
+    for (rec, part) in &records {
+        let table = &readers[*part].extension_table;
+        for plane in &rec.terminals {
+            let id = table.entries[plane.codec_table_idx as usize].canonical_id;
+            if !used_codecs.contains(&id) {
+                used_codecs.push(id);
+            }
+        }
+    }
     let mut cursor = Cursor::new(Vec::new());
     {
         let mut writer = ContainerWriter::new(&mut cursor).unwrap();
         writer.set_prelude(&prelude).unwrap();
-        writer
-            .set_chain_registry(ChainRegistry {
-                chains: chains
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, c)| (i as u16, c))
-                    .collect(),
-            })
-            .unwrap();
+        if trimmed {
+            writer
+                .set_chain_registry_with_codecs(registry, &used_codecs)
+                .unwrap();
+        } else {
+            writer.set_chain_registry(registry).unwrap();
+        }
         for (mut rec, part) in records {
             let table = &readers[part].extension_table;
             for plane in &mut rec.terminals {
@@ -972,7 +1000,7 @@ fn rederive_builtins_rejects_length_change() {
     rederive_builtins(&mut blob, "1.1.0", "1.10.0");
 }
 
-/// Current writer output with a trimmed table and shared `Order1ScaleAC`
+/// Current writer output with the v1.1.0 table layout and shared `Order1ScaleAC`
 /// prelude state (the default for models with scale planes) decodes to the
 /// inputs and transcodes byte-exactly. No fixture file: the bytes come from
 /// [`main_container`], whose hash is pinned by
@@ -982,7 +1010,7 @@ fn current_writer_shared_state_transcode_round_trip() {
     let blob = main_container();
     let reader = ContainerReader::open(&blob).unwrap();
     assert!(!reader.prelude.is_empty(), "shared prelude state");
-    assert!(plane_codec_count(&reader) < 16, "trimmed table");
+    assert_eq!(plane_codec_count(&reader), 16, "v1.1.0 table layout");
     assert!(
         records_in_file_order(&reader)
             .iter()
@@ -1013,8 +1041,28 @@ fn legacy_writer_output_is_golden() {
     );
     assert!(
         trimmed_container() == load(TRIMMED),
-        "compress_model output != {TRIMMED}"
+        "trimmed rewrite of compress_model output != {TRIMMED}"
     );
+    assert!(
+        rewrite_as_trimmed(&[&p4_container()]) == load(P4),
+        "trimmed rewrite of the P4 container != {P4}"
+    );
+}
+
+/// The legacy writer interns every built-in codec in built-in order, as
+/// v1.1.0 did. A v1.1 transcoder rebuilds this table when it implodes an
+/// exploded store and keeps each plane's `codec_table_idx`; a trimmed table
+/// would make those indices name the wrong codecs.
+#[test]
+fn legacy_writer_keeps_v1_1_0_table_layout() {
+    for blob in [main_container(), p4_container()] {
+        let reader = ContainerReader::open(&blob).unwrap();
+        assert_eq!(plane_codec_count(&reader), 16);
+        assert!(
+            rewrite_as_v1_1(&[&blob], "") == blob,
+            "legacy writer output differs from its v1.1.0-layout rewrite"
+        );
+    }
 }
 
 /// The v1.1.0 table layout (`set_chain_registry`) must keep producing the
@@ -1038,7 +1086,7 @@ fn regenerate_fixtures() {
     assert!(rederive_builtins(&mut v1_0_0, "1.1.0", "1.0.0") > 0);
     let trimmed = trimmed_container();
     let golden = main_container();
-    let p4 = p4_container();
+    let p4 = rewrite_as_trimmed(&[&p4_container()]);
     let p4_v1_1_0 = p4_v1_1_0_container();
 
     let dir = fixture_dir();

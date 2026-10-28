@@ -85,9 +85,9 @@ class ContainerLayout(Enum):
     built-in extensions by id, integers as varints and tensor names only in
     the index; it needs v1.2 or later to read. ``LEGACY`` (magic
     ``\x89PTWM``) is the fixed-width layout that v1.1 and later read. Its
-    output is byte-identical to the current pre-PTWC writer, whose Extension
-    Table holds only the referenced codecs; the v1.1.0 writer interned all 16
-    built-in codecs, so its bytes differ.
+    Extension Table interns all 16 built-in codecs in built-in order, as the
+    v1.1.0 writer does, so a v1.1 transcoder rebuilds exploded LMDB and
+    WebDataset stores of it correctly.
 
     Strings coerce case-insensitively: ``ContainerLayout("compact")`` and
     ``ContainerLayout("LEGACY")`` work, and the bindings take the lower-case

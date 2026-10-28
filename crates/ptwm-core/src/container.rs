@@ -519,8 +519,9 @@ impl<W: Write + Seek> ContainerWriter<W> {
     /// second table-building pass.  Any previously set extension table is
     /// replaced.
     ///
-    /// This is the legacy (v1.1 and earlier) table layout. Writers that know
-    /// the set of codecs in use should call
+    /// This is the legacy (v1.1 and earlier) table layout, and the one legacy
+    /// writers use. Compact-layout writers that know the set of codecs in use
+    /// should call
     /// [`set_chain_registry_with_codecs`](Self::set_chain_registry_with_codecs)
     /// instead, which omits the unreferenced codec entries (about 125 B each).
     ///
@@ -542,6 +543,12 @@ impl<W: Write + Seek> ContainerWriter<W> {
     ///
     /// Returns `InvalidContainer` if a codec in `codecs` has no built-in
     /// Extension Table entry.
+    ///
+    /// Use it for the compact layout. A v1.1 transcoder cannot rebuild a
+    /// trimmed legacy table: its implode always interns every built-in
+    /// codec and keeps each plane's `codec_table_idx`, so an exploded store
+    /// of such a file decodes with the wrong codecs there. Legacy files meant
+    /// for v1.1 readers use [`set_chain_registry`](Self::set_chain_registry).
     ///
     /// Must be called before any `append_tensor` call.
     pub fn set_chain_registry_with_codecs(

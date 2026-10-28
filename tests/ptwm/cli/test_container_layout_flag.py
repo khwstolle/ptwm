@@ -41,7 +41,9 @@ def _safetensors_file(tmp_path: Path) -> Path:
     path = tmp_path / "model.safetensors"
     save_file(
         {
-            "a.weight": torch.randn(64, 32, generator=g).to(torch.bfloat16),
+            # Large enough to compress in the legacy layout too, whose
+            # Extension Table of all 16 built-in codecs takes about 2 KB.
+            "a.weight": torch.randn(256, 128, generator=g).to(torch.bfloat16),
             "b.weight": torch.randn(128, generator=g),
         },
         str(path),
@@ -166,7 +168,7 @@ def test_webdataset_store_takes_the_layout(tmp_path: Path, layout: str | None) -
 
     with WebDatasetWeightStore.open(out) as store:
         assert manifest_container_layout(store._registry_json) == (layout or "compact")
-        want = torch.randn(64, 32, generator=torch.Generator().manual_seed(0))
+        want = torch.randn(256, 128, generator=torch.Generator().manual_seed(0))
         assert torch.equal(store.get_tensor("a.weight"), want.to(torch.bfloat16))
 
 

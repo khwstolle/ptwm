@@ -322,3 +322,83 @@ def test_new_writes_default_to_the_compact_layout(tmp_path, store_tensors):
     write_webdataset(wd, store_tensors)
     index = json.loads((wd / INDEX_NAME).read_text())
     assert index["registry"]["ptwm_format"] == "ptwm-manifest-c"
+
+
+# ── v1.1 transcoder compatibility ─────────────────────────────────────────────
+
+# Plane codecs in the order the v1.1.0 transcoder interns them after the chain
+# ops when it implodes a "ptwm-manifest" v1 manifest
+# (ContainerWriter::set_chain_registry).
+V1_1_PLANE_CODECS = (
+    "identity",
+    "huffman",
+    "rans",
+    "zstd",
+    "zstd_dict",
+    "fpc",
+    "tans",
+    "order1_scale_ac",
+    "arithmetic_o0",
+    "arithmetic_o0_adaptive",
+    "arithmetic_o1",
+    "per_group_codebook",
+    "context_mixing_lite",
+    "huff_llm_5bit",
+    "order1_arithmetic",
+    "neural_predictor",
+)
+
+
+def _assert_v1_1_codec_indices(registry: dict, tensor_manifests: list[dict]) -> int:
+    """Check every plane's ``codec_table_idx`` against the v1.1 table.
+
+    The v1.1 implode rebuilds the Extension Table as the chain ops followed
+    by every built-in plane codec, and copies ``codec_table_idx`` from the
+    manifest unchanged. Returns the number of planes checked.
+    """
+    reg = registry["registry"]
+    n_ops = len(reg["ops"])
+    names = {c["id"]: c["codec"] for c in reg["codecs"]}
+    n = 0
+    for tm in tensor_manifests:
+        for plane in tm["planes"]:
+            want = n_ops + V1_1_PLANE_CODECS.index(names[plane["codec"]])
+            assert plane["codec_table_idx"] == want, (tm["name"], plane)
+            n += 1
+    return n
+
+
+@pytest.mark.parametrize("method_hint", [2, 3, 4])
+def test_legacy_manifest_indices_match_the_v1_1_table(store_tensors, method_hint):
+    """A v1.1 implode of a legacy manifest resolves each plane to its codec.
+
+    The legacy writer once interned only the codecs its planes used, so the
+    manifest's indices pointed at other codecs in the table v1.1 rebuilds,
+    and v1.1 failed to decode LMDB-exploded and WebDataset stores.
+    """
+    blob = compress_ptwm_blob(
+        store_tensors, method_hint=method_hint, container_layout="legacy"
+    )
+    model = explode_model(blob)
+    registry = json.loads(model.registry_json)
+    assert registry["ptwm_format"] == "ptwm-manifest"
+    manifests = [json.loads(j) for _, _, j in model.tensors]
+    assert _assert_v1_1_codec_indices(registry, manifests) > 0
+
+
+def test_legacy_webdataset_indices_match_the_v1_1_table(tmp_path, store_tensors):
+    wd = tmp_path / "m.wds"
+    write_webdataset(wd, store_tensors, container_layout="legacy")
+    for shard in sorted(wd.glob("weights-*-of-*.tar")):
+        with tarfile.open(shard, "r") as tar:
+            f = tar.extractfile(SHARDMETA_MEMBER)
+            assert f is not None
+            registry = json.loads(f.read())
+            manifests = []
+            for m in tar.getmembers():
+                if m.name.endswith(".json") and m.name != SHARDMETA_MEMBER:
+                    g = tar.extractfile(m)
+                    assert g is not None
+                    manifests.append(json.loads(g.read()))
+        assert manifests
+        assert _assert_v1_1_codec_indices(registry, manifests) > 0

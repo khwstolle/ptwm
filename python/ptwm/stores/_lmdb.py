@@ -28,6 +28,7 @@ from typing import Any, Self
 import torch
 
 from .. import _rust
+from .._config import ContainerLayout, container_layout_name
 from ..sharding import compress_ptwm_blob
 from ..utils import DType, decode_ptwm_tensor, raw_to_tensor
 from ._common import (
@@ -76,7 +77,7 @@ def write_lmdb(
     map_size: int = _DEFAULT_MAP_SIZE,
     method_hint: int = 3,
     chains_per_tensor: list[list[bytes]] | None = None,
-    container_layout: str = "legacy",
+    container_layout: ContainerLayout | str = "legacy",
 ) -> Path:
     r"""Write ``tensors`` into an LMDB environment at ``path``.
 
@@ -91,6 +92,7 @@ def write_lmdb(
         msg = f"unknown LMDB layout {layout!r} (expected 'blob' or 'exploded')"
         raise ValueError(msg)
 
+    container_layout = container_layout_name(container_layout)
     lmdb = _require_lmdb()
     path = Path(path)
     blob = compress_ptwm_blob(
@@ -370,7 +372,7 @@ class LmdbWeightStore:
         *,
         delta_reference: str | None = None,
         method_hint: int = 3,
-        container_layout: str | None = None,
+        container_layout: ContainerLayout | str | None = None,
     ) -> None:
         """Atomically insert or replace tensor ``name`` (blob layout only).
 
@@ -406,8 +408,9 @@ class LmdbWeightStore:
         else:
             stored, store_shape, store_dtype = raw, shape, dtype
 
-        if container_layout is None:
-            container_layout = self._container_layout
+        container_layout = container_layout_name(
+            self._container_layout if container_layout is None else container_layout
+        )
         blob = compress_ptwm_blob(
             [(name, stored, store_dtype, store_shape)],
             method_hint=method_hint,

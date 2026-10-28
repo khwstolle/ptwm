@@ -63,10 +63,10 @@ def container_kind(buf: bytes | bytearray | memoryview) -> ContainerKind | None:
 
 
 def is_container(buf: bytes | bytearray | memoryview) -> bool:
-    """Whether ``buf`` starts with a multi-tensor container magic.
+    r"""Whether ``buf`` starts with a multi-tensor container magic.
 
-    True for ``\\x89PTWM``, ``\\x89PTWX`` and ``\\x89PTWC``: the formats that
+    True for ``\x89PTWM``, ``\x89PTWX`` and ``\x89PTWC``: the formats that
     :class:`ptwm.random_access.TensorIndex`, the stores and the transcoder
-    open. False for a ``\\x89PTWS`` single-tensor frame.
+    open. False for a ``\x89PTWS`` single-tensor frame.
     """
     return container_kind(buf) in ("ptwm", "ptwx", "ptwc")

@@ -6,6 +6,7 @@ import json
 import tarfile
 
 from ptwm import _rust
+from ptwm._magic import MAGIC_LEN, is_container
 from ptwm.sharding import compress_ptwm_blob
 from ptwm.stores import WebDatasetWeightStore, detect_format, write_webdataset
 from ptwm.stores._webdataset import INDEX_NAME, SHARDMETA_MEMBER, WDS_FORMAT
@@ -31,7 +32,7 @@ def test_shard_and_index_layout(tmp_path, store_tensors):
                 if info.name.endswith(".bin"):
                     f = tar.extractfile(info)
                     assert f is not None
-                    assert f.read(5) != b"\x89PTWM"
+                    assert not is_container(f.read(MAGIC_LEN))
 
     index = json.loads((wd / INDEX_NAME).read_text())
     assert index["ptwm_format"] == WDS_FORMAT

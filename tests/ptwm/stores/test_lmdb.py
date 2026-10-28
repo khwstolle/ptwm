@@ -7,6 +7,7 @@ import json
 import pytest
 import torch
 from ptwm import _rust
+from ptwm._magic import is_container
 from ptwm.stores import LmdbWeightStore, detect_format, write_lmdb
 from ptwm.stores._lmdb import KEY_FMT, KEY_IDX, KEY_REG, LMDB_FORMAT
 
@@ -25,7 +26,7 @@ def test_blob_layout_keys(tmp_path, store_tensors):
     # Every tensor is a self-contained single-tensor container.
     for name, *_ in store_tensors:
         blob = store._get(b"t/" + name.encode())
-        assert blob[:5] == b"\x89PTWM"
+        assert is_container(blob)
 
 
 def test_exploded_layout_keys(tmp_path, store_tensors):

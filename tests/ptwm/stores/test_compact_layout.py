@@ -12,8 +12,9 @@ import tarfile
 
 import pytest
 import torch
-from ptwm import _rust
+from ptwm import ContainerLayout, _rust
 from ptwm._exceptions import Error
+from ptwm._magic import MAGIC_LEN, MAGIC_PTWC, MAGIC_PTWM, container_kind
 from ptwm.sharding import compress_ptwm_blob, write_ptwm_shard
 from ptwm.stores import (
     LmdbWeightStore,
@@ -32,7 +33,7 @@ from ptwm.stores._common import (
 from ptwm.stores._lmdb import KEY_FMT, KEY_REG
 from ptwm.stores._webdataset import INDEX_NAME, SHARDMETA_MEMBER
 
-MAGIC = {"legacy": b"\x89PTWM", "compact": b"\x89PTWC"}
+MAGIC = {"legacy": MAGIC_PTWM, "compact": MAGIC_PTWC}
 LAYOUTS = ("legacy", "compact")
 
 
@@ -47,7 +48,7 @@ def test_compress_ptwm_blob_honours_the_layout(tmp_path, store_tensors, layout):
     assert blob[:9].startswith(MAGIC[layout])
     out = tmp_path / "m.ptwm"
     write_ptwm_shard(out, store_tensors, container_layout=layout)
-    assert out.read_bytes()[:5] == MAGIC[layout]
+    assert out.read_bytes()[:MAGIC_LEN] == MAGIC[layout]
     # Both layouts decode to the same bytes.
     assert _reference_raw(store_tensors, layout) == _reference_raw(
         store_tensors, "legacy"
@@ -108,7 +109,7 @@ def test_raw_from_members_rebuilds_one_tensor(store_tensors, layout):
         single = _rust.implode_ptwm(
             model.registry_json, [model.tensor_json(name)], members
         )
-        assert single[:5] == MAGIC[layout]
+        assert single[:MAGIC_LEN] == MAGIC[layout]
         raw = raw_from_members(model.registry_json, model.tensor_json(name), members)
         assert raw == want[name]
 
@@ -135,7 +136,7 @@ def test_lmdb_compact_round_trip(tmp_path, store_tensors, torch_tensors, store_l
         assert set(store.names()) == {n for n, *_ in store_tensors}
         if store_layout == "blob":
             for name, *_ in store_tensors:
-                assert store._get(b"t/" + name.encode())[:5] == MAGIC["compact"]
+                assert store._get(b"t/" + name.encode())[:MAGIC_LEN] == MAGIC["compact"]
         else:
             reg = json.loads(store._get(KEY_REG))
             assert reg["ptwm_format"] == "ptwm-manifest-c"
@@ -160,11 +161,11 @@ def test_lmdb_put_tensor_in_either_layout(tmp_path, raw_of):
         store.put_tensor(
             "w", raw_of(new), torch.float32, (8,), container_layout="legacy"
         )
-        assert store._get(b"t/w")[:5] == MAGIC["legacy"]
+        assert store._get(b"t/w")[:MAGIC_LEN] == MAGIC["legacy"]
         store.put_tensor(
             "v", raw_of(new), torch.float32, (8,), container_layout="compact"
         )
-        assert store._get(b"t/v")[:5] == MAGIC["compact"]
+        assert store._get(b"t/v")[:MAGIC_LEN] == MAGIC["compact"]
         store.put_tensor(
             "d",
             raw_of(step),
@@ -173,7 +174,7 @@ def test_lmdb_put_tensor_in_either_layout(tmp_path, raw_of):
             delta_reference="v",
             container_layout="compact",
         )
-        assert store._get(b"t/d")[:5] == MAGIC["compact"]
+        assert store._get(b"t/d")[:MAGIC_LEN] == MAGIC["compact"]
     with LmdbWeightStore.open(path) as store:
         assert torch.equal(store.get_tensor("w"), new)
         assert torch.equal(store.get_tensor("v"), new)
@@ -198,12 +199,12 @@ def test_lmdb_put_tensor_inherits_store_layout(tmp_path, raw_of, layout):
             assert fmt["container_layout"] == "compact"
         store.put_tensor("w", raw_of(new), torch.float32, (8,))
         store.put_tensor("d", raw_of(new + 1), torch.float32, (8,), delta_reference="w")
-        assert store._get(b"t/w")[:5] == MAGIC[layout]
-        assert store._get(b"t/d")[:5] == MAGIC[layout]
+        assert store._get(b"t/w")[:MAGIC_LEN] == MAGIC[layout]
+        assert store._get(b"t/d")[:MAGIC_LEN] == MAGIC[layout]
     # The layout survives a reopen.
     with LmdbWeightStore.open(path, readonly=False) as store:
         store.put_tensor("v", raw_of(new), torch.float32, (8,))
-        assert store._get(b"t/v")[:5] == MAGIC[layout]
+        assert store._get(b"t/v")[:MAGIC_LEN] == MAGIC[layout]
     with LmdbWeightStore.open(path) as store:
         assert torch.equal(store.get_tensor("w"), new)
         assert torch.equal(store.get_tensor("v"), new)
@@ -252,3 +253,28 @@ def test_webdataset_compact_round_trip(tmp_path, store_tensors, max_shard_size):
     for name, tensor in single.stream_tensors():
         assert tensor.numel() > 0
         assert name in want
+
+
+def test_stores_accept_the_layout_enum(tmp_path, store_tensors, raw_of):
+    path = tmp_path / "m.lmdb"
+    write_lmdb(
+        path, store_tensors, layout="blob", container_layout=ContainerLayout.COMPACT
+    )
+    with LmdbWeightStore.open(path, readonly=False) as store:
+        fmt = json.loads(store._get(KEY_FMT))
+        assert fmt["container_layout"] == "compact"
+        for name, *_ in store_tensors:
+            assert container_kind(store._get(b"t/" + name.encode())) == "ptwc"
+        store.put_tensor(
+            "x",
+            raw_of(torch.ones(4)),
+            torch.float32,
+            (4,),
+            container_layout=ContainerLayout.LEGACY,
+        )
+        assert container_kind(store._get(b"t/x")) == "ptwm"
+
+    wd = tmp_path / "m.wds"
+    write_webdataset(wd, store_tensors, container_layout=ContainerLayout.COMPACT)
+    index = json.loads((wd / INDEX_NAME).read_text())
+    assert index["registry"]["ptwm_format"] == "ptwm-manifest-c"

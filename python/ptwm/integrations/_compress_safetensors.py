@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
+from .._config import ContainerLayout, container_layout_name
 from .._rust import shannon
 from ..classify import (
     AuditLog,
@@ -190,8 +191,9 @@ def compress_safetensors_file(
     use_user_cache: bool = True,
     fast: bool = False,
     fast_chunk: int = 512 * 1024,
+    container_layout: ContainerLayout | str = "legacy",
 ) -> AuditLog:
-    """Compress a safetensors file into a sharded ``.ptwm`` directory.
+    r"""Compress a safetensors file into a sharded ``.ptwm`` directory.
 
     Parameters
     ----------
@@ -211,12 +213,19 @@ def compress_safetensors_file(
     method_hint:
         Method hint forwarded to ``write_ptwm_shard``
         (1=HUFFMAN, 2=ZSTD, 3=MICROSCALE, 4=RANS, 5=IDENTITY).
+    container_layout:
+        Layout of every shard container: ``"legacy"`` (``\x89PTWM``, readable
+        by every release) or ``"compact"`` (``\x89PTWC``, v1.2 and later).
+        Forwarded to ``write_ptwm_shard``; a string or
+        :class:`ptwm.ContainerLayout`. Other values raise ``ValueError``
+        before any tensor is read.
 
     Returns
     -------
     AuditLog
         Per-tensor classification audit log.
     """
+    container_layout = container_layout_name(container_layout)
     src = Path(src_path)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -339,6 +348,7 @@ def compress_safetensors_file(
             chains_per_tensor=shard_chains,
             method_hint=eff_method,
             streaming_chunk=eff_stream,
+            container_layout=container_layout,
         )
         _persist_discovered(_new_templates, use_user_cache)
         return audit
@@ -373,6 +383,7 @@ def compress_safetensors_file(
                 chains_per_tensor=shard_chains,
                 method_hint=eff_method,
                 streaming_chunk=eff_stream,
+                container_layout=container_layout,
             )
         else:
             if _write_mode_b_shell is None:
@@ -388,6 +399,7 @@ def compress_safetensors_file(
                 chains_per_tensor=shard_chains,
                 method_hint=eff_method,
                 streaming_chunk=eff_stream,
+                container_layout=container_layout,
             )
             ptwm_bytes = tmp_ptwm.read_bytes()
             tmp_ptwm.unlink()

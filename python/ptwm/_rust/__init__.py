@@ -10,7 +10,12 @@ from __future__ import annotations
 
 from ptwm import _core as _ext
 
+from .._config import ContainerLayout, container_layout_name
 from ._errors import translate_errors
+
+Buffer = bytes | bytearray | memoryview
+"""A byte buffer the container functions accept. ``bytes`` and read-only
+buffers are borrowed without a copy; writable ones are copied once."""
 
 __all__ = [
     "ContainerHandle",
@@ -193,7 +198,7 @@ def compress_model(
     streaming_chunk: int | None = None,
     codec_menu: list[int] | None = None,
     *,
-    container_layout: str = "legacy",
+    container_layout: ContainerLayout | str = "legacy",
 ) -> bytes:
     r"""Compress a list of tensors into a ``.ptwm`` container.
 
@@ -210,9 +215,11 @@ def compress_model(
     empty intersection on a plane raises ``InvalidContainer``.
     ``container_layout``: ``"legacy"`` writes ``\x89PTWM`` (readable by every
     release), ``"compact"`` writes ``\x89PTWC`` (readable by v1.2 and later).
-    Other values raise :class:`ptwm.Error` (the binding's ``ValueError``
-    passes through ``translate_errors``).
+    A :class:`ptwm.ContainerLayout` is accepted too. Other values raise
+    :class:`ptwm.Error` before anything is compressed (the binding itself
+    raises ``ValueError``).
     """
+    layout = container_layout_name(container_layout)
     return bytes(
         _ext.compress_model(
             records,
@@ -222,7 +229,7 @@ def compress_model(
             method_hint,
             streaming_chunk,
             codec_menu,
-            container_layout=container_layout,
+            container_layout=layout,
         )
     )
 
@@ -289,7 +296,7 @@ def decode_compact(
 
 
 @translate_errors
-def decode_tensor(blob: bytes, name: str, skip_missing: bool = False) -> bytes:
+def decode_tensor(blob: Buffer, name: str, skip_missing: bool = False) -> bytes:
     """Decode a single tensor from a ``.ptwm`` container blob.
 
     Returns raw decompressed bytes.
@@ -298,10 +305,10 @@ def decode_tensor(blob: bytes, name: str, skip_missing: bool = False) -> bytes:
 
 
 @translate_errors
-def decode_model(blob: bytes, skip_missing: bool = False) -> list[tuple[str, bytes]]:
+def decode_model(blob: Buffer, skip_missing: bool = False) -> list[tuple[str, bytes]]:
     """Decode every tensor from a ``.ptwm`` container blob in parallel.
 
-    Returns ``(name, raw_bytes)`` per tensor in container index order. Prefer
+    Returns ``(name, raw_bytes)`` per tensor in write order. Prefer
     this over per-tensor :func:`decode_tensor` for a full-model load — the
     decodes run across the rayon pool with the GIL released.
     """
@@ -310,7 +317,7 @@ def decode_model(blob: bytes, skip_missing: bool = False) -> list[tuple[str, byt
 
 @translate_errors
 def decode_tensor_shape(
-    blob: bytes, name: str, skip_missing: bool = False
+    blob: Buffer, name: str, skip_missing: bool = False
 ) -> tuple[list[int], str] | None:
     """Return ``(shape, dtype_name)`` for a tensor, or ``None``."""
     return _ext.decode_tensor_shape(blob, name, skip_missing)
@@ -318,7 +325,7 @@ def decode_tensor_shape(
 
 @translate_errors
 def decode_tensor_delta_hash(
-    blob: bytes, name: str, skip_missing: bool = False
+    blob: Buffer, name: str, skip_missing: bool = False
 ) -> bytes | None:
     """Return the 32-byte BLAKE3 hash of the delta reference for ``name``.
 
@@ -329,7 +336,7 @@ def decode_tensor_delta_hash(
 
 
 @translate_errors
-def list_tensor_names(blob: bytes, skip_missing: bool = False) -> list[str]:
+def list_tensor_names(blob: Buffer, skip_missing: bool = False) -> list[str]:
     """Return every tensor name stored in a ``.ptwm`` container.
 
     Names come in write (body) order for both layouts.
@@ -339,7 +346,7 @@ def list_tensor_names(blob: bytes, skip_missing: bool = False) -> list[str]:
 
 @translate_errors
 def list_plane_summaries(
-    blob: bytes, skip_missing: bool = False
+    blob: Buffer, skip_missing: bool = False
 ) -> list[tuple[str, int, int, int, int, int]]:
     """Return per-plane summaries for every tensor in a container.
 
@@ -351,13 +358,13 @@ def list_plane_summaries(
 
 @translate_errors
 def decode_tensor_info(
-    blob: bytes, name: str, skip_missing: bool = False
+    blob: Buffer, name: str, skip_missing: bool = False
 ) -> tuple[list[int], str, int, int] | None:
     """Return ``(shape, dtype_name, dtype_code, input_format)`` or ``None``."""
     return _ext.decode_tensor_info(blob, name, skip_missing)
 
 
-def container_layout(blob: bytes | bytearray | memoryview) -> str | None:
+def container_layout(blob: Buffer) -> str | None:
     r"""Return the multi-tensor layout of ``blob`` from its magic.
 
     ``"legacy"`` for ``\x89PTWM`` / ``\x89PTWX``, ``"compact"`` for
@@ -389,9 +396,7 @@ class ContainerHandle:
     __slots__ = ("_h",)
 
     @translate_errors
-    def __init__(
-        self, blob: bytes | bytearray | memoryview, skip_missing: bool = False
-    ) -> None:
+    def __init__(self, blob: Buffer, skip_missing: bool = False) -> None:
         self._h = _ext.ContainerHandle(blob, skip_missing)
 
     @property
@@ -437,8 +442,11 @@ class ContainerHandle:
 
     @translate_errors
     def plane_summaries(self) -> list[tuple[str, int, int, int, int, int]]:
-        """One ``(tensor_name, plane_index, role, codec_id, state_source,
-        payload_len)`` row per plane, tensors in write order."""
+        """One row per plane, tensors in write order.
+
+        Each row is ``(tensor_name, plane_index, role, codec_id,
+        state_source, payload_len)``.
+        """
         return list(self._h.plane_summaries())
 
     def __len__(self) -> int:  # noqa: D105

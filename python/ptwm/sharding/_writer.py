@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import _rust
+from .._config import ContainerLayout
 from ..preprocessing._chains import (
     ClassifierRole,
     build_chain_blobs,
@@ -40,7 +41,7 @@ def compress_ptwm_blob(
     emit_payload_hash: bool = True,
     emit_plane_crc: bool = True,
     streaming_chunk: int | None = None,
-    container_layout: str = "legacy",
+    container_layout: ContainerLayout | str = "legacy",
 ) -> bytes:
     r"""Compress ``tensors`` into a single in-memory ``.ptwm`` container blob.
 
@@ -49,8 +50,9 @@ def compress_ptwm_blob(
     each blob is produced by ``Chain.to_bytes()``. When ``None``, chains are
     auto-derived from each tensor's dtype via the STANDARD production table.
     ``method_hint``: 1=HUFFMAN, 2=ZSTD, 3=MICROSCALE, 4=RANS, 5=IDENTITY.
-    ``container_layout``: ``"legacy"`` (``\x89PTWM``) or ``"compact"``
-    (``\x89PTWC``).
+    ``container_layout``: ``"legacy"`` (``\x89PTWM``, readable by every
+    release) or ``"compact"`` (``\x89PTWC``, v1.2 and later), as a string or
+    :class:`ptwm.ContainerLayout`. Other values raise :class:`ptwm.Error`.
     """
     records = []
     auto_chains: list[list[bytes]] = []
@@ -93,7 +95,7 @@ def write_ptwm_shard(
     emit_payload_hash: bool = True,
     emit_plane_crc: bool = True,
     streaming_chunk: int | None = None,
-    container_layout: str = "legacy",
+    container_layout: ContainerLayout | str = "legacy",
 ) -> None:
     """Write a single ``.ptwm`` container holding ``tensors``.
 

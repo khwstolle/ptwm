@@ -98,15 +98,16 @@ class ContainerLayout(Enum):
 def container_layout_name(layout: ContainerLayout | str) -> str:
     """Return the binding name (``"compact"`` or ``"legacy"``) of ``layout``.
 
-    A string that names no layout is returned unchanged, so the binding
-    rejects it with an error that names ``container_layout``.
+    ``layout`` is a :class:`ContainerLayout` or a string that names one (any
+    case). Anything else raises :class:`ValueError`.
     """
     if isinstance(layout, ContainerLayout):
         return layout.value
     try:
         return ContainerLayout(layout).value
     except ValueError:
-        return layout
+        msg = f"unknown container_layout {layout!r} (expected 'compact' or 'legacy')"
+        raise ValueError(msg) from None
 
 
 class Lossy(Enum):

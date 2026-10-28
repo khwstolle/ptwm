@@ -21,6 +21,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
+from .._config import ContainerLayout
 from ..sharding import compress_ptwm_blob, plan_shards
 from ._common import (
     ExplodedModel,
@@ -70,7 +71,7 @@ def write_webdataset(
     max_shard_size: int = _DEFAULT_MAX_SHARD_SIZE,
     method_hint: int = 3,
     chains_per_tensor: list[list[bytes]] | None = None,
-    container_layout: str = "legacy",
+    container_layout: ContainerLayout | str = "legacy",
 ) -> Path:
     """Write ``tensors`` as a WebDataset shard set rooted at ``out_dir``.
 

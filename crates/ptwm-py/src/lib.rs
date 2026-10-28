@@ -657,7 +657,11 @@ fn decode_tensor_delta_hash<'py>(
 /// order. `skip_missing` has the same semantics as for :func:`decode_tensor`.
 #[pyfunction]
 #[pyo3(signature = (blob, skip_missing = false))]
-fn list_tensor_names(py: Python<'_>, blob: PyBuffer<u8>, skip_missing: bool) -> PyResult<Vec<String>> {
+fn list_tensor_names(
+    py: Python<'_>,
+    blob: PyBuffer<u8>,
+    skip_missing: bool,
+) -> PyResult<Vec<String>> {
     ContainerHandle::open(py, blob, skip_missing)?.names_vec(py)
 }
 

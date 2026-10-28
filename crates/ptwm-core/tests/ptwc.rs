@@ -1489,7 +1489,7 @@ fn read_extension_table_checks_the_compact_meta_hash() {
 }
 
 #[test]
-fn tensor_names_come_in_write_order_in_both_layouts() {
+fn tensor_names_and_decode_model_come_in_write_order_in_both_layouts() {
     let mut rng = Rng(7);
     let names = ["zeta", "alpha", "mid", "beta", "omega", "a.b.c"];
     let data: Vec<Tensor> = names
@@ -1500,5 +1500,12 @@ fn tensor_names_come_in_write_order_in_both_layouts() {
         let blob = compress(&data, options(true, true, None, layout));
         let reader = ContainerReader::open(&blob).unwrap();
         assert_eq!(reader.tensor_names().unwrap(), names, "{layout:?}");
+        let decoded: Vec<String> = reader
+            .decode_model()
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(decoded, names, "{layout:?}");
     }
 }

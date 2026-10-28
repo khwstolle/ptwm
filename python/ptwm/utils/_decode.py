@@ -74,14 +74,23 @@ def raw_to_tensor(
         raise
 
 
-def decode_ptwm_tensor(blob: bytes, name: str) -> torch.Tensor:
-    """Decode a single named tensor from a ``.ptwm`` container blob.
+def decode_ptwm_tensor(
+    blob: bytes | bytearray | memoryview | _rust.ContainerHandle, name: str
+) -> torch.Tensor:
+    """Decode a single named tensor from a ``.ptwm`` container.
+
+    ``blob`` is the container bytes (either layout) or an open
+    :class:`ptwm._rust.ContainerHandle`. Pass a handle when decoding several
+    tensors from one container: bytes are parsed again on every call.
 
     Falls back to a flat ``uint8`` tensor (with a warning) when the container
     has no shape metadata for ``name``.
     """
-    raw = bytes(_rust.decode_tensor(blob, name))
-    info = _rust.decode_tensor_shape(blob, name)
+    handle = (
+        blob if isinstance(blob, _rust.ContainerHandle) else _rust.ContainerHandle(blob)
+    )
+    raw = handle.decode(name)
+    info = handle.shape(name)
     if info is None:
         warnings.warn(
             f"weights: no shape metadata for tensor {name!r}; "

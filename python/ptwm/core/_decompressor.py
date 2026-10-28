@@ -11,6 +11,7 @@ from .._magic import MAGIC_PTWS, container_kind
 from ..delta import decode as delta_decode
 from ..utils import DType
 
+
 def _torch_dtype_for_code(dtype_code: int) -> torch.dtype | None:
     """Map a wire ``dtype_code`` to a concrete ``torch.dtype`` if supported."""
     for m in DType:
@@ -39,9 +40,10 @@ class Decompressor:
 
         Accepts a compact single-tensor frame (magic ``\x89PTWS``) or a
         full container in either layout (magic ``\x89PTWM``, ``\x89PTWX``
-        or ``\x89PTWC``). The single-tensor container uses name ``"_"``. Raw decompressed bytes
-        come from ``decode_tensor``; shape/dtype/input_format (when present)
-        come from the CBOR shape-metadata map. Format recovery:
+        or ``\x89PTWC``). The single-tensor container uses name ``"_"``.
+        Raw decompressed bytes come from one
+        :class:`ptwm._rust.ContainerHandle`; shape/dtype/input_format (when
+        present) come from the CBOR shape-metadata map. Format recovery:
 
         - No metadata or ``input_format == BYTE`` → raw ``bytes``.
         - ``input_format == TORCH`` → :class:`torch.Tensor` reconstructed

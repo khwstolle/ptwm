@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from ptwm import _rust
+from ptwm._magic import is_container
 from ptwm.integrations import compress_safetensors_file
 from ptwm.sharding import compress_ptwm_blob
 from ptwm.stores import jcs_canonicalize
@@ -19,12 +20,12 @@ from safetensors.torch import save_file
 
 
 def _ptwm_blobs_under(root: Path) -> list[bytes]:
-    """Collect every native ``.ptwm`` container blob under ``root``."""
+    """Collect every native ``.ptwm`` container blob (either layout) under ``root``."""
     blobs: list[bytes] = []
     for p in sorted(root.rglob("*")):
         if p.is_file():
             data = p.read_bytes()
-            if data[:5] == b"\x89PTWM":
+            if is_container(data):
                 blobs.append(data)
     return blobs
 

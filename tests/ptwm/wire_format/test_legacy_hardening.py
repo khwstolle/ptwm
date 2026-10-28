@@ -100,6 +100,63 @@ def test_shape_and_plane_summaries_honour_skip_missing() -> None:
     )
 
 
+def test_container_handle_honours_skip_missing() -> None:
+    blob = _legacy_blob()
+    patched = _with_missing_extension(blob)
+    with pytest.raises(Exception, match="(?i)missing|flavor"):
+        _rust.ContainerHandle(patched)
+    h = _rust.ContainerHandle(patched, skip_missing=True)
+    ref = _rust.ContainerHandle(blob)
+    (name,) = ref.names()
+    assert h.names() == [name]
+    assert h.shape(name) == ref.shape(name)
+    assert h.info(name) == ref.info(name)
+    assert h.plane_summaries() == ref.plane_summaries()
+    assert h.decode(name) == ref.decode(name)
+
+
+def test_inspect_verifies_the_extension_table_hash(tmp_path) -> None:
+    from ptwm._core import list_extension_table_entries
+
+    blob = bytearray(_legacy_blob())
+    # Flip one byte inside the table: the header hash no longer matches.
+    blob[HEADER_LEN + 40] ^= 0x01
+    path = tmp_path / "bad_hash.ptwm"
+    path.write_bytes(bytes(blob))
+    with pytest.raises(ValueError, match="(?i)hash"):
+        list_extension_table_entries(str(path))
+
+
+def test_inspect_reads_both_layouts(tmp_path) -> None:
+    from ptwm._core import list_extension_table_entries
+
+    tensor = torch.arange(64 * 32, dtype=torch.float32).reshape(64, 32)
+    entries = {}
+    for layout in ("legacy", "compact"):
+        blob = Compressor(
+            CompressionConfig(
+                input_format=Format.TORCH,
+                method=Method.HUFFMAN,
+                framing=Framing.CONTAINER,
+                container_layout=layout,
+            )
+        ).compress(tensor)
+        path = tmp_path / f"{layout}.ptwm"
+        path.write_bytes(blob)
+        entries[layout] = list_extension_table_entries(str(path))
+    assert entries["legacy"]
+    # The compact table expands to the same built-in entries.
+    assert {e[0] for e in entries["compact"]} <= {e[0] for e in entries["legacy"]}
+    assert entries["compact"]
+
+    path = tmp_path / "frame.ptwm"
+    path.write_bytes(
+        Compressor(CompressionConfig(input_format=Format.TORCH)).compress(tensor)
+    )
+    with pytest.raises(ValueError, match="(?i)magic"):
+        list_extension_table_entries(str(path))
+
+
 def test_inspect_rejects_extension_table_offset_overflow(tmp_path) -> None:
     from ptwm._core import list_extension_table_entries
 

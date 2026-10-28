@@ -1660,19 +1660,20 @@ impl<'a> ContainerReader<'a> {
             .collect()
     }
 
-    /// Decode every tensor in the container, in index order, across the rayon
-    /// pool. `decode_tensor` is `&self` and reads only shared state, so the
-    /// per-tensor decodes are independent — this is the primary multi-core
-    /// scaling lever for full-model loads (the per-tensor `decode_tensor` stays
-    /// available for random access). Returns `(name, raw_bytes)` per tensor.
+    /// Decode every tensor in the container across the rayon pool. Returns
+    /// `(name, raw_bytes)` per tensor in body (write) order, the order of
+    /// [`tensor_names`](Self::tensor_names). `decode_tensor` is `&self` and
+    /// reads only shared state, so the per-tensor decodes are independent;
+    /// this is the main multi-core lever for full-model loads (the
+    /// per-tensor `decode_tensor` stays available for random access).
     pub fn decode_model(&self) -> Result<Vec<(String, Vec<u8>)>, PtwmCoreError> {
         if self.index.is_empty() {
             return Ok(Vec::new());
         }
-        // Parse each record header and decode it in the same parallel pass —
-        // no sequential tensor_names() pre-pass.
-        self.index
-            .par_iter()
+        // Parse each record header and decode it in the same parallel pass,
+        // with no sequential tensor_names() pre-pass.
+        self.entries_in_body_order()
+            .into_par_iter()
             .map(|e| {
                 let rec = self.entry_record(e)?;
                 let bytes = self.decode_tensor_record(&rec)?;

@@ -59,27 +59,26 @@ fn runtime_err(e: PtwmCoreError) -> PyErr {
 impl ContainerHandle {
     /// Open `buffer`, borrowing it when it is read-only and C-contiguous.
     pub fn open(py: Python<'_>, buffer: PyBuffer<u8>, skip_missing: bool) -> PyResult<Self> {
-        let (bytes, backing): (&[u8], Backing) =
-            if buffer.readonly() && buffer.is_c_contiguous() {
-                let len = buffer.len_bytes();
-                let bytes: &[u8] = if len == 0 {
-                    &[]
-                } else {
-                    // SAFETY: the buffer is C-contiguous and `len` bytes long.
-                    // The export stays alive in `Backing::Borrowed` for as
-                    // long as the reader, and a read-only export cannot be
-                    // written through.
-                    unsafe { std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, len) }
-                };
-                (bytes, Backing::Borrowed(buffer))
+        let (bytes, backing): (&[u8], Backing) = if buffer.readonly() && buffer.is_c_contiguous() {
+            let len = buffer.len_bytes();
+            let bytes: &[u8] = if len == 0 {
+                &[]
             } else {
-                let owned: Box<[u8]> = buffer.to_vec(py)?.into_boxed_slice();
-                // SAFETY: the boxed slice's heap memory does not move when the
-                // box moves into `Backing::Owned`, and it lives as long as the
-                // reader.
-                let bytes = unsafe { std::slice::from_raw_parts(owned.as_ptr(), owned.len()) };
-                (bytes, Backing::Owned(owned))
+                // SAFETY: the buffer is C-contiguous and `len` bytes long.
+                // The export stays alive in `Backing::Borrowed` for as
+                // long as the reader, and a read-only export cannot be
+                // written through.
+                unsafe { std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, len) }
             };
+            (bytes, Backing::Borrowed(buffer))
+        } else {
+            let owned: Box<[u8]> = buffer.to_vec(py)?.into_boxed_slice();
+            // SAFETY: the boxed slice's heap memory does not move when the
+            // box moves into `Backing::Owned`, and it lives as long as the
+            // reader.
+            let bytes = unsafe { std::slice::from_raw_parts(owned.as_ptr(), owned.len()) };
+            (bytes, Backing::Owned(owned))
+        };
         // SAFETY: `bytes` points into `backing`, which the handle owns and
         // drops after the reader (see the field order of `ContainerHandle`).
         let bytes: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(bytes) };
@@ -209,7 +208,7 @@ impl ContainerHandle {
         self.decode_bytes(py, name)
     }
 
-    /// Decode every tensor in parallel; ``(name, bytes)`` in index order.
+    /// Decode every tensor in parallel; ``(name, bytes)`` in write order.
     fn decode_model<'py>(&self, py: Python<'py>) -> PyResult<Vec<(String, Bound<'py, PyBytes>)>> {
         self.decode_all(py)
     }
@@ -221,7 +220,11 @@ impl ContainerHandle {
     }
 
     /// The BLAKE3 hash of the tensor's delta reference, or ``None``.
-    fn delta_hash<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Option<Bound<'py, PyBytes>>> {
+    fn delta_hash<'py>(
+        &self,
+        py: Python<'py>,
+        name: &str,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
         self.tensor_delta_hash(py, name)
     }
 

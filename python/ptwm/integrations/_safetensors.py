@@ -29,8 +29,8 @@ def decompress_safetensors_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return decompressor.decompress(tensor.cpu().contiguous().numpy())
 
 
-def _decode_ptwm_tensor(blob: bytes, name: str) -> torch.Tensor:
-    """Decode a single named tensor from a v3 .ptwm blob.
+def _decode_ptwm_tensor(blob: bytes | _rust.ContainerHandle, name: str) -> torch.Tensor:
+    """Decode a single named tensor from a .ptwm blob or open handle.
 
     Thin wrapper over the shared :func:`ptwm.utils.decode_ptwm_tensor` helper,
     kept for backward compatibility with existing call sites.
@@ -54,15 +54,17 @@ class SafeOpen:
         path = Path(filename)
         self._mode_a = path.suffix == ".ptwm"
         self._mode_b = False
-        # Compressed blob for Mode A / Mode B — held for lazy per-tensor decode.
-        self._ptwm_blob: bytes | None = None
+        # Opened container for Mode A / Mode B, held for lazy per-tensor
+        # decode. The handle keeps the compressed bytes alive and parses the
+        # container once.
+        self._ptwm: _rust.ContainerHandle | None = None
         self._ptwm_keys: tuple[str, ...] = ()
         self._underlying = None
         self.compressed_tensors_metadata: dict[str, Any] = {}
 
         if self._mode_a:
-            self._ptwm_blob = path.read_bytes()
-            self._ptwm_keys = tuple(_rust.list_tensor_names(self._ptwm_blob))
+            self._ptwm = _rust.ContainerHandle(path.read_bytes())
+            self._ptwm_keys = tuple(self._ptwm.names())
             return
 
         # Mode B detection: open as safetensors first, sniff metadata.
@@ -76,13 +78,15 @@ class SafeOpen:
             # __ptwm_payload__ tensor eagerly; that is safetensors' own
             # behaviour and cannot be deferred further at this layer.
             payload = self._underlying.get_tensor("__ptwm_payload__")
-            self._ptwm_blob = bytes(memoryview(payload.cpu().numpy()).cast("B"))
-            self._ptwm_keys = tuple(_rust.list_tensor_names(self._ptwm_blob))
+            self._ptwm = _rust.ContainerHandle(
+                bytes(memoryview(payload.cpu().numpy()).cast("B"))
+            )
+            self._ptwm_keys = tuple(self._ptwm.names())
         else:
             self.compressed_tensors_metadata = get_compressed_tensors_metadata(meta)
 
     def keys(self) -> list[str]:
-        if self._ptwm_blob is not None:
+        if self._ptwm is not None:
             return list(self._ptwm_keys)
         return list(self._underlying.keys())
 
@@ -92,14 +96,14 @@ class SafeOpen:
         return self._underlying.metadata()
 
     def get_tensor(self, name: str) -> torch.Tensor:
-        if self._ptwm_blob is not None:
-            return _decode_ptwm_tensor(self._ptwm_blob, name)
+        if self._ptwm is not None:
+            return _decode_ptwm_tensor(self._ptwm, name)
         if name not in self.compressed_tensors_metadata:
             return self._underlying.get_tensor(name)
         return decompress_safetensors_tensor(self._underlying.get_tensor(name))
 
     def get_slice(self, name: str) -> Any:
-        if self._ptwm_blob is not None:
+        if self._ptwm is not None:
             msg = "get_slice is not supported on .ptwm/ptwm-shell containers"
             raise NotImplementedError(msg)
         if name not in self.compressed_tensors_metadata:

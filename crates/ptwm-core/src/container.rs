@@ -258,9 +258,34 @@ pub fn encode_registry_for_table(
         return Err(bad("embedded WASM entries are not supported".into()));
     }
 
+    // Every entry must be addressable by a u16 table index.
+    if table.entries.len() > usize::from(u16::MAX) + 1 {
+        return Err(bad(format!(
+            "{} entries; a u16 index addresses at most 65536",
+            table.entries.len()
+        )));
+    }
+
     let mut normalised = table.clone();
     normalize_builtin_ids(&mut normalised);
     let n_entries = normalised.entries.len();
+
+    // Check every registry op against the table before encoding. Encoding
+    // interns a missing op, which grows the table and can overflow the u16
+    // index space of a full table.
+    let present: std::collections::HashSet<CanonicalId> =
+        normalised.entries.iter().map(|e| e.canonical_id).collect();
+    for (_, chain) in &registry.chains {
+        for node in &chain.nodes {
+            if !present.contains(&node.op.canonical_id()) {
+                return Err(bad(format!(
+                    "chain op {:?} is missing from the table",
+                    node.op
+                )));
+            }
+        }
+    }
+
     let mut codec_idx_map = HashMap::new();
     for (i, e) in normalised.entries.iter().enumerate() {
         if let Some(BuiltinKind::Codec(_)) = dispatch_builtin(&e.canonical_id) {
@@ -657,7 +682,12 @@ impl<W: Write + Seek> ContainerWriter<W> {
             if let Some(crate::extension::BuiltinKind::Codec(_)) =
                 crate::extension::dispatch_builtin(&e.canonical_id)
             {
-                codec_idx_map.entry(e.canonical_id).or_insert(i as u16);
+                let idx = u16::try_from(i).map_err(|_| {
+                    PtwmCoreError::InvalidContainer(format!(
+                        "extension table entry {i} is past the u16 index range"
+                    ))
+                })?;
+                codec_idx_map.entry(e.canonical_id).or_insert(idx);
             }
         }
         self.extension_table = table;
@@ -2623,6 +2653,28 @@ mod tests {
 
         // Garbage.
         assert!(encode_registry_for_table(b"\xff\xff\xff\xff", &registry).is_err());
+    }
+
+    /// A full raw table (65,536 third-party entries) whose registry needs an
+    /// op the table lacks must fail with an error. Encoding would intern the
+    /// op past the u16 index space, which used to panic.
+    #[test]
+    fn full_raw_extension_table_missing_an_op_is_an_error() {
+        let registry = ChainRegistry {
+            chains: vec![(0, v3_passthrough_chain(4))],
+        };
+        let base = sample_extension_table_entry();
+        let entries: Vec<_> = (0u32..1 << 16)
+            .map(|i| {
+                let mut e = base.clone();
+                e.canonical_id =
+                    crate::extension::CanonicalId::derive(&[0x22; 32], &format!("bar{i}"), "0.1.0");
+                e
+            })
+            .collect();
+        let bytes = ExtensionTable { entries }.to_bytes().unwrap();
+        let e = encode_registry_for_table(&bytes, &registry).unwrap_err();
+        assert!(e.to_string().contains("missing from the table"), "{e}");
     }
 
     /// A raw table is written verbatim; the registry indices resolve

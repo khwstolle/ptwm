@@ -3446,7 +3446,6 @@ mod tests {
                 chunk_size: None,
                 // Reads the legacy index and records, so the layout is pinned.
                 container_layout: ContainerLayout::Legacy,
-                ..Default::default()
             },
         )
         .expect("compress succeeds");
@@ -3915,7 +3914,6 @@ label = "test-author"
                 chunk_size,
                 // Parses legacy records, so the layout is pinned.
                 container_layout: ContainerLayout::Legacy,
-                ..Default::default()
             },
         )
         .unwrap();

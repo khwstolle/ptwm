@@ -1412,7 +1412,6 @@ mod tests {
                 chunk_size: None,
                 // Parses legacy records, so the layout is pinned.
                 container_layout: ContainerLayout::Legacy,
-                ..Default::default()
             },
         )
         .expect("compress succeeds");
@@ -1818,7 +1817,6 @@ mod tests {
                 chunk_size: None,
                 // Parses legacy records, so the layout is pinned.
                 container_layout: ContainerLayout::Legacy,
-                ..Default::default()
             },
         )
         .unwrap();
@@ -1903,7 +1901,6 @@ mod tests {
                 chunk_size: None,
                 // Parses legacy records, so the layout is pinned.
                 container_layout: ContainerLayout::Legacy,
-                ..Default::default()
             },
         )
         .unwrap();

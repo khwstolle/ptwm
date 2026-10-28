@@ -1457,18 +1457,18 @@ fn read_extension_table_checks_the_legacy_region_and_hash() {
     };
 
     // offset + length overflows u64 / usize.
-    let mut h = header.clone();
+    let mut h = header;
     h.extension_table_offset = u64::MAX - 4;
     let err = read_extension_table(&patched(&h)).unwrap_err().to_string();
     assert!(err.contains("exceeds the buffer"), "{err}");
 
-    let mut h = header.clone();
+    let mut h = header;
     h.extension_table_length = u64::MAX;
     let err = read_extension_table(&patched(&h)).unwrap_err().to_string();
     assert!(err.contains("exceeds the buffer"), "{err}");
 
     // A region that runs past the end of the file.
-    let mut h = header.clone();
+    let mut h = header;
     h.extension_table_length = legacy.len() as u64;
     assert!(read_extension_table(&patched(&h)).is_err());
 

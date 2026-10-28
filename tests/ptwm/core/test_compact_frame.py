@@ -109,10 +109,49 @@ def test_integrity_fields_can_be_disabled(framing: Framing) -> None:
     bare = Compressor(
         _torch_cfg(framing=framing, emit_payload_hash=False, emit_plane_crc=False)
     ).compress(t)
-    # 8 B payload hash, plus 4 B CRC per coded plane (bf16 has two).
-    assert len(full) - len(bare) == 8 + 2 * 4
-    back = Decompressor().decompress(bare)
-    assert torch.equal(back.view(torch.uint8), t.view(torch.uint8))
+    crc_only = Compressor(
+        _torch_cfg(framing=framing, emit_payload_hash=False, emit_plane_crc=True)
+    ).compress(t)
+    # 8 B payload hash; 4 B CRC per coded plane (bf16 has two). The compact
+    # frame omits plane CRCs when it stores the payload hash, which already
+    # covers every plane of its one tensor.
+    if framing is Framing.COMPACT:
+        assert len(full) - len(bare) == 8
+    else:
+        assert len(full) - len(bare) == 8 + 2 * 4
+    assert len(crc_only) - len(bare) == 2 * 4
+    for blob in (bare, crc_only):
+        back = Decompressor().decompress(blob)
+        assert torch.equal(back.view(torch.uint8), t.view(torch.uint8))
+
+
+@pytest.mark.parametrize("tail", [b"\x00", b"\x00" * 7, b"\xff" * 100])
+@pytest.mark.parametrize(
+    "t",
+    [
+        torch.randn(64, 64, generator=torch.Generator().manual_seed(0)).to(
+            torch.bfloat16
+        ),
+        torch.randn(64, 64, generator=torch.Generator().manual_seed(0)),
+        torch.randint(
+            -128, 127, (4096,), generator=torch.Generator().manual_seed(0)
+        ).to(torch.int8),
+        torch.cumsum(torch.randn(4096, generator=torch.Generator().manual_seed(0)), 0),
+    ],
+    ids=["bf16", "fp32", "int8", "fp32-smooth"],
+)
+@pytest.mark.parametrize(
+    ("hash_", "crc"), [(True, True), (False, True), (False, False)]
+)
+def test_appended_bytes_are_rejected(
+    t: torch.Tensor, tail: bytes, hash_: bool, crc: bool
+) -> None:
+    blob = Compressor(_torch_cfg(emit_payload_hash=hash_, emit_plane_crc=crc)).compress(
+        t
+    )
+    assert blob[:5] == b"\x89PTWS"
+    with pytest.raises(Error, match="trailing|stored body is"):
+        Decompressor().decompress(blob + tail)
 
 
 def test_delta_round_trip() -> None:

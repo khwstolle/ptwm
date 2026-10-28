@@ -200,7 +200,7 @@ a compact frame instead, with its own magic `\x89PTWS`:
 magic          [u8;5]    \x89PTWS
 flags          u8        payload hash, plane CRC, shape, dtype name,
                          delta reference, stored, size; unknown bits
-                         rejected
+                         and plane CRC with payload hash rejected
 dtype_code     varint
 input_format   u8
 orig_size      varint                             (if flagged)
@@ -215,22 +215,32 @@ body
 `product(shape) × element_size(dtype_code)`. The dtype name is stored
 only when it differs from the canonical name of `dtype_code`. Varints
 are minimal unsigned LEB128, and a reader rejects any field written
-in a form the writer would not produce, so each tensor has one frame
-encoding.
+in a form the writer would not produce, so each field has one
+encoding for the value it holds. The frame as a whole is not unique
+for a tensor: the writer chooses the codecs, the chain, a stored or a
+coded body, and plane state 0 or 2 (below), and the reader accepts
+any valid choice. A reader rejects bytes after the end of the body.
 
 The body is either the raw bytes (the stored flag, written when no
 codec makes the tensor smaller) or a coded tensor: the chain in the
 compact chain wire (CW2, below), then one record per terminal plane:
 a varint `codec_id << 2 | state` (state 0 none, 1 inline with a
 version byte and length-prefixed bytes, 2 inline with version 0 and
-no bytes), the payload length (omitted on the last plane, whose
-payload runs to the end of the frame), an optional CRC32 and the
-payload. The frame does not store plane layouts, plane lengths or
+no bytes; states 0 and 2 decode alike), the payload length, an
+optional CRC32 and the payload. The coded body ends with the last
+payload. The payload hash and the plane CRCs check decoded bytes, not
+the coded payload. The payload hash already covers every plane of the
+one tensor, so the writer stores plane CRCs only when it does not
+store the hash, and a reader rejects a frame with both. The frame does not store plane layouts, plane lengths or
 the plane count, because the decoder derives them from the chain.
 
-The fixed cost is 10 to 70 bytes, depending on the chain and on
-which integrity fields are on: about 48 bytes for a bf16 tensor and
-68 bytes for an fp32 tensor with the payload hash and plane CRCs on.
+The fixed cost is about 10 to 70 bytes, depending on the chain and
+on which integrity fields are on. With the default settings (payload
+hash on) it is at most about 50 bytes for a bf16 tensor, 55 bytes for
+an fp32 tensor with the split chain, and 61 bytes for an fp32 tensor
+with the IntDelta or PredictorXor chain that smooth data selects.
+Plane CRCs instead of the hash add up to 8 bytes more for four
+planes.
 A tensor whose planes need shared state (a prelude) or chunked
 encoding cannot use the frame; the compressor writes a full
 container for it. The frame holds no extension table, so it can

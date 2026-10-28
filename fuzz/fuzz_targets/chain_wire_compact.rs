@@ -7,6 +7,8 @@
 //
 // Input layout: byte 0 selects the bound Source (bit 0 set: none; else
 // params for a [3, 5] fp32 tensor); the rest is the chain.
+// Seeds in `corpus/chain_wire_compact` are chains from production frames,
+// bound and explicit, with the selector byte.
 
 use libfuzzer_sys::fuzz_target;
 use ptwm_core::chain::validate::validate_chain;

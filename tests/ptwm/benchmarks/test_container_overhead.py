@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from ptwm import CompressionConfig, Compressor, Decompressor, Format
 from ptwm._config import Framing
 
 from benchmarks.container_overhead import (
@@ -17,6 +18,7 @@ from benchmarks.container_overhead import (
     SIZES,
     make_tensor,
     measure,
+    non_payload_bytes,
     tiled_rows,
 )
 
@@ -24,10 +26,17 @@ from benchmarks.container_overhead import (
 # codec payload is smaller than zstd-19's output.
 SLACK = 64
 
-# Largest compact-frame non-payload bytes (header, compact chain, plane heads,
-# payload hash and plane CRCs) per dtype. fp32 frames carry four planes, bf16
-# frames two. Measured maxima over SIZES: fp32 68 B, bf16 48 B.
-COMPACT_OVERHEAD = {"bf16": 55, "fp32": 70}
+# Largest compact-frame non-payload bytes (header, compact chain, plane heads
+# and payload hash; the frame omits plane CRCs when it stores the hash) per
+# dtype. fp32 frames carry four planes, bf16 frames two. Measured maxima over
+# SIZES: fp32 55 B, bf16 43 B.
+COMPACT_OVERHEAD = {"bf16": 50, "fp32": 62}
+
+# Bound for any fp32 or bf16 chain the compressor picks, including the
+# IntDelta and PredictorXor chains for smooth data, which carry an extra node
+# and a non-spine edge. Measured maxima for cumulative-sum data: fp32 61 B
+# with the default config, 69 B with plane CRCs and no payload hash.
+CHAIN_OVERHEAD_LIMIT = 70
 
 
 def test_constant_64_byte_bf16_tensor_is_at_most_128_bytes() -> None:
@@ -61,6 +70,29 @@ def test_constant_overhead_is_bounded(
     assert row.out <= row.raw + SLACK, row
     assert row.non_payload <= COMPACT_OVERHEAD[dname], row
     assert row.out <= 256, row
+
+
+@pytest.mark.parametrize(
+    ("hash_", "crc"), [(True, True), (False, True), (False, False)]
+)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("n", [64, 1024, 65536, 262144])
+def test_smooth_data_overhead_is_bounded(
+    hash_: bool, crc: bool, dtype: torch.dtype, n: int
+) -> None:
+    g = torch.Generator().manual_seed(n)
+    t = torch.cumsum(torch.randn(n, generator=g), 0).to(dtype)
+    blob = Compressor(
+        CompressionConfig(
+            input_format=Format.TORCH,
+            emit_payload_hash=hash_,
+            emit_plane_crc=crc,
+        )
+    ).compress(t)
+    assert blob[:5] == b"\x89PTWS"
+    back = Decompressor().decompress(blob)
+    assert torch.equal(back.view(torch.uint8), t.view(torch.uint8))
+    assert non_payload_bytes(blob) <= CHAIN_OVERHEAD_LIMIT, (dtype, n)
 
 
 def test_tiled_rows_ratio_is_at_least_60() -> None:

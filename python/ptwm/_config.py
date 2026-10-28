@@ -46,7 +46,7 @@ class Framing(Enum):
     r"""Byte layout of a single-tensor :meth:`Compressor.compress` output.
 
     ``COMPACT`` writes a compact single-tensor frame (magic ``\x89PTWS``)
-    with a fixed cost of about 10 to 70 bytes, and stores the raw bytes when
+    with a fixed cost of at most about 70 bytes, and stores the raw bytes when
     no codec makes them smaller. It falls back to ``CONTAINER`` when the
     tensor cannot use the frame (streaming, or a plane that selects shared
     codec state). ``CONTAINER`` writes a full ``.ptwm`` container (magic
@@ -116,7 +116,11 @@ class CompressionConfig:
     emit_payload_hash: bool = True
     """Store an xxh64 of the raw bytes (8 B per tensor), checked on decode."""
     emit_plane_crc: bool = True
-    """Store a CRC32 of every coded plane (4 B per plane), checked on decode."""
+    """Store a CRC32 of every coded plane (4 B per plane), checked on decode.
+
+    A compact frame stores plane CRCs only when ``emit_payload_hash`` is off:
+    the payload hash already covers every plane of its one tensor.
+    """
 
     @classmethod
     def from_resolved_policy(

@@ -3,9 +3,10 @@
 //!
 //! Parsing is canonical: a varint must use the fewest bytes that hold its
 //! value (no trailing `0x80`/`0x00` groups), is at most 10 bytes long, and
-//! must fit in `u64`. Together with the other fail-closed checks of the
-//! compact formats, this makes every accepted byte string the only encoding
-//! of its value, so `write(parse(b)) == b`.
+//! must fit in `u64`, so each value has one varint encoding. The compact
+//! formats build on this: each of their fields has one encoding for the
+//! value it holds. (A compact frame as a whole still leaves the writer some
+//! choices; see [`crate::compact`].)
 
 use crate::error::PtwmCoreError;
 

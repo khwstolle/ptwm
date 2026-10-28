@@ -2,7 +2,8 @@
 
 // `Decompressor.decompress` hands any blob that starts with the compact-frame
 // magic to `decode_compact`. The parser must never panic or infinite-loop on
-// adversarial input.
+// adversarial input. Seeds in `corpus/compact_decode` are production frames
+// without the magic.
 
 use libfuzzer_sys::fuzz_target;
 use ptwm_core::compact::{FLAG_SHAPE, FLAG_SIZE, MAGIC_COMPACT, decode_compact, size_from_shape};
@@ -44,5 +45,10 @@ fuzz_target!(|data: &[u8]| {
     let mut buf = Vec::with_capacity(MAGIC_COMPACT.len() + data.len());
     buf.extend_from_slice(&MAGIC_COMPACT);
     buf.extend_from_slice(data);
-    let _ = decode_compact(&buf);
+    if decode_compact(&buf).is_ok() {
+        // A frame is self-delimiting: no accepted frame stays valid with a
+        // byte appended.
+        buf.push(0);
+        assert!(decode_compact(&buf).is_err(), "appended byte accepted");
+    }
 });

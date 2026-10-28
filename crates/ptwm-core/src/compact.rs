@@ -7,7 +7,9 @@
 //!
 //! ```text
 //!     magic:          [u8; 5]   \x89PTWS
-//!     flags:          u8        see FLAG_*; unknown bits are rejected
+//!     flags:          u8        see FLAG_*; unknown bits are rejected,
+//!                               and FLAG_PLANE_CRC with FLAG_PAYLOAD_HASH
+//!                               is rejected
 //!     dtype_code:     varint    at most u16::MAX
 //!     input_format:   u8
 //!     [orig_size]     varint    raw byte count                  (FLAG_SIZE)
@@ -42,19 +44,29 @@
 //!         [state_version] u8          (state 1)
 //!         [state_len]     varint      (state 1)
 //!         [state]         bytes       (state 1)
-//!         [payload_len]   varint      every plane but the last; the last
-//!                                     payload runs to the end of the frame
+//!         payload_len:    varint
 //!         [crc32]         u32         CRC32 of the raw plane (FLAG_PLANE_CRC)
 //!         payload:        bytes
 //! ```
 //!
 //! State 1 with version 0 and an empty state is rejected: state 2 is its
-//! only encoding. All integers are little-endian; varints are canonical
-//! unsigned LEB128 ([`crate::varint`]). Every header and chain field has
-//! exactly one encoding. A stored body must be exactly `orig_size` bytes,
-//! and a coded body ends with the last plane's payload, so bytes appended to
-//! a coded frame reach the last plane's codec, which rejects them or ignores
-//! them; the plane CRC and payload hash still guard the decoded bytes.
+//! only encoding. States 0 and 2 decode alike; the frame keeps the
+//! distinction the codec reported, and the reader accepts either. All
+//! integers are little-endian; varints are canonical unsigned LEB128
+//! ([`crate::varint`]). A stored body must be exactly `orig_size` bytes, and
+//! a coded body must end exactly with the last plane's payload, so the reader
+//! rejects bytes appended to either.
+//!
+//! The payload hash covers the decoded bytes of the one tensor, and so every
+//! plane, so the writer stores plane CRCs only when it does not store the
+//! hash. Both checks verify decoded bytes; they do not cover the coded
+//! payload.
+//!
+//! Each header, chain and plane field has one encoding for the value it
+//! holds. The frame as a whole is not unique for a tensor: the writer
+//! chooses between a stored and a coded body, between plane state codes 0
+//! and 2, and between codecs and chains, and the reader accepts any valid
+//! choice.
 //!
 //! The plane layout, the decoded plane length and the plane count all come
 //! from the chain, so the frame does not store them. Planes that need shared
@@ -91,7 +103,8 @@ pub const MAGIC_COMPACT: [u8; 5] = [0x89, b'P', b'T', b'W', b'S'];
 
 /// The frame carries an xxh64 of the raw bytes.
 pub const FLAG_PAYLOAD_HASH: u8 = 0x01;
-/// Every coded plane carries a CRC32 of its raw bytes.
+/// Every coded plane carries a CRC32 of its raw bytes. Not combined with
+/// [`FLAG_PAYLOAD_HASH`], which already covers every plane.
 pub const FLAG_PLANE_CRC: u8 = 0x02;
 /// The frame carries the tensor shape.
 pub const FLAG_SHAPE: u8 = 0x04;
@@ -226,11 +239,14 @@ pub fn compress_compact(
         out.extend_from_slice(&xxh64(raw, 0).to_le_bytes());
     }
 
-    let coded = encode_body(input, opts, bound_source.as_deref())?;
+    // The payload hash covers the decoded bytes of every plane, so plane
+    // CRCs would only repeat it.
+    let plane_crc = opts.emit_plane_crc && !opts.emit_payload_hash;
+    let coded = encode_body(input, opts, bound_source.as_deref(), plane_crc)?;
     match coded {
         None => return Ok(None),
         Some(body) if body.len() < raw.len() => {
-            if opts.emit_plane_crc {
+            if plane_crc {
                 flags |= FLAG_PLANE_CRC;
             }
             out.extend_from_slice(&body);
@@ -250,6 +266,7 @@ fn encode_body(
     input: &InputTensor<'_>,
     opts: &CompressorOptions,
     bound_source: Option<&[u8]>,
+    plane_crc: bool,
 ) -> Result<Option<Vec<u8>>, PtwmCoreError> {
     let plan = plan_model(std::slice::from_ref(input), opts)?;
     if !plan.prelude_entries.is_empty() {
@@ -266,7 +283,7 @@ fn encode_body(
     );
     write_chain_compact(chain, bound_source, op_wire_ref, &mut body)?;
 
-    for (i, cp) in planes.iter().enumerate() {
+    for cp in planes {
         let codec = u64::from(cp.codec_id.as_u16()) << 2;
         match cp.state_source {
             StateSource::None => write_varint(&mut body, codec | STATE_NONE),
@@ -283,10 +300,8 @@ fn encode_body(
             }
             StateSource::Shared | StateSource::External => return Ok(None),
         }
-        if i + 1 < planes.len() {
-            write_varint(&mut body, cp.payload_bytes.len() as u64);
-        }
-        if opts.emit_plane_crc {
+        write_varint(&mut body, cp.payload_bytes.len() as u64);
+        if plane_crc {
             body.extend_from_slice(&crc32fast::hash(&cp.raw_plane_for_crc).to_le_bytes());
         }
         body.extend_from_slice(&cp.payload_bytes);
@@ -317,6 +332,9 @@ fn read_header(r: &mut Cursor<'_>) -> Result<FrameHeader, PtwmCoreError> {
             "unknown flag bits {:#04x}",
             flags & !KNOWN_FLAGS
         )));
+    }
+    if flags & FLAG_PLANE_CRC != 0 && flags & FLAG_PAYLOAD_HASH != 0 {
+        return Err(r.err("plane CRC flag with payload hash"));
     }
     let dtype_code = r.varint_max(u64::from(u16::MAX), "dtype_code")? as u16;
     let input_format = r.u8()?;
@@ -465,7 +483,7 @@ fn decode_body(
 
     let n_planes = descriptors.len();
     let mut terminal_planes: Vec<Plane> = Vec::with_capacity(n_planes);
-    for (i, descriptor) in descriptors.into_iter().enumerate() {
+    for descriptor in descriptors {
         let head = r.varint()?;
         let wire = u16::try_from(head >> 2).map_err(|_| r.err("codec id exceeds u16"))?;
         let codec_id = CodecId::from_u16(wire)
@@ -482,10 +500,9 @@ fn decode_body(
             }
             s => return Err(r.err(format_args!("unknown state code {s}"))),
         };
-        let last = i + 1 == n_planes;
-        let payload_len = if last { None } else { Some(r.len_varint()?) };
+        let payload_len = r.len_varint()?;
         let crc = if has_crc { Some(r.u32_le()?) } else { None };
-        let payload = r.take(payload_len.unwrap_or(r.remaining()))?;
+        let payload = r.take(payload_len)?;
         *payload_len_out += (state.len() + payload.len()) as u64;
 
         let codec = codec_for(codec_id)
@@ -891,7 +908,7 @@ mod tests {
     #[test]
     fn fp32_frame_binds_source_and_stays_small() {
         let raw = fp32_raw(4096);
-        for (h, c) in [(true, true), (false, false)] {
+        for (h, c) in [(true, true), (false, false), (false, true)] {
             let blob = compress_compact(&fp32_input(&raw, &[64, 64]), &opts(h, c))
                 .unwrap()
                 .unwrap();
@@ -903,11 +920,27 @@ mod tests {
             assert_eq!(t.dtype_name.as_deref(), Some("float32"));
             let overhead = blob.len() as u64 - t.payload_len;
             // magic 5, flags 1, dtype 1, format 1, shape 3, chain 19,
-            // 4 plane heads, 3 payload lengths; plus hash 8 and 4 CRCs.
-            let limit = if h { 33 + 8 + 4 + 16 + 8 } else { 33 + 4 + 8 };
+            // 4 plane heads, 4 payload lengths (up to 2 bytes each); plus
+            // the hash (8) or 4 CRCs (16), never both.
+            let integrity = match (h, c) {
+                (true, _) => 8,
+                (false, true) => 16,
+                (false, false) => 0,
+            };
+            let limit = 31 + 4 + 8 + integrity;
             assert!(
                 overhead <= limit,
-                "overhead {overhead} > {limit} (hash {h})"
+                "overhead {overhead} > {limit} (hash {h}, crc {c})"
+            );
+            assert_eq!(
+                flags & (FLAG_PAYLOAD_HASH | FLAG_PLANE_CRC),
+                if h {
+                    FLAG_PAYLOAD_HASH
+                } else if c {
+                    FLAG_PLANE_CRC
+                } else {
+                    0
+                }
             );
             // The Source dims are not stored.
             let dims: Vec<u8> = [&64u32.to_le_bytes()[..], &64u32.to_le_bytes()].concat();
@@ -1024,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn plane_state_codes_are_canonical() {
+    fn plane_state_codes_are_checked() {
         let raw: Vec<u8> = (0..4096u32).map(|i| (i % 7) as u8).collect();
         let mut o = opts(false, false);
         o.forced_codec = Some(CodecId::Zstd);
@@ -1036,7 +1069,9 @@ mod tests {
         // Zstd carries an empty version-0 inline state: state code 2.
         assert_eq!(blob[at], (4 << 2) | 2);
         let with_head = |head: &[u8]| [&blob[..at], head, &blob[at + 1..]].concat();
-        // The same plane with state code 0 decodes (decode treats both alike).
+        // The same plane with state code 0 decodes: decode treats both
+        // alike, and the frame keeps the state kind the codec reported, so
+        // these two frames are both valid for one tensor.
         assert_eq!(decode_compact(&with_head(&[4 << 2])).unwrap().raw, raw);
         // State code 1 with an empty version-0 state is non-canonical.
         let err = decode_compact(&with_head(&[(4 << 2) | 1, 0, 0]))
@@ -1050,24 +1085,79 @@ mod tests {
     }
 
     #[test]
-    fn last_plane_runs_to_the_end_of_the_frame() {
-        let raw = fp32_raw(1024);
-        let blob = compress_compact(&fp32_input(&raw, &[1024]), &opts(true, true))
+    fn appended_bytes_are_rejected() {
+        let fp32 = fp32_raw(1024);
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i % 7) as u8).collect();
+        let mut blobs = Vec::new();
+        for (h, c) in [(true, true), (false, true), (false, false)] {
+            blobs.push(
+                compress_compact(&fp32_input(&fp32, &[1024]), &opts(h, c))
+                    .unwrap()
+                    .unwrap(),
+            );
+            blobs.push(
+                compress_compact(&input(&bytes, None, None), &opts(h, c))
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let mut zstd = opts(true, false);
+        zstd.forced_codec = Some(CodecId::Zstd);
+        blobs.push(
+            compress_compact(&input(&bytes, None, None), &zstd)
+                .unwrap()
+                .unwrap(),
+        );
+        for blob in &blobs {
+            assert_eq!(blob[FLAGS_AT] & FLAG_STORED, 0);
+            let t = decode_compact(blob).unwrap();
+            // Every payload byte is accounted for: the coded body ends with
+            // the last payload.
+            assert!(t.payload_len > 0);
+            for cut in 0..blob.len() {
+                assert!(decode_compact(&blob[..cut]).is_err(), "cut at {cut}");
+            }
+            for tail in [&[0u8][..], &[0u8; 7], &[0xFFu8; 100]] {
+                let longer = [blob.as_slice(), tail].concat();
+                let err = decode_compact(&longer).unwrap_err().to_string();
+                assert!(err.contains("trailing"), "{} appended: {err}", tail.len());
+            }
+        }
+        // A stored body must be exactly orig_size bytes.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let noise: Vec<u8> = (0..300)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let stored = compress_compact(&input(&noise, None, None), &opts(true, true))
             .unwrap()
             .unwrap();
-        assert_eq!(decode_compact(&blob).unwrap().raw, raw);
-        // Every truncation fails: a short last payload fails its codec, CRC
-        // or the payload hash.
-        for cut in 0..blob.len() {
-            assert!(decode_compact(&blob[..cut]).is_err(), "cut at {cut}");
-        }
-        // A byte appended to the frame becomes part of the last payload.
-        // Whether that fails depends on the codec; it must never return
-        // other data.
-        let mut longer = blob.clone();
-        longer.push(0);
-        if let Ok(t) = decode_compact(&longer) {
-            assert_eq!(t.raw, raw);
-        }
+        assert_ne!(stored[FLAGS_AT] & FLAG_STORED, 0);
+        assert!(decode_compact(&[stored.as_slice(), &[0]].concat()).is_err());
+    }
+
+    #[test]
+    fn plane_crc_is_not_combined_with_the_payload_hash() {
+        let raw = fp32_raw(256);
+        let with_crc = compress_compact(&fp32_input(&raw, &[256]), &opts(false, true))
+            .unwrap()
+            .unwrap();
+        assert_eq!(with_crc[FLAGS_AT], FLAG_SHAPE | FLAG_PLANE_CRC);
+        decode_compact(&with_crc).unwrap();
+        // Add the payload hash to the CRC frame: the writer never does.
+        let at = body_start(&with_crc);
+        let mut b = [
+            &with_crc[..at],
+            &xxh64(&raw, 0).to_le_bytes()[..],
+            &with_crc[at..],
+        ]
+        .concat();
+        b[FLAGS_AT] |= FLAG_PAYLOAD_HASH;
+        let err = decode_compact(&b).unwrap_err().to_string();
+        assert!(err.contains("plane CRC flag with payload hash"), "{err}");
     }
 }

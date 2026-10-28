@@ -10,10 +10,14 @@ the per-tensor overhead of multi-tensor containers. The sweeps match
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import torch
-from ptwm import CompressionConfig, Compressor, Decompressor, Format
+from ptwm import CompressionConfig, Compressor, Decompressor, Format, _rust
 from ptwm._config import ContainerLayout, Framing
+from ptwm._magic import container_kind
+from ptwm.codecs import CodecId
 
 from benchmarks.container_overhead import (
     DTYPES,
@@ -139,8 +143,8 @@ def test_codec_data_is_counted_alike_in_every_format(
     dname: str, dtype: torch.dtype, nbytes: int
 ) -> None:
     # The three formats carry the same coded planes for the same tensor, so
-    # payload plus inline state must come out equal. A count that left inline
-    # state out for one format would differ here.
+    # the codec data must come out equal. These inputs carry no codec state;
+    # the two tests below cover inline and shared state.
     t = make_tensor(dtype, "normal", nbytes)
     data = {
         f"{framing.name}/{layout.name}": codec_data_bytes(
@@ -149,6 +153,72 @@ def test_codec_data_is_counted_alike_in_every_format(
         for framing, layout in FORMATS
     }
     assert len(set(data.values())) == 1, data
+
+
+def _payload_only_bytes(blob: bytes) -> int:
+    """Sum of the plane payloads of a container, without any codec state."""
+    _registry, tensors, _members = _rust.explode_ptwm(blob)
+    return sum(
+        plane["comp_len"]
+        for _name, _key, tensor_json in tensors
+        for plane in json.loads(tensor_json)["planes"]
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_inline_state_is_counted_alike_in_every_format(dtype: torch.dtype) -> None:
+    # ArithmeticO0 stores its frequency table as inline codec state, so the
+    # count must include it in every format. A count that left inline state
+    # out of the containers would come out smaller than the frame's.
+    t = torch.randn(16384, generator=torch.Generator().manual_seed(3)).to(dtype)
+    data = {}
+    for framing, layout in FORMATS:
+        blob = Compressor(
+            CompressionConfig(
+                input_format=Format.TORCH,
+                framing=framing,
+                container_layout=layout,
+                codec_menu=[CodecId.ArithmeticO0],
+            )
+        ).compress(t)
+        back = Decompressor().decompress(blob)
+        assert torch.equal(back.view(torch.uint8), t.view(torch.uint8))
+        data[container_kind(blob)] = codec_data_bytes(blob)
+        if framing == Framing.CONTAINER:
+            # The input really carries inline state.
+            assert codec_data_bytes(blob) > _payload_only_bytes(blob), layout
+    assert set(data) == {"ptws", "ptwc", "ptwm"}, data
+    assert len(set(data.values())) == 1, data
+
+
+@pytest.mark.parametrize("layout", [ContainerLayout.LEGACY, ContainerLayout.COMPACT])
+def test_shared_state_is_counted(layout: ContainerLayout) -> None:
+    # A container with one shared (prelude) state, built through the
+    # transcoder: its bytes count as codec data in both container layouts.
+    # A single-tensor frame cannot hold shared state.
+    t = make_tensor(torch.float32, "normal", 4096)
+    blob = compress_checked(t, Framing.CONTAINER, layout)
+    registry_json, tensors, members = _rust.explode_ptwm(blob)
+    registry = json.loads(registry_json)
+    state = bytes(range(200))
+    registry["registry"]["shared_state"].append(
+        {
+            "id": 0,
+            "codec": int(CodecId.Order1ScaleAC),
+            "state_format_version": 1,
+            "applies_to_mask": 1,
+            "hash_xxh64": f"{_rust.xxhash64(state):016x}",
+            "name": "s",
+            "payload": "shared.bin",
+        }
+    )
+    with_state = _rust.implode_ptwm(
+        json.dumps(registry),
+        [tensor_json for _name, _key, tensor_json in tensors],
+        {**members, "shared.bin": state},
+    )
+    assert container_kind(with_state) == container_kind(blob)
+    assert codec_data_bytes(with_state) == codec_data_bytes(blob) + len(state)
 
 
 @pytest.mark.parametrize(("dname", "dtype"), DTYPES)

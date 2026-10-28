@@ -260,3 +260,59 @@ def test_directory_compression_with_several_processes(tmp_path: Path) -> None:
         blob = (tmp_path / (src.name + ".ptwm")).read_bytes()
         assert container_kind(blob) == "ptwm"
         assert Decompressor().decompress(blob) == src.read_bytes()
+
+
+def _builtin_label_versions(blob: bytes) -> set[bytes]:
+    """Versions of every ``io.ptwm.builtin.<name>@<version>`` label in ``blob``."""
+    import re  # noqa: PLC0415
+
+    return set(re.findall(rb"io\.ptwm\.builtin\.[a-z0-9_]+@([0-9.]+)", blob))
+
+
+@pytest.mark.parametrize("layout", [None, "compact", "legacy"])
+def test_per_tensor_shell_honours_the_layout(
+    tmp_path: Path, layout: str | None
+) -> None:
+    """The default per-tensor path for a ``.safetensors`` file writes v1.1
+    readable ``\\x89PTWM`` containers with ``--container-layout legacy``. It
+    used to write ``\\x89PTWS`` frames whatever the flag said."""
+    from safetensors import safe_open  # noqa: PLC0415
+
+    src = _safetensors_file(tmp_path)
+    argv = [str(src), "--force"]
+    if layout is not None:
+        argv += ["--container-layout", layout]
+    handle_compress(_parse(argv))
+    out = tmp_path / "model.ptwm.safetensors"
+    whole = out.read_bytes()
+
+    from ptwm.integrations._safetensors import (  # noqa: PLC0415
+        decompress_safetensors_tensor,
+    )
+    from safetensors.torch import load_file  # noqa: PLC0415
+
+    want = load_file(str(src))
+    kinds = set()
+    with safe_open(str(out), "pt") as f:
+        assert set(f.keys()) == set(want)
+        for name, tensor in want.items():
+            stored = f.get_tensor(name)
+            if stored.dtype != torch.uint8:
+                # Stored raw: compression did not make it smaller.
+                assert torch.equal(stored, tensor), name
+                continue
+            kinds.add(container_kind(stored.numpy().tobytes()))
+            got = decompress_safetensors_tensor(stored)
+            if isinstance(got, torch.Tensor):
+                got = got.contiguous().view(torch.uint8).numpy().tobytes()
+            assert bytes(got) == tensor.contiguous().view(torch.uint8).numpy().tobytes()
+    assert kinds
+    if layout == "legacy":
+        assert kinds == {"ptwm"}
+        assert b"\x89PTWS" not in whole
+        assert b"\x89PTWC" not in whole
+        # A v1.1 reader recognises only the built-in ids of 1.1.0.
+        assert _builtin_label_versions(whole) == {b"1.1.0"}
+    else:
+        assert kinds <= {"ptws", "ptwc"}
+        assert b"\x89PTWM" not in whole

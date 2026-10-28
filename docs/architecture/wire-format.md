@@ -187,9 +187,13 @@ parser.
 
 A built-in entry has the canonical id
 `blake3(BUILTIN_PUBKEY ‖ 0x00 ‖ name ‖ 0x00 ‖ version)` and the label
-`io.ptwm.builtin.<name>@<version>`, where `version` is the crate
-version of the writer (`CURRENT_BUILTIN_VERSION`). The id therefore
-changes with every release, although the entry means the same thing.
+`io.ptwm.builtin.<name>@<version>`. Releases up to v1.1 wrote their own
+crate version there, so the id changed with every release although the
+entry means the same thing. From v1.2 the legacy writers write
+`LEGACY_BUILTIN_VERSION` (`1.1.0`) whatever their crate version, so
+v1.1 readers recognise their built-ins. The transcoder can write other
+versions with `ContainerWriter::set_builtin_version` to reproduce files
+of other releases.
 
 From v1.2 the reader handles this with `normalize_builtin_ids`: after
 the hash check, an entry whose label names a built-in and whose id
@@ -670,25 +674,25 @@ To write files that a v1.1 reader opens:
   `container_layout="legacy"` on `compress_ptwm_blob`,
   `write_ptwm_shard`, `compress_safetensors_file`, the LMDB and
   WebDataset writers and `_rust.compress_model`.
-- CLI: `ptwm compress --container-layout legacy`.
+- CLI: `ptwm compress --container-layout legacy`. It applies to every
+  output, and for a `.safetensors` file without `--mode` it writes each
+  tensor as a full `\x89PTWM` container instead of a `\x89PTWS` frame.
 - Rust: `CompressorOptions { container_layout: ContainerLayout::Legacy,
   .. }` or `ContainerWriter::new`.
 
-A legacy file carries the built-in ids of the writer's crate version
-(see [Built-in entries](#built-in-entries)), and a v1.1 reader
-recognises only the ids of version 1.1.0. This tree's crate version is
-1.1.0, so its legacy output opens in v1.1. A build with another crate
-version writes legacy files that v1.1 cannot open unless the writer
-pins the built-in version with `ContainerWriter::set_builtin_version`
-(Rust only).
+A v1.1 reader recognises only the built-in ids of version 1.1.0. The
+legacy writers stamp those ids whatever their own crate version (see
+[Built-in entries](#built-in-entries)), so their output opens in v1.1.
 
 ## Reader limits
 
 The readers treat every file as untrusted input. In both layouts:
 
-- every count is checked against the bytes that remain before a
-  vector is allocated, and every offset and length is added with
-  checked arithmetic;
+- a vector sized from a count or length read from the file is bounded
+  by the bytes that remain or by a small constant: an 8-bit or 16-bit
+  field, or 64 Extension Table entries, after which the table grows
+  only as entries parse. Every offset and length is added with checked
+  arithmetic;
 - the chain's Source must declare exactly `orig_size` bytes in PTWC
   and PTWS. A legacy Source may declare up to 8 × `orig_size`, so that
   files written by the v1.1 `Format.BYTE` bug keep decoding;

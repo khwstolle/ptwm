@@ -43,9 +43,10 @@ pub struct RegistryManifest {
 pub struct ContainerFlags {
     pub embedded_wasm: bool,
     /// Release whose built-in Extension Table ids and labels the container
-    /// was written with, when it is not the release reading it. `implode`
-    /// writes built-in entries (file-level and inline-chain tables) with
-    /// this version. Absent for the crate version.
+    /// was written with. `implode` writes built-in entries (file-level and
+    /// inline-chain tables) with this version. Absent for
+    /// [`crate::extension::LEGACY_BUILTIN_VERSION`] (`1.1.0`), the default of
+    /// the legacy writer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builtin_version: Option<String>,
 }

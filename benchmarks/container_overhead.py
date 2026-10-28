@@ -156,10 +156,9 @@ def codec_data_bytes(blob: bytes) -> int:
         # Payload plus inline state; the raw size for a stored frame.
         return _rust.decode_compact(blob)[6]
     registry_json, tensors, members = _rust.explode_ptwm(blob)
-    total = sum(
-        len(members[s["payload"]])
-        for s in json.loads(registry_json).get("shared_state", [])
-    )
+    # Both manifest forms keep the shared states under "registry".
+    shared = json.loads(registry_json)["registry"].get("shared_state", [])
+    total = sum(len(members[s["payload"]]) for s in shared)
     for _name, _key, tensor_json in tensors:
         for plane in json.loads(tensor_json)["planes"]:
             total += plane["comp_len"]

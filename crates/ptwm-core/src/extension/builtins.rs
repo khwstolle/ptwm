@@ -18,6 +18,14 @@ use crate::transforms::op::OpId;
 /// Version that the built-in ids and labels of this build derive from.
 pub const CURRENT_BUILTIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Version whose built-in ids and labels the legacy (`\x89PTWM`) writers
+/// stamp by default. It is fixed at the release whose reader the legacy
+/// layout exists for: a v1.1 reader recognises only the ids derived from
+/// `1.1.0`, so legacy output stays readable there whatever the crate
+/// version of the writer. Readers of every release map these ids back to
+/// the current ones (see [`normalize_builtin_ids`]).
+pub const LEGACY_BUILTIN_VERSION: &str = "1.1.0";
+
 /// Prefix of every built-in label: `io.ptwm.builtin.<name>@<version>`.
 pub const BUILTIN_LABEL_PREFIX: &str = "io.ptwm.builtin.";
 

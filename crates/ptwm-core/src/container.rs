@@ -157,7 +157,7 @@ pub struct BuiltExtensionTable {
 /// [`crate::extension::builtin_entries`].
 ///
 /// Built-in entries carry the ids and labels of `builtin_version`
-/// ([`crate::extension::CURRENT_BUILTIN_VERSION`] for new files). The
+/// ([`crate::extension::LEGACY_BUILTIN_VERSION`] for new legacy files). The
 /// returned `codec_idx_map` is keyed by the current canonical ids whatever
 /// the version.
 ///
@@ -336,6 +336,19 @@ impl ContainerLayout {
     }
 }
 
+/// Built-in version a new writer of `layout` stamps on built-in entries.
+///
+/// The legacy layout uses [`crate::extension::LEGACY_BUILTIN_VERSION`], so
+/// a v1.1 reader recognises its built-in ids whatever the crate version.
+/// The compact layout stores built-ins without a version; its tables use
+/// the crate version internally.
+fn default_builtin_version(layout: ContainerLayout) -> String {
+    match layout {
+        ContainerLayout::Legacy => crate::extension::LEGACY_BUILTIN_VERSION.to_owned(),
+        ContainerLayout::Compact => crate::extension::CURRENT_BUILTIN_VERSION.to_owned(),
+    }
+}
+
 /// Serializes tensor records for one container writer's layout and tables.
 ///
 /// [`ContainerWriter::record_encoder`] returns it so that callers can
@@ -452,6 +465,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
         }
 
         let header = Header::new_ptwm();
+        let builtin_version = default_builtin_version(layout);
 
         Ok(Self {
             writer,
@@ -459,7 +473,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
             compact_index: Vec::new(),
             encoder: RecordEncoder {
                 layout,
-                builtin_version: crate::extension::CURRENT_BUILTIN_VERSION.to_owned(),
+                builtin_version: builtin_version.clone(),
                 codec_ids: Vec::new(),
                 registry_bound: Vec::new(),
             },
@@ -477,7 +491,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
             finalized: false,
             prelude_section_len: 0,
             names: HashSet::new(),
-            builtin_version: crate::extension::CURRENT_BUILTIN_VERSION.to_owned(),
+            builtin_version,
             raw_extension_table: None,
             table_set: false,
         })
@@ -668,7 +682,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
     }
 
     /// Write built-in Extension Table entries with the ids and labels of
-    /// `version` instead of the crate version. This applies to the table
+    /// `version` instead of [`crate::extension::LEGACY_BUILTIN_VERSION`]. This applies to the table
     /// built by [`set_chain_registry`](Self::set_chain_registry) and
     /// [`set_chain_registry_with_codecs`](Self::set_chain_registry_with_codecs)
     /// and to inline-chain tables. The transcoder uses it to reproduce files
@@ -2478,6 +2492,37 @@ mod tests {
             w.codec_table_idx_for(&crate::extension::builtin_canonical_id("zstd"))
                 .is_some()
         );
+    }
+
+    /// A legacy writer stamps built-ins with the ids and labels of `1.1.0`,
+    /// which a v1.1 reader recognises, whatever the crate version. The
+    /// compact layout keeps the crate version internally.
+    #[test]
+    fn legacy_writer_stamps_legacy_builtin_version() {
+        use crate::extension::{BUILTIN_LABEL_PREFIX, BUILTIN_PUBKEY, LEGACY_BUILTIN_VERSION};
+        assert_eq!(LEGACY_BUILTIN_VERSION, "1.1.0");
+        let mut buf = Cursor::new(Vec::new());
+        let mut w = ContainerWriter::new(&mut buf).unwrap();
+        assert_eq!(w.builtin_version, "1.1.0");
+        assert_eq!(w.encoder.builtin_version, "1.1.0");
+        w.set_chain_registry(ChainRegistry {
+            chains: vec![(0, make_minimal_chain(1))],
+        })
+        .unwrap();
+        assert!(!w.extension_table.entries.is_empty());
+        for e in &w.extension_table.entries {
+            let rest = e.human_label.strip_prefix(BUILTIN_LABEL_PREFIX).unwrap();
+            let (name, ver) = rest.split_once('@').unwrap();
+            assert_eq!(ver, "1.1.0", "{}", e.human_label);
+            assert_eq!(
+                e.canonical_id,
+                CanonicalId::derive(&BUILTIN_PUBKEY, name, "1.1.0")
+            );
+        }
+
+        let mut buf = Cursor::new(Vec::new());
+        let w = ContainerWriter::with_layout(&mut buf, ContainerLayout::Compact).unwrap();
+        assert_eq!(w.builtin_version, crate::extension::CURRENT_BUILTIN_VERSION);
     }
 
     /// Serialized Extension Table of a container written with `registry`.

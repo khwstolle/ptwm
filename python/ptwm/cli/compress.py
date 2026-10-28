@@ -27,7 +27,9 @@ _CODEC_NAME_MAP: dict[str, CodecId] = {
 _CONTAINER_LAYOUT_HELP = (
     "Layout of written .ptwm containers: 'compact' (default; magic "
     "\\x89PTWC, readable by ptwm v1.2 and later) or 'legacy' (magic "
-    "\\x89PTWM, readable by v1.1 and later)."
+    "\\x89PTWM, readable by v1.1 and later). With 'legacy', per-tensor "
+    "safetensors output also uses full \\x89PTWM containers instead of "
+    "the v1.2 \\x89PTWS frame."
 )
 
 
@@ -383,10 +385,12 @@ def compress_safetensors_file(
     device: int | None = None,
     container_layout: str = "compact",
 ) -> None:
-    """Compress a safetensors file.
+    r"""Compress a safetensors file.
 
-    ``container_layout`` applies to tensors that do not fit the compact
-    single-tensor frame and are written as full containers.
+    With ``container_layout="compact"`` (the default) each tensor is a
+    ``\x89PTWS`` frame, or a ``\x89PTWC`` container when it does not fit
+    the frame. With ``container_layout="legacy"`` each tensor is a
+    ``\x89PTWM`` container, which v1.1 readers open.
     """
     import torch  # noqa: PLC0415
     from safetensors import safe_open  # noqa: PLC0415
@@ -397,7 +401,7 @@ def compress_safetensors_file(
         Compressor,
         Method,
     )
-    from ptwm._config import Format  # noqa: PLC0415
+    from ptwm._config import Format, Framing, container_layout_name  # noqa: PLC0415
     from ptwm.utils._safetensors import (  # noqa: PLC0415
         COMPRESSED_DTYPE,
         COMPRESSION_METHOD,
@@ -433,6 +437,13 @@ def compress_safetensors_file(
     )
 
     compressor_cache = {}
+    # The compact single-tensor frame is a v1.2 format, so legacy output
+    # writes every tensor as a full container.
+    framing = (
+        Framing.CONTAINER
+        if container_layout_name(container_layout) == "legacy"
+        else Framing.COMPACT
+    )
 
     with safe_open(filename, "pt", "cpu") as f:
         for name in f.keys():  # noqa: SIM118
@@ -451,6 +462,7 @@ def compress_safetensors_file(
                         codec_menu=codec_menu,
                         codec=codec,
                         device=device,
+                        framing=framing,
                         container_layout=container_layout,
                     )
                 )

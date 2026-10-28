@@ -9,7 +9,7 @@ use crate::chain::Chain;
 use crate::chain::wire::{read_chain, write_chain};
 use crate::error::PtwmCoreError;
 use crate::extension::table::ExtensionTable;
-use crate::extension::{CURRENT_BUILTIN_VERSION, ExtensionTableBuilder, normalize_builtin_ids};
+use crate::extension::{ExtensionTableBuilder, LEGACY_BUILTIN_VERSION, normalize_builtin_ids};
 use crate::plane_record::{PlaneRecord, parse_plane_record, write_plane_record};
 
 pub const TENSOR_FLAG_DEPENDENCIES: u8 = 0x01;
@@ -90,12 +90,14 @@ pub(crate) fn checked_len<T: TryFrom<usize>>(n: usize, what: &str) -> Result<T, 
     })
 }
 
-/// Append the serialized record to `out`.
+/// Append the serialized record to `out`. Built-in entries of an inline
+/// chain's Extension Table carry the ids and labels of
+/// [`LEGACY_BUILTIN_VERSION`].
 ///
 /// On error, `out` is truncated back to its length before the call, so a
 /// failed write never leaves a partial record behind.
 pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), PtwmCoreError> {
-    write_tensor_record_with_builtin_version(rec, out, CURRENT_BUILTIN_VERSION)
+    write_tensor_record_with_builtin_version(rec, out, LEGACY_BUILTIN_VERSION)
 }
 
 /// [`write_tensor_record`] with the inline chain's Extension Table written
@@ -367,7 +369,9 @@ pub fn parse_tensor_record_with_builtin_version(
         need(buf, pos, 2, "dep_count")?;
         let dep_count = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
-        let mut deps = Vec::with_capacity(dep_count);
+        // Every dependency takes at least 4 bytes, so the reservation is
+        // bounded by the bytes that remain, not by the forged count.
+        let mut deps = Vec::with_capacity(dep_count.min((buf.len() - pos) / 4));
         for _ in 0..dep_count {
             need(buf, pos, 4, "dependency header")?;
             let ref_kind_raw = buf[pos];
@@ -570,6 +574,78 @@ mod tests {
         assert_eq!(parsed.name, "lm_head.weight");
         assert_eq!(parsed.payload_hash, Some(0xDEAD_BEEF_CAFE_1234));
         assert_eq!(parsed.terminals.len(), 2);
+    }
+
+    /// The inline chain table of a legacy record carries the ids and labels
+    /// of `1.1.0`, which a v1.1 reader recognises, whatever the crate
+    /// version of the writer.
+    #[test]
+    fn inline_chain_builtins_use_legacy_version() {
+        assert_eq!(LEGACY_BUILTIN_VERSION, "1.1.0");
+        let rec = TensorRecord {
+            chain_ref: 0x8001,
+            dtype_code: 0x0010,
+            input_format: 0,
+            flags: 0,
+            orig_size: 2048,
+            name: "w".to_string(),
+            payload_hash: None,
+            inline_chain: Some(minimal_chain()),
+            dependencies: Vec::new(),
+            tensor_metadata: None,
+            terminals: vec![identity_plane(), identity_plane()],
+        };
+        let mut out = Vec::new();
+        write_tensor_record(&rec, &mut out).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        let labels: Vec<&str> = text
+            .match_indices("io.ptwm.builtin.")
+            .map(|(i, _)| &text[i..])
+            .collect();
+        assert!(!labels.is_empty());
+        for label in labels {
+            let rest = &label["io.ptwm.builtin.".len()..];
+            let (_, ver) = rest.split_once('@').unwrap();
+            assert!(ver.starts_with("1.1.0"), "{label:?}");
+        }
+        let (_, _, version) = parse_tensor_record_with_builtin_version(&out).unwrap();
+        assert_eq!(version.as_deref(), Some("1.1.0"));
+    }
+
+    /// A forged dependency count with no dependencies behind it fails as a
+    /// truncated record.
+    #[test]
+    fn forged_dependency_count_is_rejected() {
+        let rec = TensorRecord {
+            chain_ref: 0x0002,
+            dtype_code: 0x0002,
+            input_format: 0,
+            flags: 0,
+            orig_size: 4096,
+            name: "w".to_string(),
+            payload_hash: None,
+            inline_chain: None,
+            dependencies: vec![Dependency {
+                ref_kind: RefKind::LocalTensor,
+                expected_hash: None,
+                ref_bytes: b"x".to_vec(),
+            }],
+            tensor_metadata: None,
+            terminals: vec![identity_plane()],
+        };
+        let mut out = Vec::new();
+        write_tensor_record(&rec, &mut out).unwrap();
+        // The dependency section starts with its u16 count, followed by the
+        // dependency's kind byte and flags byte.
+        let dep = [1u8, 0, RefKind::LocalTensor as u8, 0, 1, 0, b'x'];
+        let at = out
+            .windows(dep.len())
+            .position(|w| w == dep)
+            .expect("dependency bytes");
+        out[at..at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        out.truncate(at + 2);
+        let err = parse_tensor_record(&out).unwrap_err().to_string();
+        assert!(err.contains("truncated"), "{err}");
     }
 
     #[test]

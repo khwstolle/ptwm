@@ -43,7 +43,7 @@ use crate::error::PtwmCoreError;
 use crate::extension::compact_table::{
     CompactEntry, TAG_CODEC, TAG_FULL, TAG_NAMED, TAG_OP, classify, read_compact_table,
 };
-use crate::extension::{CURRENT_BUILTIN_VERSION, CanonicalId, ExtensionTable};
+use crate::extension::{CanonicalId, ExtensionTable, LEGACY_BUILTIN_VERSION};
 use crate::header::FLAG_PTWX;
 use crate::layout::PlaneLayout;
 use crate::metadata::{decode_shape_metadata, encode_shape_metadata};
@@ -388,7 +388,7 @@ pub fn explode(blob: &[u8]) -> Result<Exploded, PtwmCoreError> {
         if record.inline_chain.is_some() {
             let version = inline_builtin_version
                 .as_deref()
-                .unwrap_or(CURRENT_BUILTIN_VERSION);
+                .unwrap_or(LEGACY_BUILTIN_VERSION);
             let mut reencoded = Vec::new();
             write_tensor_record_with_builtin_version(&record, &mut reencoded, version)?;
             if blob.get(start..start + consumed) != Some(reencoded.as_slice()) {
@@ -440,9 +440,7 @@ pub fn explode(blob: &[u8]) -> Result<Exploded, PtwmCoreError> {
     // tables are always re-encoded, so their version wins; the file-level
     // table is rebuilt with it when that reproduces the bytes.
     let builtin_version = inline_builtin_version.or_else(|| reader.builtin_version.clone());
-    let version = builtin_version
-        .as_deref()
-        .unwrap_or(CURRENT_BUILTIN_VERSION);
+    let version = builtin_version.as_deref().unwrap_or(LEGACY_BUILTIN_VERSION);
 
     // Check that implode can rebuild the Extension Table and the
     // shared-prelude section byte-exactly. When no table builder reproduces
@@ -480,7 +478,7 @@ pub fn explode(blob: &[u8]) -> Result<Exploded, PtwmCoreError> {
         manifest_version: MANIFEST_VERSION,
         container_flags: ContainerFlags {
             embedded_wasm,
-            builtin_version: builtin_version.filter(|v| v != CURRENT_BUILTIN_VERSION),
+            builtin_version: builtin_version.filter(|v| v != LEGACY_BUILTIN_VERSION),
         },
         registry_hash_blake3: hex::encode(reader.header.extension_table_hash),
         registry: Registry {
@@ -827,7 +825,7 @@ pub fn implode(
         .container_flags
         .builtin_version
         .as_deref()
-        .unwrap_or(CURRENT_BUILTIN_VERSION);
+        .unwrap_or(LEGACY_BUILTIN_VERSION);
 
     let prelude_entries = prelude_from_manifest(&registry.registry.shared_state, &mut members)?;
     let chain_registry = chains_from_manifest(&registry.registry.chains)?;

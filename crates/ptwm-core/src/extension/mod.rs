@@ -17,9 +17,9 @@ pub mod table;
 
 pub use builder::ExtensionTableBuilder;
 pub use builtins::{
-    BUILTIN_LABEL_PREFIX, BuiltinRef, BuiltinRegistry, CURRENT_BUILTIN_VERSION, builtin_entries,
-    builtin_entry, builtin_entry_at_version, builtin_registry, is_builtin,
-    is_valid_builtin_version, normalize_builtin_ids,
+    BUILTIN_LABEL_PREFIX, BuiltinRef, BuiltinRegistry, CURRENT_BUILTIN_VERSION,
+    LEGACY_BUILTIN_VERSION, builtin_entries, builtin_entry, builtin_entry_at_version,
+    builtin_registry, is_builtin, is_valid_builtin_version, normalize_builtin_ids,
 };
 pub use capability::{Capability, CapabilityMap};
 pub use dispatch::{BuiltinKind, dispatch_builtin};

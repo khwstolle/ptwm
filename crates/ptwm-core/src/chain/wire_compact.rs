@@ -3,7 +3,7 @@
 //! [`crate::chain::wire`] stores a chain with fixed-width fields and section
 //! lengths, which costs 50-70 bytes for a typical production chain. CW2
 //! stores the same [`Chain`] in about 15-20 bytes. The `\x89PTWS` compact
-//! frame uses it, and the compact container will too. The legacy wire stays
+//! frame and the `\x89PTWC` compact container use it. The legacy wire stays
 //! unchanged for `\x89PTWM` containers and Python chain blobs.
 //!
 //! ```text

@@ -1,9 +1,11 @@
-"""Size limits for single-tensor ``Compressor.compress`` output.
+"""Size limits for PTWM output.
 
-The fixed bytes per output (header, tables, framing) used to be about 2.7 KB,
-so small tensors came out larger than their input. These tests hold the
-default (compact) framing to the limits below and keep the full container's
-Extension Table trimmed. The sweep matches ``benchmarks/container_overhead``.
+The fixed bytes per single-tensor output (header, tables, framing) used to be
+about 2.7 KB, so small tensors came out larger than their input. These tests
+hold the default (compact) framing and the compact container (PTWC) to the
+limits below, keep the legacy container's Extension Table trimmed, and bound
+the per-tensor overhead of multi-tensor containers. The sweeps match
+``benchmarks/container_overhead``.
 """
 
 from __future__ import annotations
@@ -15,10 +17,17 @@ from ptwm._config import ContainerLayout, Framing
 
 from benchmarks.container_overhead import (
     DTYPES,
+    FORMATS,
     SIZES,
+    ShapeFn,
+    codec_data_bytes,
+    compress_checked,
+    distinct_shapes,
     make_tensor,
     measure,
+    measure_multi,
     non_payload_bytes,
+    same_shape,
     tiled_rows,
 )
 
@@ -113,3 +122,71 @@ def test_container_framing_floor_stays_trimmed(dname: str, dtype: torch.dtype) -
         ContainerLayout.LEGACY,
     )
     assert row.non_payload < 1100, row
+
+
+def test_formats_write_the_expected_magic() -> None:
+    t = make_tensor(torch.float32, "normal", 4096)
+    labels = [
+        measure(t, framing, "fp32", "normal", layout).framing
+        for framing, layout in FORMATS
+    ]
+    assert labels == ["ptws", "ptwc", "ptwm"]
+
+
+@pytest.mark.parametrize(("dname", "dtype"), DTYPES)
+@pytest.mark.parametrize("nbytes", [1024, 65536])
+def test_codec_data_is_counted_alike_in_every_format(
+    dname: str, dtype: torch.dtype, nbytes: int
+) -> None:
+    # The three formats carry the same coded planes for the same tensor, so
+    # payload plus inline state must come out equal. A count that left inline
+    # state out for one format would differ here.
+    t = make_tensor(dtype, "normal", nbytes)
+    data = {
+        f"{framing.name}/{layout.name}": codec_data_bytes(
+            compress_checked(t, framing, layout)
+        )
+        for framing, layout in FORMATS
+    }
+    assert len(set(data.values())) == 1, data
+
+
+@pytest.mark.parametrize(("dname", "dtype"), DTYPES)
+@pytest.mark.parametrize("nbytes", SIZES)
+def test_compact_container_overhead_is_bounded(
+    dname: str, dtype: torch.dtype, nbytes: int
+) -> None:
+    # A one-tensor PTWC file pays its header, Extension Table, registry,
+    # index and footer alone. Measured maxima over SIZES: fp32 141 B,
+    # bf16 117 B.
+    row = measure(
+        make_tensor(dtype, "normal", nbytes),
+        Framing.CONTAINER,
+        dname,
+        "normal",
+        ContainerLayout.COMPACT,
+    )
+    assert row.framing == "ptwc", row
+    assert row.non_payload <= 160, row
+
+
+@pytest.mark.parametrize(
+    ("shape_of", "hashes", "limit"),
+    [(same_shape, True, 95), (distinct_shapes, True, 100), (same_shape, False, 70)],
+    ids=["same-shape", "distinct-shapes", "no-hash-no-crc"],
+)
+def test_multi_tensor_overhead_per_tensor(
+    shape_of: ShapeFn, hashes: bool, limit: int
+) -> None:
+    # 64 fp32 (64,) bias vectors (synthesis cases A and B). Measured per
+    # tensor: 83.1 B, 82.6 B and 59.1 B, against 235 B, 288 B and 211 B for
+    # the legacy layout.
+    compact = measure_multi(
+        "fp32", "float32", shape_of, 64, ContainerLayout.COMPACT, hashes
+    )
+    legacy = measure_multi(
+        "fp32", "float32", shape_of, 64, ContainerLayout.LEGACY, hashes
+    )
+    assert (compact.layout, legacy.layout) == ("ptwc", "ptwm")
+    assert compact.per_tensor <= limit, compact
+    assert compact.per_tensor < legacy.per_tensor / 2, (compact, legacy)

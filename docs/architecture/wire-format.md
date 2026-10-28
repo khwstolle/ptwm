@@ -1,10 +1,25 @@
-# The `.ptwm` wire format
+# The `.ptwm` wire formats
 
-The on-disk container is the most stable surface in PTWM. Every
-change to it must be backwards compatible with every file that an
-older PTWM version may have produced. This document explains the
-overall shape and the reasoning behind the choices that are not
-obvious from the bytes themselves.
+The on-disk formats are the most stable surface in PTWM. A reader must
+keep decoding every file that an older PTWM release wrote, and a format
+change must make older readers fail cleanly instead of misreading the
+new bytes. This document describes the bytes of each format and the
+reasoning behind the choices that the bytes do not explain.
+
+PTWM writes three formats. All of them start with the bytes `\x89PTW`,
+and the fifth byte tells them apart:
+
+| Magic | Format | Writer | Readers |
+|---|---|---|---|
+| `\x89PTWM\r\n\x1a\n` | legacy multi-tensor container | `ContainerLayout::Legacy` / `container_layout="legacy"` | v1.2 and later; older releases with a caveat (see [Compatibility](#compatibility)) |
+| `\x89PTWX\r\n\x1a\n` | legacy container with embedded WASM extensions | extension bundling | as `\x89PTWM` |
+| `\x89PTWC\r\n\x1a\n` | compact multi-tensor container | `ContainerLayout::Compact`, the default | v1.2 and later |
+| `\x89PTWS` | compact single-tensor frame | `Compressor.compress`, the default | v1.2 and later |
+
+The three container magics are nine bytes long. The frame magic is five
+bytes long. Compare the whole magic, not a prefix: readers before v1.2
+check only for `\x89PTWM`, and that check is what makes them reject the
+newer formats.
 
 ## Why a custom container at all
 
@@ -14,325 +29,709 @@ the integration adapter (`compress_safetensors_file` with
 `mode="b"`), which produces a `.safetensors` file whose data section
 is a `.ptwm` blob. The native `.ptwm` container exists alongside the
 integration because three properties are hard to achieve in
-`.safetensors` directly:
+`.safetensors` directly.
 
 First, per-plane codec dispatch. A trained-weight tensor compresses
 best when its exponent byte and its mantissa bytes flow through
-different codecs. The plane records in PTWM let the decoder know
-which codec was used for which slice of bytes, with the slice
-boundaries recorded by the preprocessing chain rather than guessed
-at decode time. `.safetensors` has no notion of per-tensor metadata
-beyond shape and dtype.
+different codecs. The plane records in PTWM tell the decoder which
+codec produced each plane, and the preprocessing chain fixes the plane
+boundaries, so the decoder does not guess them. `.safetensors` has no
+notion of per-tensor metadata beyond shape and dtype.
 
-Second, shared state. The microscaling codecs (`Order1ScaleAC` and
-`PerGroupCodebook`) need a small probability table or codebook that
-multiple tensors share. The `.ptwm` prelude stores these once per
-file rather than once per tensor.
+Second, shared state. Some codecs (`Order1ScaleAC`, for example) use a
+probability table that several tensors can share. The prelude stores
+such state once per file instead of once per tensor.
 
-Third, the extension table. Third-party codecs need a stable way to
+Third, the Extension Table. Third-party codecs need a stable way to
 say "the bytes in this plane were produced by the codec with this
-canonical id". The extension table makes that explicit and lets the
-verifier check the contribution chain before any third-party code
-runs.
+canonical id". The Extension Table makes that explicit and lets the
+verifier check the contribution before any third-party code runs.
 
-## Top-level layout
+## Conventions
 
-The container is a flat byte stream with the following sections in
-order. All offsets and lengths are stored in little-endian.
+These rules hold for every format unless a section says otherwise.
+
+- Fixed-width integers are little-endian.
+- A *varint* is unsigned LEB128 (`crate::varint`). It is at most 10
+  bytes long and must be minimal: a reader rejects a varint with
+  redundant trailing `0x80` groups, so every value has one encoding.
+  Every varint field also has a range, given in its section, which the
+  reader checks.
+- A reader rejects bytes it does not understand (unknown flag bits,
+  unknown tags, unknown enum values) in the compact formats. The legacy
+  container is older and less strict; [What the legacy reader
+  checks](#what-the-legacy-reader-checks) lists the gaps.
+- Every container ends with the 8-byte EOF sentinel
+  `89 54 57 4D 45 4F 46 1A` (`\x89TWMEOF\x1a`, `index::EOF_SENTINEL`).
+  The reader checks it first, so a truncated file fails in constant
+  time. The first byte has the high bit set, like the magic, so a
+  transfer that strips the eighth bit also breaks the sentinel.
+
+## Versioning
+
+No format stores a numeric version. A version field tends to encourage
+a v1-then-v2 mindset: every reader becomes a switch statement over the
+version, and every breaking change adds another arm. PTWM uses two
+other mechanisms instead.
+
+1. **A new magic for an incompatible layout.** `\x89PTWX`,
+   `\x89PTWC` and `\x89PTWS` are examples. A reader that predates a
+   magic rejects the file at the magic check, so an old reader never
+   applies its rules to new bytes. The rule runs in that direction: a
+   new reader keeps reading the old magics.
+2. **Reserved flag bits for compatible additions.** In the compact
+   formats every flag bit that is not defined must be zero, and the
+   reader rejects the file otherwise. A future feature takes a free
+   bit, and readers that predate it reject files that use it with a
+   clear error. The PTWC header reserves all 16 bits of `hflags` for
+   this.
+
+Built-in operations and codecs are identified on the wire by the
+`OpId` and `CodecId` wire ids in PTWC and PTWS, and by the built-in
+name in the legacy Extension Table, whose ids are derived from the name
+and the release version (see [Built-in entries](#built-in-entries)).
+The legacy plane record and prelude also store `CodecId` wire ids. A
+reader decodes a built-in with the algorithm of its own release. **The meaning of a built-in wire id must
+never change.** A change to what a built-in op or codec does to the
+bytes, even a bug fix, needs a new `OpId` or `CodecId` and a new
+built-in name, with the old ones kept for decoding existing files.
+The same applies to a change to the layout of a codec's state or
+params: a new state version or a new id, never a reinterpretation.
+
+## Legacy container (`\x89PTWM`, `\x89PTWX`)
+
+`ContainerLayout::Legacy`. Every PTWM release reads this layout;
+readers before v1.2 also need the file's built-in ids to be those of
+their own version (see [Compatibility](#compatibility)).
 
 ```
-[ 91-byte header                       ]
-[ extension table                       ]   variable length
-[ shared-state prelude                  ]   variable length
-[ tensor 1 record                       ]
-[ tensor 2 record                       ]
+[ header                 ]  91 bytes
+[ Extension Table        ]  header: extension_table_offset/length
+[ prelude                ]  header: shared_prelude_offset; the
+[ chain registry         ]    shared-prelude section covers both
+[ tensor record 1        ]
+[ tensor record 2        ]
 ...
-[ tensor index                          ]   sorted by name hash
-[ 8-byte EOF sentinel: 0x89 P T W M EOF]
+[ tensor index           ]  header: tensor_index_offset/length
+[ EOF sentinel           ]  8 bytes
 ```
 
-Three of the four "variable length" sections (extension table,
-prelude, tensor index) carry their offset and length in the header.
-The header is fixed-size, so a reader can mmap the container, parse
-91 bytes, and jump to any section without scanning the rest.
+The writer streams the records and then seeks back to fill in the
+header, so it needs a seekable output.
 
-The EOF sentinel exists so a reader can detect a truncated file in
-constant time. The sentinel is `\x89PTWMEOF\x1a` plus padding; the
-first four bytes are PNG-style so that a file misnamed as an image
-type still trips an early decode error.
-
-## Header (91 bytes)
-
-The choice of 91 bytes is the result of two constraints meeting. A
-header that fits in one or two cache lines on a modern x86 machine
-keeps header parsing branch-predictable; the natural targets are 64
-or 128 bytes. The integrity field needs a cryptographic-strength
-hash so that a malformed extension table is detected before any of
-its entries are read; 32 bytes is the natural width for that. The
-remaining offset and length fields claim another 56 bytes between
-them, which puts the total above the 64-byte cache line. The 91
-bytes that result fit comfortably in two cache lines and leave room
-for the offset fields without a numeric version field competing for
-space.
-
-The header carries:
+### Header
 
 ```
-magic              [u8;9]    PTWM or PTWX
-flags              u16
-extension_table_offset u64
-extension_table_length u64
-extension_table_hash   [u8;32]   blake3
-tensor_index_offset    u64
-tensor_index_length    u64
-shared_prelude_offset  u64
-shared_prelude_length  u64
+magic                   [u8; 9]   \x89PTWM\r\n\x1a\n or \x89PTWX\r\n\x1a\n
+flags                   u16       bit 0: PTWX (embedded WASM)
+extension_table_offset  u64       91 in files current writers produce
+extension_table_length  u64
+extension_table_hash    [u8; 32]  blake3 of the Extension Table bytes
+tensor_index_offset     u64
+tensor_index_length     u64
+shared_prelude_offset   u64
+shared_prelude_length   u64       prelude and chain registry together
 ```
 
-The extension table hash is committed in the header rather than next
-to the table itself. A reader that wants to check integrity does it
-without trusting any byte that lives outside the header.
+The header is fixed-size, so a reader can map the file, read 91 bytes
+and go straight to the section it needs. There is no field for the
+chain registry: it starts where the prelude ends, inside the
+shared-prelude section, and the reader parses both from that section
+alone. Tensor records start at the end of the shared-prelude section.
 
-## No numeric version field
+The Extension Table hash sits in the header rather than next to the
+table, so a reader checks the table against bytes it has already
+read. Bit 0 of `flags` must be set exactly when the magic is
+`\x89PTWX`.
 
-PTWM does not store a version `u16` in the header. A version field
-tends to encourage a v1-then-v2 mindset: every reader becomes a
-switch statement over the version, and every breaking change adds
-another arm. The alternative used here is per-contribution version
-negotiation through the extension table, with a fresh magic for any
-wire-format change that crosses the contribution boundary. The
-PTWX magic (for the embedded-WASM variant) is one example of the
-pattern; a future format-incompatible variant would pick a new
-magic. Files with the old magic are rejected by new readers, so
-there is no path by which a reader silently applies new rules to
-old bytes.
-
-This is the kind of architecture choice that is hard to walk back.
-Adding a version field later is possible but the files in the wild
-at the time of the addition cannot benefit from it.
-
-## Extension table
-
-The extension table is the per-file manifest of every contribution
-the container needs at decode time. Each entry records:
+### Extension Table
 
 ```
-canonical_id       [u8;32]   blake3-derived
-human_label        utf8      length-prefixed
-kind               u16       Transform, PlaneCodec, ...
-abi_version        u16
-lifecycle          u8        none, thread, process
-flavor_hints       u8        bitfield: wasm, native, host
-capabilities       cbor
-attestation        Attestation
-install_hint       Option<utf8>
-embedded_wasm_offset Option<u64>
-embedded_wasm_length Option<u64>
+count                  u32        at most 65,536
+entry × count:
+    canonical_id         [u8; 32]
+    human_label          u16 length + UTF-8
+    kind                 u16      Transform, PlaneCodec, ...
+    abi_version          u16
+    lifecycle            u8
+    flavor_hints         u8       bit 0 WASM, bit 1 native, bit 2 host
+    capabilities         u32 length (at most 1 MiB) + canonical CBOR
+    attestation_kind     u8       1 = PGP signature
+    attestation          u16 length + bytes
+    install_hint         u16 length + UTF-8 (length 0: none)
+    embedded_wasm_offset u64      0: none
+    embedded_wasm_length u64      0: none
 ```
 
-The canonical id is the cryptographic identifier the verifier checks
-against the keyring. The human label is informational. The kind and
-abi_version together tell the host which ABI surface the
-contribution expects.
+The table lists every contribution the file needs at decode time:
+first the ops of every registry chain, then the plane codecs that the
+plane records reference, in built-in registry order. Chain nodes and
+plane records refer to entries by position. A built-in entry costs
+about 130 bytes (six entries take 779 bytes in a one-tensor fp32
+file), which is why the compact container stores built-ins by wire id
+instead.
 
-Two design choices here are worth flagging. The flavor hints are a
-bitfield rather than an enum because a contribution can ship in
-multiple flavours and the reader chooses based on host capability.
-The capabilities are CBOR rather than TOML because the format is
-parsed in Rust without an extra dependency on a TOML parser path
-that the reader would otherwise not need.
+Writers up to the v1.1.0 release interned all 16 built-in plane
+codecs, about 2 KB per file, whether or not a plane used them. Readers resolve
+`codec_table_idx` by position and check the table hash against the
+bytes present, so they read both forms. The transcoder rebuilds the
+table from the chain registry and the codec list and keeps whichever
+form reproduces the recorded hash.
 
-The writer interns the ops of every chain in the chain registry,
-then only the plane codecs that the plane records reference, in the
-order of the built-in registry. Writers up to v1.1 interned all 16
-built-in plane codecs, about 2 KB per file, whether or not a plane
-used them. Readers resolve `codec_table_idx` by position and check
-the table hash against the bytes present, so they decode both
-layouts. The table is a pure function of the chain registry and the
-codec set; the explode/implode transcoder relies on this to rebuild
-the same bytes from the codec list in the registry manifest.
+The flavor hints are a bitfield rather than an enum because a
+contribution can ship in several flavours and the reader picks one by
+host capability. The capabilities are CBOR so the reader needs no TOML
+parser.
 
-## Plane records
+#### Built-in entries
 
-Each tensor's record holds a fixed header plus a sequence of plane
-records, one per terminal of the preprocessing chain. The plane
-record carries:
+A built-in entry has the canonical id
+`blake3(BUILTIN_PUBKEY ‖ 0x00 ‖ name ‖ 0x00 ‖ version)` and the label
+`io.ptwm.builtin.<name>@<version>`, where `version` is the crate
+version of the writer (`CURRENT_BUILTIN_VERSION`). The id therefore
+changes with every release, although the entry means the same thing.
 
-```
-codec_id              u16       legacy CodecId enum
-codec_table_idx       u16       new: index into extension table
-role                  u8        role bytes from PPG terminal
-state_source          u8        none, inline, shared, external
-state_version         u8        per-codec version of the state
-state_info            u16       interpretation depends on source
-inline_state_bytes    bytes     present if source == inline
-shape                 list<u64> per-plane shape
-payload_hash          u64       optional
-plane_flags           u8        bitfield
-payload_len           u64
-crc32                 u32       optional
-chunk_table           Option<...>
-external_state        Option<...>
-payload_bytes         bytes
-```
+From v1.2 the reader handles this with `normalize_builtin_ids`: after
+the hash check, an entry whose label names a built-in and whose id
+re-derives from that label is mapped to the current built-in. An entry
+whose id does not re-derive keeps its id and is treated as third-party,
+so a forged label gains no trust. Readers before v1.2 recognise only
+the ids of their own version.
 
-The `codec_id` field predates the `codec_table_idx`. New writers fill
-both. Readers that see a valid `codec_table_idx` route through the
-extension table; readers that see only the legacy `codec_id` fall
-back to the in-tree codec table. This dual path will be removed once
-no field-deployed writer emits the legacy form alone.
-
-The state source is the most subtle field. PTWM's compression
-strategy depends on whether a codec needs per-plane state, a state
-shared across planes within a tensor, a state shared across tensors
-(the prelude case), or no state at all. The four-valued enum lets
-the writer record exactly one of those four, which the reader uses
-to find the bytes to feed back into the codec.
-
-## Compact single-tensor frame
-
-`Compressor.compress` writes one tensor. The container sections
-above cost about 500 to 1,000 bytes for one tensor, which is more
-than the payload of a small tensor. By default the compressor writes
-a compact frame instead, with its own magic `\x89PTWS`:
+### Prelude
 
 ```
-magic          [u8;5]    \x89PTWS
-flags          u8        payload hash, plane CRC, shape, dtype name,
-                         delta reference, stored, size; unknown bits
-                         and plane CRC with payload hash rejected
-dtype_code     varint
-input_format   u8
-orig_size      varint                             (if flagged)
-shape          varint ndim + varint dims          (if flagged)
-dtype_name     varint length + utf8               (if flagged)
-delta_ref      [u8;32]   blake3 of the reference  (if flagged)
-payload_hash   u64       xxh64 of the raw bytes   (if flagged)
-body
+count                   u32
+entry × count:
+    shared_state_id       u16
+    codec_id              u16      CodecId wire id
+    state_format_version  u8
+    applies_to_mask       u8       bit (r − 1) for PlaneRole r in 1..=8
+    reserved              u16
+    state_xxhash64        u64      xxh64 (seed 0) of state_bytes
+    name                  u16 length + UTF-8, zero-padded to a multiple of 4
+    state_bytes           u32 length + bytes
 ```
 
-`orig_size` is stored only when the shape does not give it as
-`product(shape) × element_size(dtype_code)`. The dtype name is stored
-only when it differs from the canonical name of `dtype_code`. Varints
-are minimal unsigned LEB128, and a reader rejects any field written
-in a form the writer would not produce, so each field has one
-encoding for the value it holds. The frame as a whole is not unique
-for a tensor: the writer chooses the codecs, the chain, a stored or a
-coded body, and plane state 0 or 2 (below), and the reader accepts
-any valid choice. A reader rejects bytes after the end of the body.
+A plane with state source Shared names an entry by `shared_state_id`
+(its `state_info`). The reader checks the version, the role mask and
+the hash before it hands the state to the codec.
 
-The body is either the raw bytes (the stored flag, written when no
-codec makes the tensor smaller) or a coded tensor: the chain in the
-compact chain wire (CW2, below), then one record per terminal plane:
-a varint `codec_id << 2 | state` (state 0 none, 1 inline with a
-version byte and length-prefixed bytes, 2 inline with version 0 and
-no bytes; states 0 and 2 decode alike), the payload length, an
-optional CRC32 and the payload. The coded body ends with the last
-payload. The payload hash and the plane CRCs check decoded bytes, not
-the coded payload. The payload hash already covers every plane of the
-one tensor, so the writer stores plane CRCs only when it does not
-store the hash, and a reader rejects a frame with both. The frame does not store plane layouts, plane lengths or
-the plane count, because the decoder derives them from the chain.
+### Chain registry
 
-The fixed cost is about 10 to 70 bytes, depending on the chain and
-on which integrity fields are on. With the default settings (payload
-hash on) it is at most about 50 bytes for a bf16 tensor, 55 bytes for
-an fp32 tensor with the split chain, and 61 bytes for an fp32 tensor
-with the IntDelta or PredictorXor chain that smooth data selects.
-Plane CRCs instead of the hash add up to 8 bytes more for four
-planes.
-A tensor whose planes need shared state (a prelude) or chunked
-encoding cannot use the frame; the compressor writes a full
-container for it. The frame holds no extension table, so it can
-reference built-in ops and codecs only.
+```
+num_chains              u16      at most 0x8000
+chain × num_chains:
+    chain_id              u16      at most 0x7FFF; writers use the position
+    chain                 legacy chain wire
+```
 
-### Compact chain wire (CW2)
+The legacy chain wire (`chain::wire`) is:
 
-`chain::wire_compact` stores a chain in about 15 to 20 bytes, against
-50 to 70 for the registry wire form:
+```
+num_nodes, num_edges, num_terminals   u8 each
+nodes_len, edges_len, terminals_len   u16 each, section byte lengths
+node:      op u16 (Extension Table index), param_len u8, params
+edge:      src u8, src_out u8, dst u8, dst_in u8, has_role u8,
+           [role], vendor_len u16, vendor bytes
+terminal:  node u8, out u8, role
+```
+
+A tensor record addresses a registry chain with 15 bits, so a writer
+fails on a registry with more than 0x8000 chains or a chain id above
+0x7FFF.
+
+### Tensor record
+
+```
+chain_ref        u16     bit 15: inline chain; else bits 0-14 are the chain_id
+dtype_code       u16
+input_format     u8
+num_planes       u8
+flags            u8      0x01 dependencies, 0x02 metadata, 0x04 payload hash
+reserved         u8
+orig_size        u64     raw tensor bytes
+name             u16 length + UTF-8, zero-padded to a multiple of 4
+[payload_hash]   u64     xxh64 (seed 0) of the raw tensor        (0x04)
+[inline chain]   Extension Table (u32 count + entries as above), then a
+                 legacy chain whose ops index that table      (bit 15)
+[dependencies]   u16 count; per dependency: ref_kind u8, ref_flags u8
+                 (bit 0: hash), u16 length + ref bytes, [blake3 32 B]
+                                                                  (0x01)
+[metadata]       u32 length + CBOR shape map (shape, dtype name)  (0x02)
+plane × num_planes
+```
+
+The fixed part is 18 bytes. With the name, the shape metadata and four
+planes, an fp32 tensor record carries 166 bytes besides its payload, or
+190 bytes with the payload hash and plane CRCs (name of 28 bytes).
+
+### Plane record
+
+```
+role              u8      PlaneRole (diagnostic label)
+plane_flags       u8      0x01 chunk table, 0x02 CRC32, 0x04 codec_table_idx
+                          present (always set)
+codec_id          u16     CodecId wire id
+codec_table_idx   u16     Extension Table index of the plane codec
+state_source      u8      0 none, 1 inline, 2 shared, 3 external
+state_version     u8
+state_info        u16     shared: shared_state_id
+inline_state_len  u32
+payload_len       u64
+[crc32]           u32     CRC32 of the decoded plane                (0x02)
+[chunk table]     u32 count; per chunk: offset_in_payload u32,
+                  decoded_size u32                                  (0x01)
+[external state]  ref_kind u8, ref_flags u8 (bit 0: hash), u16 length +
+                  ref bytes, state_format_version u8, [blake3 32 B]
+                                                       (state_source 3)
+layout_kind       u8      0 flat, 1 rows
+[row_len]         u32     non-zero                            (rows)
+inline state      inline_state_len bytes
+payload           payload_len bytes
+```
+
+A flat plane without CRC costs 23 bytes plus its payload. The decoder
+finds the codec through `codec_table_idx` alone. `codec_id` duplicates
+it; every writer fills both, and the reader requires `codec_id` to be a
+known `CodecId` but does not dispatch on it. The reader reads
+`codec_table_idx` whether or not flag 0x04 is set.
+
+The plane record stores no shape and no decoded length. The decoder
+derives each plane's length from the chain (see [Reader
+limits](#reader-limits)).
+
+### Tensor index
+
+```
+count            u64
+entry × count:
+    name_hash      u64    xxh64 (seed 0) of the UTF-8 name
+    tensor_offset  u64    absolute offset of the record
+    tensor_len     u64    record length
+```
+
+Entries are sorted by `name_hash`. A lookup binary-searches the hash,
+then compares the name in each record of the run of equal hashes, so
+two names with the same hash resolve correctly. Writers reject
+duplicate tensor names. Tools that list or decode every tensor return
+them in record (write) order, not index order.
+
+### What the legacy reader checks
+
+The reader checks the EOF sentinel, the magic, the PTWX flag against
+the magic, the bounds of every section, the Extension Table hash, the
+prelude and registry within their section, every index entry's range
+before it reads a record, the decoded plane lengths against the plane
+bound (see [Reader limits](#reader-limits)), the plane CRCs and the
+payload hash.
+
+It does not check:
+
+- that the index is sorted (an unsorted index makes lookups miss);
+- the reserved bytes and unknown flag bits of records and the prelude;
+- that records are contiguous or that every byte belongs to a section.
+
+None of these can make the reader read out of bounds; they are why the
+legacy layout has more than one encoding for the same content, and why
+the compact layout rejects them.
+
+Payloads are not aligned. Only the names in the tensor record and the
+prelude are padded to a multiple of 4 bytes, and the rest of the file
+has no alignment. Codecs read their input as bytes and do not assume
+alignment.
+
+## Compact container (`\x89PTWC`)
+
+`ContainerLayout::Compact`, the default for multi-tensor output since
+v1.2. It holds the same information as the legacy container, with
+varints, built-ins stored by wire id, names moved into the index, and
+fields the reader can derive left out. The reader parses it into the
+same in-memory records as a legacy file, so decoding, trust checks and
+the transcoder share one code path.
+
+```
+FILE = HEADER | EXTENSION TABLE | PRELUDE | REGISTRY | BODY | INDEX | FOOTER
+```
+
+All sections are contiguous. The writer streams them and never seeks:
+the header comes first because the table, prelude and registry are
+known before the first record, and the index length goes in the
+footer.
+
+Every section parser gets exactly its slice and must consume all of
+it. Together with minimal varints and zero reserved bits, this gives
+each file one encoding for its content, so the transcoder's
+`implode(explode(x))` reproduces `x` byte for byte.
+
+### Header and footer
+
+```
+magic         [u8; 9]   \x89PTWC\r\n\x1a\n
+hflags        u16       must be 0 (all bits reserved)
+et_len        varint    Extension Table bytes
+prelude_len   varint    prelude bytes
+registry_len  varint    registry bytes
+meta_xxh64    u64       xxh64 (seed 0) of the header bytes before this
+                        field, then the Extension Table, prelude and
+                        registry bytes
+...
+index_len     u64       (footer)
+sentinel      [u8; 8]   \x89TWMEOF\x1a (footer)
+```
+
+The header is 22 bytes for files whose sections are each shorter than
+128 bytes, and grows by one byte per seven bits of section length. The
+body runs from the end of the registry to the start of the index,
+which is `file_len − 16 − index_len`. The reader checks all offsets
+with checked arithmetic and rejects a file whose body would have a
+negative length.
+
+`meta_xxh64` protects the sections a reader parses before it touches
+a record. xxh64 is enough here: it detects corruption, and the trust
+decision does not rest on it, because a built-in is stored by wire id
+and a third-party entry carries its own canonical id and attestation.
+
+### Extension Table
+
+```
+count       varint   at most 65,536 and at most et_len / 2
+entry × count:
+    tag     u8
+    0x01    OpId wire id (varint)       built-in transform
+    0x02    CodecId wire id (varint)    built-in plane codec
+    0x03    name length varint (1..=255), then the built-in name
+                                        built-in without a wire id
+    0x7F    length varint, then one legacy entry of exactly that length
+                                        third-party entry
+```
+
+The reader expands tags 0x01 to 0x03 into the built-in entry of its own
+version, so a PTWC file does not depend on the release that wrote it.
+Six built-in entries take 13 bytes, against 779 in the legacy table.
+
+The reader rejects unknown tags, ids and names, duplicate entries, a
+built-in stored with tag 0x7F (of this release or, by its label, of
+another one), a tag 0x03 entry for a built-in that has a wire id, and
+any entry with embedded WASM. Embedded WASM exists only in `\x89PTWX`
+files; the PTWC writer refuses such entries. The writer orders entries
+like the legacy writer: chain ops first, then the referenced plane
+codecs.
+
+### Prelude
+
+The legacy prelude bytes, parsed within `prelude_len`. Shared state is
+rare and the format is already compact enough.
+
+### Registry
+
+```
+count            varint   at most 0x8000 (chain ids 0..=0x7FFF)
+chain × count:   chain_len varint, then a CW2 chain
+```
+
+The chain id is the position. A node's `op_ref` is an Extension Table
+index that must name a built-in transform. A registry chain may have a
+bound Source (see [CW2](#compact-chain-wire-cw2)), which takes its
+params from the record that uses the chain. Tensors that differ only in
+shape then share one registry chain: 64 fp32 tensors with 64 distinct
+shapes need two registry chains (48 bytes) in PTWC, against 64 chains
+(3,872 bytes) in the legacy layout.
+
+### Tensor record
+
+Records follow each other in write order. A record does not store its
+name: the index does.
+
+```
+tflags          u8      bit 0 PAYLOAD_HASH, bit 1 INLINE_CHAIN, bit 2 DEPS,
+                        bit 3 SHAPE, bit 4 DTYPE_NAME (needs SHAPE),
+                        bit 5 RAW_META (excludes SHAPE); bits 6-7 zero
+[chain_id]      varint  < registry count               (not INLINE_CHAIN)
+dtype_code      varint  at most 65,535
+input_format    u8
+orig_size       varint
+[shape]         varint ndim (at most 64), varint per dimension     (SHAPE)
+[dtype_name]    varint length + UTF-8                         (DTYPE_NAME)
+[raw_meta]      varint length + bytes                           (RAW_META)
+[payload_hash]  u64     xxh64 (seed 0) of the raw tensor    (PAYLOAD_HASH)
+[inline chain]  varint length + compact Extension Table of the chain's
+                ops in first-use order, then varint length + CW2 chain
+                                                            (INLINE_CHAIN)
+[dependencies]  varint count (at least 1); per dependency: ref_kind u8,
+                ref_flags u8 (bit 0: hash), varint length + ref bytes,
+                [blake3 32 B]                                       (DEPS)
+n_planes        varint  at most 255
+plane × n_planes
+```
+
+SHAPE stands for the CBOR shape map of the legacy record, built from
+the shape and the canonical dtype name of `dtype_code`, or from the
+stored dtype name under DTYPE_NAME. The reader rejects a DTYPE_NAME
+equal to the canonical name. The writer uses SHAPE only when it
+reproduces the record's metadata bytes exactly; other metadata goes in
+RAW_META.
+
+The record must end exactly at the length the index gives. The
+in-memory `chain_ref`, `flags` and `name` are rebuilt from the record
+and the index, as the legacy parser would produce them.
+
+### Plane record
+
+```
+pflags          u8      bit 0 CRC32, bit 1 CHUNKS, bits 2-3 state source
+                        (0 none, 1 inline, 2 shared, 3 external),
+                        bit 4 LAYOUT_ROWS, bit 5 STATE_EXTRA; bits 6-7 zero
+role            u8      PlaneRole
+codec_ref       varint  Extension Table index of a plane codec
+[state_version] u8                                         (STATE_EXTRA)
+[state_info]    varint  at most 65,535                     (STATE_EXTRA)
+[inline_len]    varint                                   (state inline)
+payload_len     varint
+[row_len]       varint  1..=u32::MAX                      (LAYOUT_ROWS)
+[crc32]         u32     CRC32 of the decoded plane              (CRC32)
+[chunks]        varint n (at most payload_len); n × (varint offset,
+                varint decoded_size), each at most u32::MAX   (CHUNKS)
+[external]      ref_kind u8, ref_flags u8 (bit 0: hash), varint length +
+                ref bytes, state_format_version u8, [blake3 32 B]
+                                                       (state external)
+[inline state]  inline_len bytes
+payload         payload_len bytes
+```
+
+STATE_EXTRA is set exactly when `state_version` or `state_info` is
+non-zero. The plane does not store `codec_id`: the reader derives it
+from the Extension Table entry, and the writer rejects a record whose
+`codec_id` disagrees. Role and layout are stored so that parsing a
+record never needs the chain.
+
+A typical plane takes 4 bytes plus its payload, or 8 with a CRC.
+
+### Tensor index
+
+```
+count        varint   at most index_len / 3
+entry × count, in body order:
+    name       varint length (1..=65,535) + UTF-8
+    rec_len    varint, at least 3
+```
+
+Record offsets are the running sum of `rec_len` from the start of the
+body, and the sum must equal the body length exactly, so records cannot
+overlap or leave gaps. Names must be unique. The reader sorts the
+entries by name hash in memory; a lookup compares names, so a hash
+collision cannot return the wrong tensor. `tensor_names` reads the
+index alone, without touching the records.
+
+### Sizes
+
+Measured with `benchmarks/container_overhead.py`, fp32 tensors of shape
+`(64,)` named `model.layers.NNN.attn.q.bias` (28 bytes), written with
+`compress_ptwm_blob`. "Non-payload" excludes plane payloads and inline
+and shared codec state.
+
+| Case | PTWC B/tensor | Legacy B/tensor |
+|---|---|---|
+| 64 tensors, same shape, hash and CRC on | 83 | 235 |
+| 64 tensors, distinct shapes, hash and CRC on | 83 | 288 |
+| 64 tensors, same shape, hash and CRC off | 59 | 211 |
+| 1 tensor, hash and CRC on | 165 | 1,176 |
+
+Per tensor, the PTWC index entry takes 31 bytes (mostly the name) and
+the record about 50 bytes with the payload hash and four plane CRCs,
+26 without. CI holds these to the bounds in
+`tests/ptwm/benchmarks/test_container_overhead.py` and
+`crates/ptwm-core/tests/ptwc.rs`.
+
+## Compact chain wire (CW2)
+
+`chain::wire_compact` stores a chain in about 15 to 30 bytes, against
+50 to 70 for the legacy chain wire. PTWC registry and inline chains and
+the PTWS frame use it.
 
 ```
 n_nodes, n_edges, n_terms    varint each (n_nodes 1..=255, others <= 255)
 node:      op_ref varint, param_len varint (<= 255), params
 n_spine    varint (<= n_edges; only when n_edges > 0)
-edge:      src, src_out, dst, dst_in varint; etag u8 (bit0 role,
-           bit1 vendor); [compact role]; [varint length + vendor bytes]
+edge:      src, src_out, dst, dst_in varint; etag u8 (bit 0 role,
+           bit 1 vendor; other bits zero); [compact role];
+           [varint length (1..=65,535) + vendor bytes]
 terminal:  ref u8 (node << 4 | out, or 0xFF + node u8 + out u8);
            compact role
 ```
 
-- `op_ref` is the `OpId` wire id in the compact frame.
+- `op_ref` is an Extension Table index in PTWC and the `OpId` wire id
+  in PTWS.
 - The first `n_spine` edges are `(i, 0) → (i + 1, 0)` with no role
-  override and no vendor bytes, and are not stored.
-- A Source node with `param_len = 0` is a bound Source: its params
-  are those of the frame's shape and dtype (`u8` ndim, `u32` dims,
-  `u16` chain dtype). The writer binds a Source exactly when its
-  params equal these, so chains that differ only in shape encode to
-  the same bytes.
+  override and no vendor bytes, and are not stored. The writer always
+  stores the longest such run, and the reader rejects a stored first
+  edge that would extend it.
+- A Source node with `param_len = 0` is a *bound Source*: its params
+  are those of the record's or frame's shape and dtype (`u8` ndim,
+  `u32` dims, `u16` chain dtype). The writer binds a Source exactly
+  when its params equal these, and the reader rejects explicit params
+  that equal them. Real Source params are never empty, so the marker
+  cannot collide with an explicit Source. A record without a shape
+  cannot use a chain with a bound Source.
 - A compact role is one byte for every role production chains use
   (scale formats, nibble kinds, mantissa and integer bytes up to 8,
   `IntN` up to 32 bits, raw, index, exponent byte, fp4 value, XOR
-  residual), and `0xFF` followed by the registry role encoding for
-  the rest.
+  residual), and `0xFF` followed by the legacy role encoding for the
+  rest. An escaped role that has a one-byte form is rejected.
 
-The frame follows the same versioning rule as the container: no
-numeric version field, and a new magic for an incompatible layout.
-Readers that predate the frame reject `\x89PTWS` as "not a .ptwm
-container" rather than misparse it. `CompressionConfig(framing=
-Framing.CONTAINER)` keeps the full container for consumers pinned to
-such readers, and the CLI writes `.ptwm` files as full containers so
-the random-access and store tools can open them.
+## Compact single-tensor frame (`\x89PTWS`)
 
-## Wire-format invariants
+`Compressor.compress` writes one tensor. A container's sections cost
+about 120 to 140 bytes (PTWC) or 500 to 1,000 bytes (legacy) for one
+tensor, which is more than the payload of a small tensor. By default
+the compressor writes a compact frame instead:
 
-The reader assumes the following without checking, since checks are
-expensive on large files and a violated invariant would surface as a
-codec error at decode time anyway:
+```
+magic          [u8; 5]   \x89PTWS
+flags          u8        bit 0 payload hash, bit 1 plane CRC, bit 2 shape,
+                         bit 3 dtype name, bit 4 delta reference,
+                         bit 5 stored, bit 6 size; bit 7 zero, and
+                         plane CRC with payload hash is rejected
+dtype_code     varint    at most 65,535
+input_format   u8
+orig_size      varint                             (size)
+shape          varint ndim (<= 64) + varint dims  (shape)
+dtype_name     varint length + UTF-8              (dtype name)
+delta_ref      [u8; 32]  blake3 of the reference  (delta reference)
+payload_hash   u64       xxh64 of the raw bytes   (payload hash)
+body
+```
 
-The plane shape always agrees with the role declared in the chain
-terminal. The PPG validator enforces this at chain construction;
-malformed chains never reach the wire format.
+`orig_size` is stored only when the shape does not give it as
+`product(shape) × element_size(dtype_code)`. The dtype name is stored
+only when it differs from the canonical name of `dtype_code`. A reader
+rejects any field written in a form the writer would not produce, so
+each field has one encoding for the value it holds. The frame as a
+whole is not unique for a tensor: the writer chooses the codecs, the
+chain, a stored or a coded body, and plane state 0 or 2 (below), and
+the reader accepts any valid choice. A reader rejects bytes after the
+end of the body.
 
-Plane payloads are aligned to their codec's preferred alignment. The
-writer pads with zeros if necessary; the reader trusts the alignment
-and may panic on misaligned access.
+The body is either the raw bytes (the stored flag, written when no
+codec makes the tensor smaller) or a coded tensor: a CW2 chain whose
+`op_ref` is the `OpId` wire id and whose bound Source takes the
+frame's shape and dtype, then one record per terminal plane:
 
-The tensor index is sorted by name hash. The reader uses a binary
-search and would return wrong results on an unsorted index.
+```
+head           varint    CodecId wire id << 2 | state
+                         (0 none, 1 inline, 2 inline with version 0 and
+                         no bytes; 3 rejected)
+[state]        version u8, varint length, bytes        (state 1)
+payload_len    varint
+[crc32]        u32       CRC32 of the decoded plane    (plane CRC)
+payload        payload_len bytes
+```
 
-The reader does check the magic, the extension-table hash, and the
-EOF sentinel. The first two protect against accidental corruption;
-the last protects against truncation.
+States 0 and 2 decode alike. The payload hash already covers every
+plane of the one tensor, so the writer stores plane CRCs only when it
+does not store the hash. The frame does not store plane layouts, plane
+lengths or the plane count, because the decoder derives them from the
+chain.
 
-## Why blake3 and not sha256
+The fixed cost is about 20 to 70 bytes, depending on the chain and on
+which integrity fields are on. With the default settings (payload hash
+on) it is at most 43 bytes for a bf16 tensor, 55 bytes for an fp32
+tensor with the split chain, and 61 bytes for an fp32 tensor with the
+IntDelta or PredictorXor chain that smooth data selects. Plane CRCs
+instead of the hash add up to 8 bytes more for four planes.
 
-Two reasons. Blake3 is faster on the workstation CPUs PTWM targets
-for compression work, by about a factor of three on the inputs that
-matter. The speed matters because the extension-table hash is
-computed on every file write and verified on every file read; the
-manifest plus binary hash is computed when verifying a signed
-extension bundle. A slower hash would dominate the open path on
-small files.
+A tensor whose planes need shared state (a prelude) or chunked encoding
+cannot use the frame; the compressor writes a full container for it,
+in the configured `container_layout`. The frame holds no Extension
+Table, so it can reference built-in ops and codecs only.
 
-Blake3 also avoids the cryptographic agility surface that PTWM has
-no use for. The library is committed to a single hash function;
-adding a second one to support sha256 callers would mean every plane
-hash needs a discriminator. The choice may need to be revisited if
-NIST publishes a new standard that supplants blake3 in policy
-documents, but the migration cost is bounded by the number of
-on-disk hash fields, which is small.
+`CompressionConfig(framing=Framing.CONTAINER)` writes a full container
+instead of the frame, for the random-access, store and transcode tools.
+
+## Compatibility
+
+| File | Readers before v1.2 | v1.2 and later |
+|---|---|---|
+| `\x89PTWS` frame (default single-tensor output) | reject: "not a .ptwm container" | read |
+| `\x89PTWC` container (default multi-tensor output) | reject: bad magic | read |
+| `\x89PTWM` container | read if its built-in ids are of the reader's version | read, built-in ids of any release |
+
+Old readers fail cleanly on the new formats. A Rust reader before v1.2
+passes the EOF sentinel check and fails in `Header::read` with "bad
+magic". A Python reader before v1.2 checks the 5-byte `\x89PTWM`
+prefix and reports that the input is not a container. The transcoder
+before v1.2 rejects the `"ptwm-manifest-c"` manifest of a PTWC
+container.
+
+To write files that a v1.1 reader opens:
+
+- Python: `CompressionConfig(framing=Framing.CONTAINER,
+  container_layout=ContainerLayout.LEGACY)`, or
+  `container_layout="legacy"` on `compress_ptwm_blob`,
+  `write_ptwm_shard`, `compress_safetensors_file`, the LMDB and
+  WebDataset writers and `_rust.compress_model`.
+- CLI: `ptwm compress --container-layout legacy`.
+- Rust: `CompressorOptions { container_layout: ContainerLayout::Legacy,
+  .. }` or `ContainerWriter::new`.
+
+A legacy file carries the built-in ids of the writer's crate version
+(see [Built-in entries](#built-in-entries)), and a v1.1 reader
+recognises only the ids of version 1.1.0. This tree's crate version is
+1.1.0, so its legacy output opens in v1.1. A build with another crate
+version writes legacy files that v1.1 cannot open unless the writer
+pins the built-in version with `ContainerWriter::set_builtin_version`
+(Rust only).
+
+## Reader limits
+
+The readers treat every file as untrusted input. In both layouts:
+
+- every count is checked against the bytes that remain before a
+  vector is allocated, and every offset and length is added with
+  checked arithmetic;
+- the chain's Source must declare exactly `orig_size` bytes in PTWC
+  and PTWS. A legacy Source may declare up to 8 × `orig_size`, so that
+  files written by the v1.1 `Format.BYTE` bug keep decoding;
+- the plane lengths are derived symbolically from the chain before any
+  plane is decoded, and no plane may exceed `16 × orig_size + 4096`
+  bytes (`max_plane_len`), so a corrupt file cannot make a codec
+  allocate far more than the tensor;
+- a decoded plane must have exactly its derived length in PTWC and
+  PTWS. In the legacy layout it may differ (older files carry Sources
+  that overstate or understate the raw size) but stays under the plane
+  bound. In every layout the inverse chain must give exactly
+  `orig_size` bytes;
+- a file whose Extension Table holds only built-ins opens without
+  extension discovery or keyring access.
+
+## Why blake3 for the legacy table hash
+
+Blake3 is faster on the workstation CPUs PTWM targets than SHA-256, by
+about a factor of three on the inputs that matter. The legacy
+Extension Table hash is computed on every legacy write and checked on
+every legacy open, and a slower hash would dominate the open path for
+small files. PTWC uses xxh64 for its metadata check (see
+[Header and footer](#header-and-footer)) because its table is a few
+bytes and trust does not rest on the checksum. Blake3 stays the hash
+for canonical ids, dependency references and extension bundles.
+
+Blake3 also avoids a hash-agility surface that PTWM has no use for.
+Adding SHA-256 would mean every hash field needs a discriminator. The
+choice may need revisiting if policy documents come to require another
+hash, but the migration cost is bounded by the number of on-disk hash
+fields, which is small.
 
 ## Sentinel public key
 
-Built-in contributions use a canonical id derived from a sentinel
-public key, `BUILTIN_PUBKEY = [0xBB; 32]`. The sentinel is treated as
-trusted by construction; the verifier short-circuits before checking
-the keyring when it sees an id derived from this key. The sentinel
-bytes are recognisable, which helps when reading hex dumps of an
-extension table during debugging.
+Built-in contributions derive their canonical ids from a sentinel
+public key, `BUILTIN_PUBKEY = [0xBB; 32]`. The reader recognises a
+built-in by looking its id up in the table of derived built-in ids
+(`builtin_registry`), after mapping ids of other releases (see
+[Built-in entries](#built-in-entries)), and trusts it without a
+keyring check. The sentinel bytes are recognisable, which helps when
+reading hex dumps of an Extension Table.
 
-A real Ed25519 public key would never have all bytes equal to
-0xBB, since the key derivation would require a chosen-private-key
-attack on Ed25519 to construct one. The probability of accidentally
-matching the sentinel from a real key is `2^-256`, which is the
-collision bound the codebase relies on elsewhere.
+A real Ed25519 public key with all bytes equal to 0xBB would require a
+chosen-private-key attack on Ed25519. The chance of a real key
+matching the sentinel by accident is `2^-256`, the collision bound the
+codebase relies on elsewhere.

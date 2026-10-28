@@ -37,11 +37,20 @@ def build_compressed_tensor_info(
 
 
 def set_compressed_tensors_metadata(
-    compressed_tensor_infos: dict[str, CompressedTensorInfo], metadata: dict[str, str]
-) -> None:
-    """Set file-level metadata on all compressed tensors."""
-    if metadata:
+    compressed_tensor_infos: dict[str, CompressedTensorInfo],
+    metadata: dict[str, str] | None,
+) -> dict[str, str]:
+    """Record the compressed tensors in the file-level metadata.
+
+    Updates ``metadata`` in place and returns it. ``None`` (a safetensors
+    file saved without metadata) gives a new dict. Without this entry,
+    readers return each compressed tensor as its raw uint8 frame.
+    """
+    if metadata is None:
+        metadata = {}
+    if compressed_tensor_infos or metadata:
         metadata[METADATA_KEY] = json.dumps(compressed_tensor_infos)
+    return metadata
 
 
 def get_compressed_tensors_metadata(

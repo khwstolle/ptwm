@@ -195,7 +195,7 @@ def decompress_safetensors_file(
         if metadata:
             metadata.pop("ptwm_compressed_vectors", None)
 
-    save_file(tensors, str(decompressed_path), metadata)
+    save_file(tensors, str(decompressed_path), metadata or None)
 
     if delete and not hf_cache:
         full_path.unlink()

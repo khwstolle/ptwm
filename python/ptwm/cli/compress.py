@@ -482,7 +482,7 @@ def compress_safetensors_file(
 
         metadata = f.metadata()
 
-    set_compressed_tensors_metadata(compressed_tensor_infos, metadata)
+    metadata = set_compressed_tensors_metadata(compressed_tensor_infos, metadata)
     save_file(tensors, str(compressed_path), metadata)
 
     if delete and not hf_cache:

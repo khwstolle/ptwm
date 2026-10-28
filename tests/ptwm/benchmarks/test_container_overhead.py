@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 from ptwm import CompressionConfig, Compressor, Decompressor, Format
-from ptwm._config import Framing
+from ptwm._config import ContainerLayout, Framing
 
 from benchmarks.container_overhead import (
     DTYPES,
@@ -103,8 +103,13 @@ def test_tiled_rows_ratio_is_at_least_60() -> None:
 @pytest.mark.parametrize(("dname", "dtype"), DTYPES)
 def test_container_framing_floor_stays_trimmed(dname: str, dtype: torch.dtype) -> None:
     # v1.1 wrote about 2.5 KB of non-payload bytes per single-tensor
-    # container, 2.1 KB of it unreferenced codec entries.
+    # container, 2.1 KB of it unreferenced codec entries. The bound is for
+    # the legacy layout, so the layout is pinned.
     row = measure(
-        make_tensor(dtype, "normal", 4096), Framing.CONTAINER, dname, "normal"
+        make_tensor(dtype, "normal", 4096),
+        Framing.CONTAINER,
+        dname,
+        "normal",
+        ContainerLayout.LEGACY,
     )
     assert row.non_payload < 1100, row

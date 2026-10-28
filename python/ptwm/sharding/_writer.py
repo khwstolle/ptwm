@@ -41,7 +41,7 @@ def compress_ptwm_blob(
     emit_payload_hash: bool = True,
     emit_plane_crc: bool = True,
     streaming_chunk: int | None = None,
-    container_layout: ContainerLayout | str = "legacy",
+    container_layout: ContainerLayout | str = "compact",
 ) -> bytes:
     r"""Compress ``tensors`` into a single in-memory ``.ptwm`` container blob.
 
@@ -50,8 +50,8 @@ def compress_ptwm_blob(
     each blob is produced by ``Chain.to_bytes()``. When ``None``, chains are
     auto-derived from each tensor's dtype via the STANDARD production table.
     ``method_hint``: 1=HUFFMAN, 2=ZSTD, 3=MICROSCALE, 4=RANS, 5=IDENTITY.
-    ``container_layout``: ``"legacy"`` (``\x89PTWM``, readable by every
-    release) or ``"compact"`` (``\x89PTWC``, v1.2 and later), as a string or
+    ``container_layout``: ``"compact"`` (default; ``\x89PTWC``, v1.2 and
+    later) or ``"legacy"`` (``\x89PTWM``, readable by every release), as a string or
     :class:`ptwm.ContainerLayout`. Other values raise :class:`ValueError`
     before anything is compressed.
     """
@@ -97,7 +97,7 @@ def write_ptwm_shard(
     emit_payload_hash: bool = True,
     emit_plane_crc: bool = True,
     streaming_chunk: int | None = None,
-    container_layout: ContainerLayout | str = "legacy",
+    container_layout: ContainerLayout | str = "compact",
 ) -> None:
     """Write a single ``.ptwm`` container holding ``tensors``.
 

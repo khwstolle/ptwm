@@ -45,7 +45,7 @@ use std::path::PathBuf;
 
 use ptwm_core::chain::{Chain, ChainEdge, ChainNode, TerminalRef};
 use ptwm_core::compressor::{CompressorOptions, InputTensor, compress_model};
-use ptwm_core::container::{ChainRegistry, ContainerReader, ContainerWriter};
+use ptwm_core::container::{ChainRegistry, ContainerLayout, ContainerReader, ContainerWriter};
 use ptwm_core::extension::{BUILTIN_PUBKEY, CanonicalId};
 use ptwm_core::tensor_record::{CHAIN_REF_INLINE_BIT, TensorRecord, parse_tensor_record};
 use ptwm_core::transcode::{explode, implode};
@@ -449,7 +449,8 @@ fn inputs(data: &[TensorData]) -> Vec<InputTensor<'_>> {
         .collect()
 }
 
-/// Options of the Python default (`emit_payload_hash`, `emit_plane_crc`).
+/// Options of the Python default (`emit_payload_hash`, `emit_plane_crc`),
+/// pinned to the legacy layout that these fixtures freeze.
 fn main_options(chunk_size: Option<u32>) -> CompressorOptions {
     CompressorOptions {
         method_hint: 1,
@@ -458,7 +459,7 @@ fn main_options(chunk_size: Option<u32>) -> CompressorOptions {
         forced_codec: None,
         allow_codec_ids: None,
         chunk_size,
-        ..Default::default()
+        container_layout: ContainerLayout::Legacy,
     }
 }
 

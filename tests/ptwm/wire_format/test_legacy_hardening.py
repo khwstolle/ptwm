@@ -6,7 +6,15 @@ import struct
 
 import pytest
 import torch
-from ptwm import CompressionConfig, Compressor, Format, Framing, Method, _rust
+from ptwm import (
+    CompressionConfig,
+    Compressor,
+    ContainerLayout,
+    Format,
+    Framing,
+    Method,
+    _rust,
+)
 
 HEADER_LEN = 91
 # Header field offsets (see crates/ptwm-core/src/header.rs).
@@ -21,6 +29,7 @@ def _legacy_blob() -> bytes:
             input_format=Format.TORCH,
             method=Method.HUFFMAN,
             framing=Framing.CONTAINER,
+            container_layout=ContainerLayout.LEGACY,
         )
     ).compress(tensor)
 

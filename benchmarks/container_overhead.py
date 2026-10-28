@@ -26,7 +26,7 @@ from dataclasses import dataclass
 import torch
 import zstandard
 from ptwm import _rust
-from ptwm._config import CompressionConfig, Format, Framing
+from ptwm._config import CompressionConfig, ContainerLayout, Format, Framing
 from ptwm.core import Compressor, Decompressor
 
 SIZES = (64, 256, 1024, 4096, 16384, 65536, 1 << 20)
@@ -87,10 +87,20 @@ def non_payload_bytes(blob: bytes) -> int:
     return len(blob) - payload
 
 
-def compress_checked(t: torch.Tensor, framing: Framing) -> bytes:
-    """Compress ``t`` and assert a bit-exact round trip with shape and dtype."""
+def compress_checked(
+    t: torch.Tensor,
+    framing: Framing,
+    layout: ContainerLayout = ContainerLayout.COMPACT,
+) -> bytes:
+    """Compress ``t`` and assert a bit-exact round trip with shape and dtype.
+
+    ``layout`` is the layout of a full container (``Framing.CONTAINER`` or the
+    compact-frame fallback).
+    """
     blob = Compressor(
-        CompressionConfig(input_format=Format.TORCH, framing=framing)
+        CompressionConfig(
+            input_format=Format.TORCH, framing=framing, container_layout=layout
+        )
     ).compress(t)
     back = Decompressor().decompress(blob)
     assert isinstance(back, torch.Tensor)
@@ -100,9 +110,15 @@ def compress_checked(t: torch.Tensor, framing: Framing) -> bytes:
     return blob
 
 
-def measure(t: torch.Tensor, framing: Framing, dtype: str, kind: str) -> Row:
+def measure(
+    t: torch.Tensor,
+    framing: Framing,
+    dtype: str,
+    kind: str,
+    layout: ContainerLayout = ContainerLayout.COMPACT,
+) -> Row:
     raw = raw_bytes(t)
-    blob = compress_checked(t, framing)
+    blob = compress_checked(t, framing, layout)
     z = zstandard.ZstdCompressor(level=19).compress(raw)
     return Row(
         framing=framing.name.lower(),

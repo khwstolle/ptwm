@@ -108,8 +108,8 @@ def test_container_layout_name() -> None:
 
 
 def test_compression_config_coerces_container_layout() -> None:
-    # The default stays LEGACY until the switch to the compact layout.
-    assert CompressionConfig().container_layout is ContainerLayout.LEGACY
+    # New writes default to the compact layout.
+    assert CompressionConfig().container_layout is ContainerLayout.COMPACT
     cfg = CompressionConfig(container_layout="compact")
     assert cfg.container_layout is ContainerLayout.COMPACT
     cfg = CompressionConfig(container_layout="Legacy")

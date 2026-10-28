@@ -90,7 +90,9 @@ pub struct InputTensor<'a> {
 }
 
 /// Compressor options. `Default` gives no hint, no hash or CRC, dispatcher
-/// codec selection, whole planes and the legacy container layout.
+/// codec selection, whole planes and the compact container layout
+/// (`\x89PTWC`, readable by v1.2 and later). Set `container_layout` to
+/// [`ContainerLayout::Legacy`] for output that every release reads.
 #[derive(Default)]
 pub struct CompressorOptions {
     /// Header hint to readers about the dominant codec.
@@ -109,7 +111,8 @@ pub struct CompressorOptions {
     pub allow_codec_ids: Option<Vec<CodecId>>,
     /// When `Some`, encode each plane in fixed-size chunks.
     pub chunk_size: Option<u32>,
-    /// On-disk layout of the written container.
+    /// On-disk layout of the written container. Defaults to
+    /// [`ContainerLayout::Compact`].
     pub container_layout: ContainerLayout,
 }
 
@@ -1397,6 +1400,8 @@ mod tests {
                 forced_codec: None,
                 allow_codec_ids: None,
                 chunk_size: None,
+                // Parses legacy records, so the layout is pinned.
+                container_layout: ContainerLayout::Legacy,
                 ..Default::default()
             },
         )
@@ -1801,6 +1806,8 @@ mod tests {
                 forced_codec: None,
                 allow_codec_ids: None,
                 chunk_size: None,
+                // Parses legacy records, so the layout is pinned.
+                container_layout: ContainerLayout::Legacy,
                 ..Default::default()
             },
         )
@@ -1884,6 +1891,8 @@ mod tests {
                 forced_codec: None,
                 allow_codec_ids: None,
                 chunk_size: None,
+                // Parses legacy records, so the layout is pinned.
+                container_layout: ContainerLayout::Legacy,
                 ..Default::default()
             },
         )

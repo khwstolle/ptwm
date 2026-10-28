@@ -8,6 +8,7 @@ import torch
 from ptwm import (
     CompressionConfig,
     Compressor,
+    ContainerLayout,
     DecompressionConfig,
     Decompressor,
     Format,
@@ -17,7 +18,10 @@ from ptwm import (
 from ptwm._exceptions import Error, HeaderParseError
 
 COMPACT = b"\x89PTWS"
-CONTAINER = b"\x89PTWM"
+# A full container has the default (compact) layout unless the config pins
+# ContainerLayout.LEGACY.
+CONTAINER = b"\x89PTWC"
+LEGACY_CONTAINER = b"\x89PTWM"
 
 
 def _torch_cfg(**kw) -> CompressionConfig:
@@ -39,17 +43,39 @@ def test_framing_accepts_names() -> None:
     assert Framing("COMPACT") is Framing.COMPACT
 
 
-def test_container_framing_still_decodes() -> None:
+@pytest.mark.parametrize(
+    ("layout", "magic"),
+    [
+        (None, CONTAINER),
+        (ContainerLayout.COMPACT, CONTAINER),
+        (ContainerLayout.LEGACY, LEGACY_CONTAINER),
+    ],
+)
+def test_container_framing_still_decodes(layout, magic: bytes) -> None:
     t = torch.randn(8, 32, dtype=torch.float32)
-    blob = Compressor(_torch_cfg(framing=Framing.CONTAINER)).compress(t)
-    assert blob[:5] == CONTAINER
+    kw = {} if layout is None else {"container_layout": layout}
+    blob = Compressor(_torch_cfg(framing=Framing.CONTAINER, **kw)).compress(t)
+    assert blob[:5] == magic
     assert torch.equal(Decompressor().decompress(blob), t)
 
 
-def test_streaming_falls_back_to_container() -> None:
+@pytest.mark.parametrize(
+    ("layout", "magic"),
+    [
+        (None, CONTAINER),
+        (ContainerLayout.COMPACT, CONTAINER),
+        (ContainerLayout.LEGACY, LEGACY_CONTAINER),
+    ],
+)
+def test_streaming_falls_back_to_container(layout, magic: bytes) -> None:
+    """The compact frame has no chunk table: streaming falls back to a full
+    container, compact by default and legacy only when pinned."""
     t = torch.randn(4096).to(torch.bfloat16)
-    blob = Compressor(_torch_cfg(is_streaming=True, streaming_chunk=1024)).compress(t)
-    assert blob[:5] == CONTAINER
+    kw = {} if layout is None else {"container_layout": layout}
+    blob = Compressor(
+        _torch_cfg(is_streaming=True, streaming_chunk=1024, **kw)
+    ).compress(t)
+    assert blob[:5] == magic
     back = Decompressor().decompress(blob)
     assert torch.equal(back.view(torch.uint8), t.view(torch.uint8))
 

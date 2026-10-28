@@ -15,6 +15,7 @@ import torch
 from ptwm import (
     CompressionConfig,
     Compressor,
+    ContainerLayout,
     Decompressor,
     Format,
     Framing,
@@ -70,14 +71,23 @@ def test_zstd_numpy_roundtrip() -> None:
     assert np.array_equal(arr, recovered)
 
 
-def test_zstd_outputs_ptwm() -> None:
-    """ZSTD produces a .ptwm container with a forced Zstd plane codec."""
+@pytest.mark.parametrize(
+    ("layout", "magic"),
+    [(ContainerLayout.LEGACY, b"\x89PTWM"), (ContainerLayout.COMPACT, b"\x89PTWC")],
+)
+def test_zstd_outputs_ptwm(layout: ContainerLayout, magic: bytes) -> None:
+    """ZSTD produces a .ptwm container with a forced Zstd plane codec, in
+    either layout."""
     arr = np.zeros(256, dtype=np.float32).tobytes()
     config = CompressionConfig(
-        method=Method.ZSTD, bytearray_dtype="float32", framing=Framing.CONTAINER
+        method=Method.ZSTD,
+        bytearray_dtype="float32",
+        framing=Framing.CONTAINER,
+        container_layout=layout,
     )
     compressed = Compressor(config).compress(arr)
-    assert compressed[:5] == b"\x89PTWM"
+    assert compressed[:5] == magic
+    assert Decompressor().decompress(compressed) == arr
 
 
 def test_zstd_empty_input() -> None:

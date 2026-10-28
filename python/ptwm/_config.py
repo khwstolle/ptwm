@@ -45,17 +45,25 @@ class Format(Enum):
 class Framing(Enum):
     r"""Byte layout of a single-tensor :meth:`Compressor.compress` output.
 
-    ``COMPACT`` writes a compact single-tensor frame (magic ``\x89PTWS``)
-    with a fixed cost of at most about 70 bytes, and stores the raw bytes when
-    no codec makes them smaller. It falls back to ``CONTAINER`` when the
-    tensor cannot use the frame (streaming, or a plane that selects shared
-    codec state). ``CONTAINER`` writes a full ``.ptwm`` container in the
-    layout :attr:`CompressionConfig.container_layout` selects, which the
-    random-access, store and transcode tools open.
+    ``COMPACT`` (default) writes a compact single-tensor frame (magic
+    ``\x89PTWS``) with a fixed cost of at most about 70 bytes, and stores the
+    raw bytes when no codec makes them smaller. It falls back to a full
+    container when the tensor cannot use the frame (streaming, or a plane that
+    selects shared codec state). ``CONTAINER`` always writes a full ``.ptwm``
+    container, which the random-access, store and transcode tools open.
+
+    A full container (from ``CONTAINER`` or the ``COMPACT`` fallback) has the
+    layout :attr:`CompressionConfig.container_layout` selects: ``\x89PTWC``
+    for :attr:`ContainerLayout.COMPACT` (the default) and ``\x89PTWM`` for
+    :attr:`ContainerLayout.LEGACY`. So ``Framing.CONTAINER`` with the default
+    layout gives a ``\x89PTWC`` container.
 
     Readers before v1.2 read only ``CONTAINER`` output in the
     :attr:`ContainerLayout.LEGACY` layout (magic ``\x89PTWM``); they reject
-    the ``\x89PTWS`` frame and the ``\x89PTWC`` compact container.
+    the ``\x89PTWS`` frame and the ``\x89PTWC`` compact container. Set
+    ``framing=Framing.CONTAINER`` and
+    ``container_layout=ContainerLayout.LEGACY`` for output that older releases
+    read.
     """
 
     COMPACT = 1
@@ -73,10 +81,11 @@ class Framing(Enum):
 class ContainerLayout(Enum):
     r"""On-disk layout of a multi-tensor ``.ptwm`` container.
 
-    ``COMPACT`` (magic ``\x89PTWC``) stores built-in extensions by id,
-    integers as varints and tensor names only in the index; it needs v1.2 or
-    later to read. ``LEGACY`` (magic ``\x89PTWM``) is the fixed-width layout
-    that every release reads.
+    ``COMPACT`` (magic ``\x89PTWC``, the default for new writes) stores
+    built-in extensions by id, integers as varints and tensor names only in
+    the index; it needs v1.2 or later to read. ``LEGACY`` (magic
+    ``\x89PTWM``) is the fixed-width layout that every release reads; its
+    output is byte-identical to the v1.1 writer.
 
     Strings coerce case-insensitively: ``ContainerLayout("compact")`` and
     ``ContainerLayout("LEGACY")`` work, and the bindings take the lower-case
@@ -157,10 +166,12 @@ class CompressionConfig:
     device: int | None = None
     framing: Framing = Framing.COMPACT
     """Output layout; see :class:`Framing`."""
-    container_layout: ContainerLayout = ContainerLayout.LEGACY
+    container_layout: ContainerLayout = ContainerLayout.COMPACT
     """Layout of a full container written with ``Framing.CONTAINER`` (or as
-    the ``Framing.COMPACT`` fallback); see :class:`ContainerLayout`. A string
-    such as ``"compact"`` is coerced on construction."""
+    the ``Framing.COMPACT`` fallback): ``COMPACT`` (default, ``\x89PTWC``) or
+    ``LEGACY`` (``\x89PTWM``, readable before v1.2); see
+    :class:`ContainerLayout`. A string such as ``"legacy"`` is coerced on
+    construction."""
     emit_payload_hash: bool = True
     """Store an xxh64 of the raw bytes (8 B per tensor), checked on decode."""
     emit_plane_crc: bool = True

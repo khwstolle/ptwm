@@ -20,7 +20,7 @@ use ptwm_core::chain::{Chain, ChainEdge, ChainNode, TerminalRef};
 use ptwm_core::codec::{CodecId, codec_for};
 use ptwm_core::compact::{compress_compact, decode_compact};
 use ptwm_core::compressor::{CompressorOptions, InputTensor, compress_model};
-use ptwm_core::container::ContainerReader;
+use ptwm_core::container::{ContainerLayout, ContainerReader};
 use ptwm_core::layout::PlaneLayout;
 use ptwm_core::transforms::op::OpId;
 use ptwm_core::types::{Role, ValueFormat};
@@ -194,11 +194,15 @@ fn compact_frame_bomb_is_bounded() {
     assert_bounded(err, t0);
 }
 
-#[test]
-fn legacy_plane_bomb_is_bounded() {
-    let raw = raw();
+/// A full container in `layout` holding `raw` with one Zstd plane (or one
+/// Zstd chunk per `chunk_size` bytes).
+fn container(raw: &[u8], chunk_size: Option<u32>, layout: ContainerLayout) -> Vec<u8> {
     let mut buf = Vec::new();
-    compress_model(Cursor::new(&mut buf), &[input(&raw)], opts(None)).unwrap();
+    let opts = CompressorOptions {
+        container_layout: layout,
+        ..opts(chunk_size)
+    };
+    compress_model(Cursor::new(&mut buf), &[input(raw)], opts).unwrap();
     assert_eq!(
         ContainerReader::open(&buf)
             .unwrap()
@@ -206,40 +210,38 @@ fn legacy_plane_bomb_is_bounded() {
             .unwrap(),
         raw
     );
-    plant_bomb(&mut buf, &zstd_payload(&raw));
-    let t0 = Instant::now();
-    let err = ContainerReader::open(&buf)
-        .unwrap()
-        .decode_tensor("t")
-        .unwrap_err()
-        .to_string();
-    assert_bounded(err, t0);
+    buf
 }
 
 #[test]
-fn legacy_chunk_bomb_is_bounded() {
-    const CHUNK: usize = 64 * 1024;
+fn container_plane_bomb_is_bounded() {
     let raw = raw();
-    let mut buf = Vec::new();
-    compress_model(
-        Cursor::new(&mut buf),
-        &[input(&raw)],
-        opts(Some(CHUNK as u32)),
-    )
-    .unwrap();
-    assert_eq!(
-        ContainerReader::open(&buf)
+    for layout in [ContainerLayout::Legacy, ContainerLayout::Compact] {
+        let mut buf = container(&raw, None, layout);
+        plant_bomb(&mut buf, &zstd_payload(&raw));
+        let t0 = Instant::now();
+        let err = ContainerReader::open(&buf)
             .unwrap()
             .decode_tensor("t")
-            .unwrap(),
-        raw
-    );
-    plant_bomb(&mut buf, &zstd_payload(&raw[..CHUNK]));
-    let t0 = Instant::now();
-    let err = ContainerReader::open(&buf)
-        .unwrap()
-        .decode_tensor("t")
-        .unwrap_err()
-        .to_string();
-    assert_bounded(err, t0);
+            .unwrap_err()
+            .to_string();
+        assert_bounded(err, t0);
+    }
+}
+
+#[test]
+fn container_chunk_bomb_is_bounded() {
+    const CHUNK: usize = 64 * 1024;
+    let raw = raw();
+    for layout in [ContainerLayout::Legacy, ContainerLayout::Compact] {
+        let mut buf = container(&raw, Some(CHUNK as u32), layout);
+        plant_bomb(&mut buf, &zstd_payload(&raw[..CHUNK]));
+        let t0 = Instant::now();
+        let err = ContainerReader::open(&buf)
+            .unwrap()
+            .decode_tensor("t")
+            .unwrap_err()
+            .to_string();
+        assert_bounded(err, t0);
+    }
 }

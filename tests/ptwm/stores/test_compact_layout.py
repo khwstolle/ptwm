@@ -16,6 +16,7 @@ from ptwm import ContainerLayout, _rust
 from ptwm._exceptions import Error
 from ptwm._magic import MAGIC_LEN, MAGIC_PTWC, MAGIC_PTWM, container_kind
 from ptwm.sharding import compress_ptwm_blob, write_ptwm_shard
+from ptwm.sharding._writer import _default_chain_bytes
 from ptwm.stores import (
     LmdbWeightStore,
     WebDatasetWeightStore,
@@ -32,6 +33,7 @@ from ptwm.stores._common import (
 )
 from ptwm.stores._lmdb import KEY_FMT, KEY_REG
 from ptwm.stores._webdataset import INDEX_NAME, SHARDMETA_MEMBER
+from ptwm.utils import DType
 
 MAGIC = {"legacy": MAGIC_PTWM, "compact": MAGIC_PTWC}
 LAYOUTS = ("legacy", "compact")
@@ -92,8 +94,11 @@ def test_compact_manifest_form_and_identity(store_tensors):
     model = explode_model(blob)
     assert model.container_layout == "compact"
     assert manifest_container_layout(registry_json) == "compact"
-    legacy = compress_ptwm_blob(store_tensors, method_hint=3)
+    legacy = compress_ptwm_blob(store_tensors, method_hint=3, container_layout="legacy")
     assert explode_model(legacy).container_layout == "legacy"
+    # The default layout is compact.
+    default = compress_ptwm_blob(store_tensors, method_hint=3)
+    assert explode_model(default).container_layout == "compact"
 
 
 @pytest.mark.parametrize("method_hint", [1, 2, 3, 4, 5])
@@ -285,5 +290,35 @@ def test_stores_accept_the_layout_enum(tmp_path, store_tensors, raw_of):
 
     wd = tmp_path / "m.wds"
     write_webdataset(wd, store_tensors, container_layout=ContainerLayout.COMPACT)
+    index = json.loads((wd / INDEX_NAME).read_text())
+    assert index["registry"]["ptwm_format"] == "ptwm-manifest-c"
+
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+
+
+def test_new_writes_default_to_the_compact_layout(tmp_path, store_tensors):
+    """Every multi-tensor writer defaults to ``\\x89PTWC``; ``"legacy"`` is
+    still available on request (see the layout-parametrized tests above)."""
+    assert container_kind(compress_ptwm_blob(store_tensors)) == "ptwc"
+    out = tmp_path / "m.ptwm"
+    write_ptwm_shard(out, store_tensors)
+    assert container_kind(out.read_bytes()) == "ptwc"
+
+    # The binding wrapper defaults to the compact layout too.
+    name, raw, dtype, shape = store_tensors[0]
+    dt = DType.from_dtype(dtype)
+    records = [(name, int(dt.code), 0, raw, list(shape), dt.dtype_str, None)]
+    chains = [_default_chain_bytes(int(dt.code), shape, len(raw))]
+    blob = _rust.compress_model(records, chains, True, True)
+    assert container_kind(blob) == "ptwc"
+
+    path = tmp_path / "m.lmdb"
+    write_lmdb(path, store_tensors, layout="blob")
+    with LmdbWeightStore.open(path) as store:
+        assert json.loads(store._get(KEY_FMT))["container_layout"] == "compact"
+
+    wd = tmp_path / "m.wds"
+    write_webdataset(wd, store_tensors)
     index = json.loads((wd / INDEX_NAME).read_text())
     assert index["registry"]["ptwm_format"] == "ptwm-manifest-c"

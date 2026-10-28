@@ -198,7 +198,7 @@ def compress_model(
     streaming_chunk: int | None = None,
     codec_menu: list[int] | None = None,
     *,
-    container_layout: ContainerLayout | str = "legacy",
+    container_layout: ContainerLayout | str = "compact",
 ) -> bytes:
     r"""Compress a list of tensors into a ``.ptwm`` container.
 
@@ -213,8 +213,9 @@ def compress_model(
     ``codec_menu``: optional list of wire-stable ``CodecId`` integers
     restricting the trial-encode menu. ``None`` uses the full menu;
     empty intersection on a plane raises ``InvalidContainer``.
-    ``container_layout``: ``"legacy"`` writes ``\x89PTWM`` (readable by every
-    release), ``"compact"`` writes ``\x89PTWC`` (readable by v1.2 and later).
+    ``container_layout``: ``"compact"`` (default) writes ``\x89PTWC``
+    (readable by v1.2 and later), ``"legacy"`` writes ``\x89PTWM`` (readable
+    by every release).
     A :class:`ptwm.ContainerLayout` is accepted too. Other values raise
     :class:`ptwm.Error` before anything is compressed (the binding itself
     raises ``ValueError``).

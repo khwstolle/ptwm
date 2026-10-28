@@ -22,6 +22,25 @@ _CODEC_NAME_MAP: dict[str, CodecId] = {
 }
 
 
+_CONTAINER_LAYOUT_HELP = (
+    "Layout of written .ptwm containers: 'compact' (default; magic "
+    "\\x89PTWC, readable by ptwm v1.2 and later) or 'legacy' (magic "
+    "\\x89PTWM, readable by every release)."
+)
+
+
+def _add_container_layout_argument(parser) -> None:  # noqa: ANN001
+    """Add ``--container-layout {compact,legacy}`` to ``parser``."""
+    parser.add_argument(
+        "--container-layout",
+        type=str.lower,
+        choices=["compact", "legacy"],
+        default="compact",
+        dest="container_layout",
+        help=_CONTAINER_LAYOUT_HELP,
+    )
+
+
 def _parse_codec_menu(arg: str | None) -> list[CodecId] | None:
     """Parse a comma-separated list of codec names into a list of CodecId.
 
@@ -131,8 +150,13 @@ def compress_file(
     codec_menu: list[CodecId] | None = None,
     codec: str | None = None,
     device: int | None = None,
+    container_layout: str = "compact",
 ) -> None:
-    """Compress a single file."""
+    """Compress a single file.
+
+    The output is a full ``.ptwm`` container in ``container_layout``
+    (``"compact"`` or ``"legacy"``).
+    """
     from ptwm import (  # noqa: PLC0415
         CompressionConfig,
         Compressor,
@@ -164,8 +188,9 @@ def compress_file(
         CompressionConfig(
             bytearray_dtype=dtype,
             # `.ptwm` files stay full containers so the random-access, store
-            # and inspect tools can open them.
+            # and inspect tools can open them (they read both layouts).
             framing=Framing.CONTAINER,
+            container_layout=container_layout,
             is_streaming=is_streaming,
             streaming_chunk=chunk_size,
             method=Method(method),
@@ -250,8 +275,12 @@ def compress_file_delta(
     codec_menu: list[CodecId] | None = None,
     codec: str | None = None,
     device: int | None = None,
+    container_layout: str = "compact",
 ) -> None:
-    """Compress a file using delta compression."""
+    """Compress a file using delta compression.
+
+    The output is a full ``.ptwm`` container in ``container_layout``.
+    """
     from ptwm import (  # noqa: PLC0415
         CompressionConfig,
         Compressor,
@@ -291,6 +320,7 @@ def compress_file_delta(
         CompressionConfig(
             bytearray_dtype="float32" if dtype else "bfloat16",
             framing=Framing.CONTAINER,
+            container_layout=container_layout,
             is_streaming=is_streaming,
             streaming_chunk=chunk_size,
             delta_compressed_type="file",
@@ -350,8 +380,13 @@ def compress_safetensors_file(
     codec_menu: list[CodecId] | None = None,
     codec: str | None = None,
     device: int | None = None,
+    container_layout: str = "compact",
 ) -> None:
-    """Compress a safetensors file."""
+    """Compress a safetensors file.
+
+    ``container_layout`` applies to tensors that do not fit the compact
+    single-tensor frame and are written as full containers.
+    """
     import torch  # noqa: PLC0415
     from safetensors import safe_open  # noqa: PLC0415
     from safetensors.torch import save_file  # noqa: PLC0415
@@ -415,6 +450,7 @@ def compress_safetensors_file(
                         codec_menu=codec_menu,
                         codec=codec,
                         device=device,
+                        container_layout=container_layout,
                     )
                 )
             compressor = compressor_cache[dtype_str]
@@ -473,6 +509,7 @@ def compress_path(
     codec_menu: list[CodecId] | None = None,
     codec: str | None = None,
     device: int | None = None,
+    container_layout: str = "compact",
 ) -> None:
     """Compress all files with the given suffix in the specified path."""
     overwrite_first = True
@@ -569,6 +606,7 @@ def compress_path(
             codec_menu,
             codec,
             device,
+            container_layout,
         )
     else:
         compression_func = compress_safetensors_file
@@ -582,6 +620,7 @@ def compress_path(
             codec_menu,
             codec,
             device,
+            container_layout,
         )
 
     failures: list[tuple[str, BaseException]] = []
@@ -701,6 +740,7 @@ def main(argv: list[str] | None = None) -> int:
         dest="classify_heuristic",
         help="Enable the built-in name-pattern heuristic classifier.",
     )
+    _add_container_layout_argument(parser)
 
     args = parser.parse_args(argv)
 
@@ -742,11 +782,12 @@ def main(argv: list[str] | None = None) -> int:
             mode=args.mode,
             classifier=chain,
             max_shard_size=_parse_size(args.max_shard_size),
+            container_layout=args.container_layout,
         )
         return 0
 
     # Fallback: raw-bytes compression via the existing helper.
-    compress_file(input_file=str(input_path))
+    compress_file(input_file=str(input_path), container_layout=args.container_layout)
     return 0
 
 
@@ -961,6 +1002,7 @@ def add_compress_parser(subparsers):
         dest="lmdb_map_size",
         help="LMDB environment map size (e.g. 8GB). --format lmdb only.",
     )
+    _add_container_layout_argument(parser)
     return parser
 
 
@@ -992,6 +1034,7 @@ def _compress_safetensors_store(args, store_format: str) -> int:  # noqa: ANN001
             layout=args.lmdb_layout,
             map_size=map_size,
             method_hint=method_hint,
+            container_layout=_container_layout_arg(args),
         )
     else:
         from ptwm.stores import write_webdataset  # noqa: PLC0415
@@ -1008,9 +1051,18 @@ def _compress_safetensors_store(args, store_format: str) -> int:  # noqa: ANN001
         )
         print(f"Compressing {input_path} → {out_path} (webdataset)")  # noqa: T201
         write_webdataset(
-            out_path, tensors, max_shard_size=max_shard, method_hint=method_hint
+            out_path,
+            tensors,
+            max_shard_size=max_shard,
+            method_hint=method_hint,
+            container_layout=_container_layout_arg(args),
         )
     return 0
+
+
+def _container_layout_arg(args) -> str:  # noqa: ANN001
+    """Return ``args.container_layout``, or ``"compact"`` when it is unset."""
+    return getattr(args, "container_layout", None) or "compact"
 
 
 def _method_hint_from_name(name: str) -> int:
@@ -1084,6 +1136,7 @@ def _compress_safetensors_integration(args, mode: str) -> int:  # noqa: ANN001
         classifier=ClassifierChain([HeuristicClassifier()]),
         explore_options=explore_options,
         use_user_cache=not getattr(args, "no_cache", False),
+        container_layout=_container_layout_arg(args),
     )
 
     output_bytes = sum(p.stat().st_size for p in out_dir.rglob("*") if p.is_file())
@@ -1162,6 +1215,7 @@ def handle_compress(args):
             codec_menu=codec_menu,
             codec=args.codec,
             device=args.device,
+            container_layout=_container_layout_arg(args),
         )
     elif path.is_file():
         if args.delta:
@@ -1181,6 +1235,7 @@ def handle_compress(args):
                 codec_menu=codec_menu,
                 codec=args.codec,
                 device=args.device,
+                container_layout=_container_layout_arg(args),
             )
         elif path.suffix == ".safetensors" and not args.file_compression:
             compress_safetensors_file(
@@ -1193,6 +1248,7 @@ def handle_compress(args):
                 codec_menu=codec_menu,
                 codec=args.codec,
                 device=args.device,
+                container_layout=_container_layout_arg(args),
             )
         else:
             compress_file(
@@ -1210,6 +1266,7 @@ def handle_compress(args):
                 codec_menu=codec_menu,
                 codec=args.codec,
                 device=args.device,
+                container_layout=_container_layout_arg(args),
             )
     elif args.hf_cache and args.model:
         compress_path(
@@ -1233,6 +1290,7 @@ def handle_compress(args):
             codec_menu=codec_menu,
             codec=args.codec,
             device=args.device,
+            container_layout=_container_layout_arg(args),
         )
     else:
         print(  # noqa: T201

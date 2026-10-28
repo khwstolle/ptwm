@@ -191,7 +191,7 @@ def compress_safetensors_file(
     use_user_cache: bool = True,
     fast: bool = False,
     fast_chunk: int = 512 * 1024,
-    container_layout: ContainerLayout | str = "legacy",
+    container_layout: ContainerLayout | str = "compact",
 ) -> AuditLog:
     r"""Compress a safetensors file into a sharded ``.ptwm`` directory.
 
@@ -214,8 +214,9 @@ def compress_safetensors_file(
         Method hint forwarded to ``write_ptwm_shard``
         (1=HUFFMAN, 2=ZSTD, 3=MICROSCALE, 4=RANS, 5=IDENTITY).
     container_layout:
-        Layout of every shard container: ``"legacy"`` (``\x89PTWM``, readable
-        by every release) or ``"compact"`` (``\x89PTWC``, v1.2 and later).
+        Layout of every shard container: ``"compact"`` (default;
+        ``\x89PTWC``, v1.2 and later) or ``"legacy"`` (``\x89PTWM``, readable
+        by every release).
         Forwarded to ``write_ptwm_shard``; a string or
         :class:`ptwm.ContainerLayout`. Other values raise ``ValueError``
         before any tensor is read.

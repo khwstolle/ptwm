@@ -93,7 +93,8 @@ def test_manifests_are_canonical_jcs(store_tensors):
 
 
 def test_registry_hash_is_hex(store_tensors):
-    blob = compress_ptwm_blob(store_tensors, method_hint=3)
+    # Only the legacy manifest carries registry_hash_blake3.
+    blob = compress_ptwm_blob(store_tensors, method_hint=3, container_layout="legacy")
     registry_json, _tensors, _members = _rust.explode_ptwm(blob)
     reg = json.loads(registry_json)
     assert reg["ptwm_format"] == "ptwm-manifest"

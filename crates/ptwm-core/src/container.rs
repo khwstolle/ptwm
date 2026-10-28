@@ -302,14 +302,18 @@ fn compact_registry_bytes(
 }
 
 /// On-disk layout of a container.
+///
+/// `Default` gives `Compact`, the layout of new multi-tensor writes
+/// ([`crate::compressor::CompressorOptions`]). [`ContainerWriter::new`]
+/// still writes `Legacy`; use [`ContainerWriter::with_layout`] to choose.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ContainerLayout {
     /// `\x89PTWM`: fixed-width header, full Extension Table, hash-sorted
     /// index. Readable by every release.
-    #[default]
     Legacy,
     /// `\x89PTWC`: varint fields, built-ins stored by id, names in the index
     /// ([`crate::ptwc`]). Readable by v1.2 and later.
+    #[default]
     Compact,
 }
 
@@ -3281,6 +3285,8 @@ mod tests {
                 forced_codec: Some(crate::codec::CodecId::Identity),
                 allow_codec_ids: None,
                 chunk_size: None,
+                // Reads the legacy index and records, so the layout is pinned.
+                container_layout: ContainerLayout::Legacy,
                 ..Default::default()
             },
         )
@@ -3748,6 +3754,8 @@ label = "test-author"
                 forced_codec: Some(CodecId::Identity),
                 allow_codec_ids: None,
                 chunk_size,
+                // Parses legacy records, so the layout is pinned.
+                container_layout: ContainerLayout::Legacy,
                 ..Default::default()
             },
         )

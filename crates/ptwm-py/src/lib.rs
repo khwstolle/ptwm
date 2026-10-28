@@ -317,10 +317,13 @@ fn py_dtype_element_size(dtype_code: u8) -> PyResult<u32> {
 /// `method_hint` selects the dominant codec for the container header
 /// (1=HUFFMAN, 2=ZSTD, 3=MICROSCALE, 4=RANS, 5=IDENTITY).
 ///
+/// `container_layout` is ``"compact"`` (default, ``\x89PTWC``, readable by
+/// v1.2 and later) or ``"legacy"`` (``\x89PTWM``, readable by every release).
+///
 /// Returns the entire container as a ``bytes`` object.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (records, chains_per_tensor, emit_payload_hash, emit_plane_crc, method_hint=3, streaming_chunk=None, codec_menu=None, *, container_layout="legacy"))]
+#[pyo3(signature = (records, chains_per_tensor, emit_payload_hash, emit_plane_crc, method_hint=3, streaming_chunk=None, codec_menu=None, *, container_layout="compact"))]
 fn compress_model<'py>(
     py: Python<'py>,
     records: Vec<(

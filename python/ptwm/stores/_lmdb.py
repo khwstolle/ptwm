@@ -77,12 +77,12 @@ def write_lmdb(
     map_size: int = _DEFAULT_MAP_SIZE,
     method_hint: int = 3,
     chains_per_tensor: list[list[bytes]] | None = None,
-    container_layout: ContainerLayout | str = "legacy",
+    container_layout: ContainerLayout | str = "compact",
 ) -> Path:
     r"""Write ``tensors`` into an LMDB environment at ``path``.
 
     ``layout`` is ``"blob"`` (default) or ``"exploded"``. ``container_layout``
-    (``"legacy"`` or ``"compact"``) selects the container layout of the
+    (``"compact"``, the default, or ``"legacy"``) selects the container layout of the
     per-tensor blobs (blob layout) or of the registry manifest the tensors are
     rebuilt from (exploded layout). A ``"compact"`` store records the layout
     in its ``\x00fmt`` record so that later :meth:`LmdbWeightStore.put_tensor`

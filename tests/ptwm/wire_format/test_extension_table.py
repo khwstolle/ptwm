@@ -1,7 +1,18 @@
-"""Verify the v1 file carries an Extension Table immediately after the header."""
+"""Verify the v1 file carries an Extension Table immediately after the header.
+
+These tests read the fixed-width legacy header, so they pin
+``ContainerLayout.LEGACY``; the default layout is compact (``\x89PTWC``).
+"""
 
 import torch
-from ptwm import CompressionConfig, Compressor, Format, Framing, Method
+from ptwm import (
+    CompressionConfig,
+    Compressor,
+    ContainerLayout,
+    Format,
+    Framing,
+    Method,
+)
 
 
 def test_extension_table_is_present_for_huffman_chain():
@@ -11,8 +22,10 @@ def test_extension_table_is_present_for_huffman_chain():
             input_format=Format.TORCH,
             method=Method.HUFFMAN,
             framing=Framing.CONTAINER,
+            container_layout=ContainerLayout.LEGACY,
         )
     ).compress(tensor)
+    assert blob[:5] == b"\x89PTWM"
 
     # Header layout (little-endian):
     #   magic:                  [u8; 9]    bytes  0.. 9
@@ -43,8 +56,13 @@ def test_extension_table_holds_only_referenced_codecs():
     v1.1 layout interned all 16 built-in plane codecs, about 2 KB."""
     tensor = torch.full((32,), 0.5, dtype=torch.bfloat16)
     blob = Compressor(
-        CompressionConfig(input_format=Format.TORCH, framing=Framing.CONTAINER)
+        CompressionConfig(
+            input_format=Format.TORCH,
+            framing=Framing.CONTAINER,
+            container_layout=ContainerLayout.LEGACY,
+        )
     ).compress(tensor)
+    assert blob[:5] == b"\x89PTWM"
     table_off = int.from_bytes(blob[11:19], "little")
     count = int.from_bytes(blob[table_off : table_off + 4], "little")
     assert count < 16, f"extension table has {count} entries"

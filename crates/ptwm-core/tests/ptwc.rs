@@ -470,13 +470,19 @@ fn compress_model_matrix_round_trips_in_both_layouts() {
     }
 }
 
+/// New multi-tensor writes default to the compact layout; the legacy
+/// layout is still available on request.
 #[test]
-fn legacy_layout_stays_the_default() {
+fn compact_layout_is_the_default() {
     let data = feature_tensors();
     let default = compress(&data, options(true, true, None, ContainerLayout::default()));
+    let compact = compress(&data, options(true, true, None, ContainerLayout::Compact));
+    assert!(default == compact);
+    assert_eq!(default[..5], *b"\x89PTWC");
     let legacy = compress(&data, options(true, true, None, ContainerLayout::Legacy));
-    assert!(default == legacy);
-    assert_eq!(default[..5], *b"\x89PTWM");
+    assert_eq!(legacy[..5], *b"\x89PTWM");
+    let from_default = compress(&data, CompressorOptions::default());
+    assert_eq!(from_default[..5], *b"\x89PTWC");
 }
 
 #[test]

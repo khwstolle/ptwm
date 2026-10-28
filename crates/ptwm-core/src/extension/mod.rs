@@ -5,6 +5,7 @@
 pub mod builder;
 pub mod builtins;
 pub mod capability;
+pub mod compact_table;
 pub mod dispatch;
 pub mod error;
 pub mod id;

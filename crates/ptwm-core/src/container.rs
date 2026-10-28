@@ -11,9 +11,14 @@ use std::collections::{HashMap, HashSet};
 
 use crate::chain::Chain;
 use crate::chain::wire::{read_chain, write_chain};
+use crate::chain::wire_compact::{bind_deferred_source, has_deferred_source};
+use crate::codec::CodecId;
 use crate::error::PtwmCoreError;
 use crate::extension::{CanonicalId, ExtensionTable, ExtensionTableBuilder};
-use crate::header::{HEADER_LEN, Header, MAGIC_PTWM};
+use crate::header::{ContainerMagic, HEADER_LEN, Header, MAGIC_PTWC, MAGIC_PTWM, MAGIC_PTWX, sniff};
+use crate::tensor_record_compact::{
+    RecordContext, parse_compact_record, plane_codec_ids, record_binding, write_compact_record,
+};
 use crate::index::{
     EOF_SENTINEL, IndexEntry, name_hash, parse_index, verify_eof_sentinel, write_index,
 };
@@ -112,6 +117,12 @@ impl ChainRegistry {
 
     /// Return a reference to the `Chain` with the given `chain_id`, or `None`.
     pub fn lookup(&self, chain_id: u16) -> Option<&Chain> {
+        // Writers assign ids by position; try that first.
+        if let Some((id, chain)) = self.chains.get(usize::from(chain_id))
+            && *id == chain_id
+        {
+            return Some(chain);
+        }
         self.chains
             .iter()
             .find(|(id, _)| *id == chain_id)
@@ -268,9 +279,112 @@ pub fn encode_registry_for_table(
     })
 }
 
+/// Encode `registry` as a compact registry whose op references index
+/// `table` (the entry with each op's built-in id).
+fn compact_registry_bytes(
+    registry: &ChainRegistry,
+    table: &ExtensionTable,
+) -> Result<Vec<u8>, PtwmCoreError> {
+    let reg = crate::extension::builtin_registry();
+    let mut index: HashMap<CanonicalId, u64> = HashMap::new();
+    for (i, e) in table.entries.iter().enumerate() {
+        index.entry(e.canonical_id).or_insert(i as u64);
+    }
+    crate::ptwc::write_registry(registry, |op| {
+        reg.id_for_entry_name(op.builtin_name())
+            .and_then(|id| index.get(&id).copied())
+            .ok_or_else(|| {
+                PtwmCoreError::InvalidContainer(format!(
+                    "op {op:?} is not in the extension table"
+                ))
+            })
+    })
+}
+
+/// On-disk layout of a container.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ContainerLayout {
+    /// `\x89PTWM`: fixed-width header, full Extension Table, hash-sorted
+    /// index. Readable by every release.
+    #[default]
+    Legacy,
+    /// `\x89PTWC`: varint fields, built-ins stored by id, names in the index
+    /// ([`crate::ptwc`]). Readable by v1.2 and later.
+    Compact,
+}
+
+impl ContainerLayout {
+    /// The layout's name as the Python bindings spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Compact => "compact",
+        }
+    }
+
+    /// Parse a layout name (`"legacy"` or `"compact"`).
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "legacy" => Some(Self::Legacy),
+            "compact" => Some(Self::Compact),
+            _ => None,
+        }
+    }
+}
+
+/// Serializes tensor records for one container writer's layout and tables.
+///
+/// [`ContainerWriter::record_encoder`] returns it so that callers can
+/// serialize records in parallel and append the bytes with
+/// [`ContainerWriter::append_serialized_tensor`].
+#[derive(Debug, Clone)]
+pub struct RecordEncoder {
+    layout: ContainerLayout,
+    builtin_version: String,
+    codec_ids: Vec<Option<CodecId>>,
+    registry_bound: Vec<bool>,
+}
+
+impl RecordEncoder {
+    /// Serialize `rec` in the writer's layout. A compact record leaves out
+    /// the name, which the index stores.
+    pub fn encode(&self, rec: &TensorRecord) -> Result<Vec<u8>, PtwmCoreError> {
+        let est: usize = rec
+            .terminals
+            .iter()
+            .map(|t| t.payload_bytes.len() + t.inline_state_bytes.len())
+            .sum();
+        let mut buf = Vec::with_capacity(est + 256);
+        self.encode_into(rec, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// [`encode`](Self::encode) into `out`; on error `out` is unchanged.
+    pub fn encode_into(&self, rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), PtwmCoreError> {
+        match self.layout {
+            ContainerLayout::Legacy => {
+                write_tensor_record_with_builtin_version(rec, out, &self.builtin_version)
+            }
+            ContainerLayout::Compact => {
+                let ctx = RecordContext {
+                    codec_ids: &self.codec_ids,
+                    registry_bound: &self.registry_bound,
+                };
+                write_compact_record(rec, &ctx, out)
+                    .map_err(|e| PtwmCoreError::InvalidContainer(format!("tensor '{}': {e}", rec.name)))
+            }
+        }
+    }
+}
+
 /// Streaming writer for a `.ptwm` container.
 pub struct ContainerWriter<W: Write + Seek> {
     writer: W,
+    layout: ContainerLayout,
+    /// Record names and lengths in body order (compact layout).
+    compact_index: Vec<(String, u64)>,
+    /// Record encoder state for the current tables.
+    encoder: RecordEncoder,
     header: Header,
     header_position: u64,
     tensors_start_pos: u64,
@@ -308,24 +422,42 @@ pub struct ContainerWriter<W: Write + Seek> {
 }
 
 impl<W: Write + Seek> ContainerWriter<W> {
-    /// Create a new container writer. Writes a 91-byte header placeholder
-    /// immediately.
-    pub fn new(mut writer: W) -> Result<Self, PtwmCoreError> {
+    /// Create a new legacy-layout container writer. Writes a 91-byte header
+    /// placeholder immediately.
+    pub fn new(writer: W) -> Result<Self, PtwmCoreError> {
+        Self::with_layout(writer, ContainerLayout::Legacy)
+    }
+
+    /// Create a container writer for `layout`. The legacy layout writes a
+    /// header placeholder now and patches it in [`finalize`](Self::finalize);
+    /// the compact layout writes its header with the first tensor and never
+    /// seeks.
+    pub fn with_layout(mut writer: W, layout: ContainerLayout) -> Result<Self, PtwmCoreError> {
         let header_position = writer
             .stream_position()
             .map_err(|e| PtwmCoreError::Io(e.to_string()))?;
 
-        // Write placeholder (magic bytes, rest zeros).
-        let mut placeholder = [0u8; HEADER_LEN];
-        placeholder[..9].copy_from_slice(&MAGIC_PTWM);
-        writer
-            .write_all(&placeholder)
-            .map_err(|e| PtwmCoreError::Io(e.to_string()))?;
+        if layout == ContainerLayout::Legacy {
+            // Write placeholder (magic bytes, rest zeros).
+            let mut placeholder = [0u8; HEADER_LEN];
+            placeholder[..9].copy_from_slice(&MAGIC_PTWM);
+            writer
+                .write_all(&placeholder)
+                .map_err(|e| PtwmCoreError::Io(e.to_string()))?;
+        }
 
         let header = Header::new_ptwm();
 
         Ok(Self {
             writer,
+            layout,
+            compact_index: Vec::new(),
+            encoder: RecordEncoder {
+                layout,
+                builtin_version: crate::extension::CURRENT_BUILTIN_VERSION.to_owned(),
+                codec_ids: Vec::new(),
+                registry_bound: Vec::new(),
+            },
             header,
             header_position,
             tensors_start_pos: 0,
@@ -411,13 +543,103 @@ impl<W: Write + Seek> ContainerWriter<W> {
                 "chain registry must be set before appending tensors".into(),
             ));
         }
+        self.check_registry_for_layout(&registry)?;
         let built = build_extension_table(&registry, codecs, &self.builtin_version)?;
+        self.chain_registry_bytes = match self.layout {
+            ContainerLayout::Legacy => built.registry_bytes,
+            ContainerLayout::Compact => compact_registry_bytes(&registry, &built.table)?,
+        };
         self.extension_table = built.table;
         self.raw_extension_table = None;
         self.table_set = true;
-        self.chain_registry_bytes = built.registry_bytes;
         self.chain_registry = registry;
         self.codec_idx_map = built.codec_idx_map;
+        self.refresh_encoder();
+        Ok(())
+    }
+
+    /// Fail on registry chains the layout cannot store: a bound Source (a
+    /// Source node with empty params) needs the compact layout.
+    fn check_registry_for_layout(&self, registry: &ChainRegistry) -> Result<(), PtwmCoreError> {
+        if self.layout == ContainerLayout::Legacy
+            && let Some((id, _)) = registry.chains.iter().find(|(_, c)| has_deferred_source(c))
+        {
+            return Err(PtwmCoreError::InvalidContainer(format!(
+                "chain {id} has a bound Source (empty Source params), which needs the \
+                 compact layout"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Recompute the record encoder's view of the tables.
+    fn refresh_encoder(&mut self) {
+        self.encoder.builtin_version = self.builtin_version.clone();
+        self.encoder.codec_ids = plane_codec_ids(&self.extension_table);
+        self.encoder.registry_bound = self
+            .chain_registry
+            .chains
+            .iter()
+            .map(|(_, c)| has_deferred_source(c))
+            .collect();
+    }
+
+    /// The writer's layout.
+    pub fn layout(&self) -> ContainerLayout {
+        self.layout
+    }
+
+    /// A record encoder for the current layout and tables. Take it after the
+    /// Extension Table and chain registry are set.
+    pub fn record_encoder(&self) -> RecordEncoder {
+        self.encoder.clone()
+    }
+
+    /// Serialize `rec` the way [`append_tensor`](Self::append_tensor) would,
+    /// for [`append_serialized_tensor`](Self::append_serialized_tensor).
+    pub fn encode_record(&self, rec: &TensorRecord) -> Result<Vec<u8>, PtwmCoreError> {
+        self.encoder.encode(rec)
+    }
+
+    /// Use `table` as the Extension Table and encode `registry` against it
+    /// (compact layout only). Registry ops resolve to the table entry with
+    /// their built-in id, and [`codec_table_idx_for`](Self::codec_table_idx_for)
+    /// to the entry of each built-in codec. The transcoder uses this to write
+    /// a table and registry exactly as they were read.
+    ///
+    /// Must be called before any tensor is appended.
+    pub fn set_compact_tables(
+        &mut self,
+        table: ExtensionTable,
+        registry: ChainRegistry,
+    ) -> Result<(), PtwmCoreError> {
+        if self.layout != ContainerLayout::Compact {
+            return Err(PtwmCoreError::InvalidContainer(
+                "set_compact_tables needs the compact layout".into(),
+            ));
+        }
+        if self.prelude_written || !self.index_entries.is_empty() {
+            return Err(PtwmCoreError::InvalidContainer(
+                "extension table must be set before appending tensors".into(),
+            ));
+        }
+        // Fails early on entries the compact table cannot store.
+        crate::extension::compact_table::compact_table_bytes(&table)?;
+        self.chain_registry_bytes = compact_registry_bytes(&registry, &table)?;
+        let mut codec_idx_map = HashMap::new();
+        for (i, e) in table.entries.iter().enumerate() {
+            if let Some(crate::extension::BuiltinKind::Codec(_)) =
+                crate::extension::dispatch_builtin(&e.canonical_id)
+            {
+                codec_idx_map.entry(e.canonical_id).or_insert(i as u16);
+            }
+        }
+        self.extension_table = table;
+        self.raw_extension_table = None;
+        self.chain_registry = registry;
+        self.codec_idx_map = codec_idx_map;
+        self.table_set = true;
+        self.refresh_encoder();
         Ok(())
     }
 
@@ -437,6 +659,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
         self.extension_table = table;
         self.raw_extension_table = None;
         self.table_set = true;
+        self.refresh_encoder();
     }
 
     /// Write built-in Extension Table entries with the ids and labels of
@@ -454,12 +677,18 @@ impl<W: Write + Seek> ContainerWriter<W> {
                 "builtin version must be set before the extension table and tensors".into(),
             ));
         }
+        if self.layout == ContainerLayout::Compact {
+            return Err(PtwmCoreError::InvalidContainer(
+                "the compact layout stores built-ins without a version".into(),
+            ));
+        }
         if !crate::extension::is_valid_builtin_version(version) {
             return Err(PtwmCoreError::InvalidContainer(format!(
                 "invalid builtin version {version:?}"
             )));
         }
         self.builtin_version = version.to_owned();
+        self.refresh_encoder();
         Ok(())
     }
 
@@ -483,6 +712,12 @@ impl<W: Write + Seek> ContainerWriter<W> {
                 "extension table must be set before appending tensors".into(),
             ));
         }
+        if self.layout != ContainerLayout::Legacy {
+            return Err(PtwmCoreError::InvalidContainer(
+                "set_raw_extension_table needs the legacy layout".into(),
+            ));
+        }
+        self.check_registry_for_layout(&registry)?;
         let built = encode_registry_for_table(table_bytes, &registry)?;
         self.extension_table = built.table;
         self.raw_extension_table = Some(table_bytes.to_vec());
@@ -490,6 +725,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
         self.chain_registry = registry;
         self.codec_idx_map = built.codec_idx_map;
         self.table_set = true;
+        self.refresh_encoder();
         Ok(())
     }
 
@@ -500,6 +736,9 @@ impl<W: Write + Seek> ContainerWriter<W> {
     fn flush_prelude(&mut self) -> Result<(), PtwmCoreError> {
         if self.prelude_written {
             return Ok(());
+        }
+        if self.layout == ContainerLayout::Compact {
+            return self.flush_compact_prelude();
         }
 
         // Extension table sits immediately after the header at HEADER_LEN.
@@ -574,12 +813,40 @@ impl<W: Write + Seek> ContainerWriter<W> {
         Ok(())
     }
 
+    /// Write the compact header, Extension Table, prelude and registry.
+    fn flush_compact_prelude(&mut self) -> Result<(), PtwmCoreError> {
+        let et = crate::extension::compact_table::compact_table_bytes(&self.extension_table)?;
+        let mut prelude = Vec::new();
+        write_prelude(&self.prelude_entries, &mut prelude)?;
+        let registry = if self.chain_registry_bytes.is_empty() {
+            crate::ptwc::write_registry(&self.chain_registry, |op| {
+                Err(PtwmCoreError::InvalidContainer(format!(
+                    "op {op:?} is not in the extension table"
+                )))
+            })?
+        } else {
+            self.chain_registry_bytes.clone()
+        };
+        let header = crate::ptwc::header_bytes(&et, &prelude, &registry);
+        for part in [&header, &et, &prelude, &registry] {
+            self.writer
+                .write_all(part)
+                .map_err(|e| PtwmCoreError::Io(e.to_string()))?;
+        }
+        self.prelude_written = true;
+        Ok(())
+    }
+
     /// Append a tensor record to the container.
     pub fn append_tensor(&mut self, record: &TensorRecord) -> Result<(), PtwmCoreError> {
         if self.finalized {
             return Err(PtwmCoreError::InvalidContainer("already finalized".into()));
         }
         self.check_new_name(&record.name)?;
+        if self.layout == ContainerLayout::Compact {
+            let bytes = self.encoder.encode(record)?;
+            return self.append_serialized_tensor(&record.name, &bytes);
+        }
 
         // On first tensor: flush prelude and record tensors_start_pos.
         if !self.prelude_written {
@@ -604,6 +871,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
             name_hash: name_hash(&record.name),
             tensor_offset,
             tensor_len,
+            name: None,
         });
         self.names.insert(record.name.clone());
 
@@ -622,10 +890,12 @@ impl<W: Write + Seek> ContainerWriter<W> {
         Ok(())
     }
 
-    /// Append a tensor whose record bytes were serialized ahead of time (e.g.
-    /// in parallel via [`crate::tensor_record::write_tensor_record`]).
-    /// Identical on-disk effect to [`Self::append_tensor`] but skips the
-    /// (payload-copy-heavy) serialization, which the caller has already done.
+    /// Append a tensor whose record bytes were serialized ahead of time by
+    /// [`encode_record`](Self::encode_record) or a [`RecordEncoder`] (for
+    /// example in parallel). Identical on-disk effect to
+    /// [`Self::append_tensor`] but skips the (payload-copy-heavy)
+    /// serialization, which the caller has already done. The bytes must be
+    /// in this writer's layout.
     pub fn append_serialized_tensor(
         &mut self,
         name: &str,
@@ -635,6 +905,29 @@ impl<W: Write + Seek> ContainerWriter<W> {
             return Err(PtwmCoreError::InvalidContainer("already finalized".into()));
         }
         self.check_new_name(name)?;
+        if self.layout == ContainerLayout::Compact {
+            if name.is_empty() || name.len() > crate::ptwc::MAX_NAME_LEN {
+                return Err(PtwmCoreError::InvalidContainer(format!(
+                    "tensor name of {} bytes (the compact layout needs 1..={})",
+                    name.len(),
+                    crate::ptwc::MAX_NAME_LEN
+                )));
+            }
+            if (tensor_buf.len() as u64) < crate::tensor_record_compact::MIN_RECORD_LEN {
+                return Err(PtwmCoreError::InvalidContainer(format!(
+                    "tensor '{name}': {}-byte record is not a compact record",
+                    tensor_buf.len()
+                )));
+            }
+            self.flush_prelude()?;
+            self.writer
+                .write_all(tensor_buf)
+                .map_err(|e| PtwmCoreError::Io(e.to_string()))?;
+            self.compact_index
+                .push((name.to_owned(), tensor_buf.len() as u64));
+            self.names.insert(name.to_owned());
+            return Ok(());
+        }
         if !self.prelude_written {
             self.flush_prelude()?;
             self.tensors_start_pos = self.header.shared_prelude_offset + self.prelude_section_len;
@@ -650,6 +943,7 @@ impl<W: Write + Seek> ContainerWriter<W> {
             name_hash: name_hash(name),
             tensor_offset,
             tensor_len: tensor_buf.len() as u64,
+            name: None,
         });
         self.names.insert(name.to_owned());
         Ok(())
@@ -665,6 +959,17 @@ impl<W: Write + Seek> ContainerWriter<W> {
         // If no tensors were appended, write prelude now so prelude_offset is valid.
         if !self.prelude_written {
             self.flush_prelude()?;
+        }
+        if self.layout == ContainerLayout::Compact {
+            let index = crate::ptwc::write_index(&self.compact_index)?;
+            self.writer
+                .write_all(&index)
+                .map_err(|e| PtwmCoreError::Io(e.to_string()))?;
+            self.writer
+                .write_all(&crate::ptwc::footer_bytes(index.len() as u64))
+                .map_err(|e| PtwmCoreError::Io(e.to_string()))?;
+            self.finalized = true;
+            return Ok(());
         }
 
         // Record tensor-index offset and write sorted index.
@@ -809,6 +1114,120 @@ fn decode_pubkey_to_canonical(
     crate::extension::CanonicalId::derive(&key, name, version)
 }
 
+/// Discovery, missing-flavor and trust pass over an Extension Table (spec
+/// §6.5: trusted ⇒ allowed). Returns the installed-extension snapshot and
+/// the missing entries. With `skip_missing`, missing or untrusted entries
+/// do not fail the call.
+#[allow(clippy::type_complexity)]
+fn check_extensions(
+    extension_table: &ExtensionTable,
+    skip_missing: bool,
+) -> Result<
+    (
+        Vec<crate::discovery::DiscoveredContribution>,
+        Vec<crate::error::MissingFlavorEntry>,
+    ),
+    PtwmCoreError,
+> {
+    // A table of built-ins only needs no discovery, keyring or trust
+    // pass: built-ins are trusted by construction and always available.
+    // Skipping it keeps opening such a file free of filesystem access.
+    let all_builtin = extension_table
+        .entries
+        .iter()
+        .all(|e| crate::extension::is_builtin(&e.canonical_id));
+
+    // Scan installed extensions once; used by both the missing-flavor check
+    // and the trust verifier pass below.
+    let installed = if all_builtin {
+        Vec::new()
+    } else {
+        crate::discovery::scan_all_cached().unwrap_or_default()
+    };
+
+    // Check for missing non-builtin flavors immediately after parsing the
+    // Extension Table — before touching any tensor payload.
+    let needs = collect_missing_flavors(extension_table, &installed)?;
+    if !needs.is_empty() && !skip_missing {
+        return Err(PtwmCoreError::MissingFlavor { needs });
+    }
+
+    // ── Trust Verifier pass (spec §6.5: trusted ⇒ allowed) ───────────────
+    //
+    // For every non-builtin entry in the Extension Table that IS installed
+    // (i.e. not flagged as missing above), verify that its author is
+    // trusted by the active keyring. Entries with no matching install
+    // (already covered by MissingFlavor above) are skipped here.
+    if !all_builtin {
+        // Build the active keyring: start from the bundled keys, merge the
+        // user keyring on top.
+        let mut keyring = match crate::trust::evaluate_bundled() {
+            Ok(crate::trust::BundleStatus::Match { keyring }) => keyring,
+            Ok(crate::trust::BundleStatus::FreshInstall { keyring, hash }) => {
+                // First-run convenience: auto-trust the bundled keyring and
+                // persist the lock so subsequent opens see Match.
+                let _ = crate::trust::apply_fresh_install(&hash);
+                keyring
+            }
+            // Bundled keyring changed since last acceptance — do not
+            // activate it until the user runs `ptwm trust update --bundled`.
+            Ok(crate::trust::BundleStatus::Mismatch { .. }) => crate::trust::Keyring::default(),
+            Err(_) => crate::trust::Keyring::default(),
+        };
+
+        // Merge user keyring (keys.toml lives beside bundled.lock).
+        let user_keys_path = crate::trust::lock_path().with_file_name("keys.toml");
+        if let Ok(user) = crate::trust::Keyring::load_from_path(&user_keys_path) {
+            keyring.entries.extend(user.entries);
+        }
+
+        let verifier = crate::trust::Verifier::new(keyring);
+
+        let mut untrusted: Vec<(crate::extension::CanonicalId, String)> = Vec::new();
+        for entry in &extension_table.entries {
+            if crate::extension::is_builtin(&entry.canonical_id) {
+                // Built-ins are trusted by construction; verifier would
+                // short-circuit anyway, but skip the lookup entirely.
+                continue;
+            }
+            let Some((pubkey, contrib_idx)) =
+                lookup_author_pubkey(&entry.canonical_id, &installed)
+            else {
+                // No matching installed manifest — MissingFlavor already
+                // accounts for this entry. If skip_missing is true we keep
+                // going; treat as unverifiable (but not actively untrusted).
+                continue;
+            };
+            // Recompute the signature's signed material from the on-disk
+            // bundle (manifest + binaries, in the order
+            // `ext_tooling/sign.py::sign_bundle` writes them). Tampering
+            // with either the manifest TOML or any binary after signing
+            // changes the digest and trips Ed25519 verification.
+            let signed_material = match installed[contrib_idx].signed_digest() {
+                Ok(d) => d,
+                Err(e) => {
+                    untrusted.push((entry.canonical_id, e.to_string()));
+                    continue;
+                }
+            };
+            match verifier.verify(entry, &signed_material, &pubkey) {
+                Ok(crate::trust::TrustVerdict::Trusted) => {}
+                Ok(crate::trust::TrustVerdict::Untrusted { reason }) => {
+                    untrusted.push((entry.canonical_id, reason));
+                }
+                Err(e) => {
+                    untrusted.push((entry.canonical_id, e.to_string()));
+                }
+            }
+        }
+        if !untrusted.is_empty() && !skip_missing {
+            let (id, reason) = untrusted.remove(0);
+            return Err(PtwmCoreError::ContributionUntrusted { id, reason });
+        }
+    }
+    Ok((installed, needs))
+}
+
 /// Zero-copy reader for a `.ptwm` container backed by an in-memory byte slice.
 #[derive(Debug)]
 pub struct ContainerReader<'a> {
@@ -848,7 +1267,16 @@ pub struct ContainerReader<'a> {
     /// [`crate::extension::normalize_builtin_ids`]: the release whose
     /// built-in ids the writer used. `None` when the table holds no built-in
     /// entry. `extension_table` holds the ids mapped to the crate version.
+    /// Always `None` for the compact layout, which stores built-ins without
+    /// a version.
     pub builtin_version: Option<String>,
+    /// The file's layout, from its magic.
+    pub layout: ContainerLayout,
+    /// Compact layout: the codec id of each Extension Table entry (see
+    /// [`plane_codec_ids`]). Empty for the legacy layout.
+    codec_ids: Vec<Option<CodecId>>,
+    /// Compact layout: whether each registry chain has a bound Source.
+    registry_bound: Vec<bool>,
 }
 
 impl<'a> ContainerReader<'a> {
@@ -881,12 +1309,20 @@ impl<'a> ContainerReader<'a> {
     /// [`open_partial`](Self::open_partial).
     fn open_with(buf: &'a [u8], skip_missing: bool) -> Result<Self, PtwmCoreError> {
         verify_eof_sentinel(buf)?;
+        if sniff(buf) == Some(ContainerMagic::Ptwc) {
+            return Self::open_compact(buf, skip_missing);
+        }
         if buf.len() < HEADER_LEN {
             return Err(PtwmCoreError::InvalidContainer(
                 "file shorter than header".into(),
             ));
         }
         let header = Header::from_bytes(&buf[..HEADER_LEN])?;
+        if header.is_ptwx() != (header.magic == MAGIC_PTWX) {
+            return Err(PtwmCoreError::InvalidContainer(
+                "the PTWX header flag disagrees with the magic".into(),
+            ));
+        }
 
         // Parse the Extension Table (sits at extension_table_offset for
         // extension_table_length bytes, immediately after the header).
@@ -921,102 +1357,7 @@ impl<'a> ContainerReader<'a> {
         // This runs after the hash check, which covers the on-disk bytes.
         let builtin_version = crate::extension::normalize_builtin_ids(&mut extension_table);
 
-        // A table of built-ins only needs no discovery, keyring or trust
-        // pass: built-ins are trusted by construction and always available.
-        // Skipping it keeps opening such a file free of filesystem access.
-        let all_builtin = extension_table
-            .entries
-            .iter()
-            .all(|e| crate::extension::is_builtin(&e.canonical_id));
-
-        // Scan installed extensions once; used by both the missing-flavor check
-        // and the trust verifier pass below.
-        let installed = if all_builtin {
-            Vec::new()
-        } else {
-            crate::discovery::scan_all_cached().unwrap_or_default()
-        };
-
-        // Check for missing non-builtin flavors immediately after parsing the
-        // Extension Table — before touching any tensor payload.
-        let needs = collect_missing_flavors(&extension_table, &installed)?;
-        if !needs.is_empty() && !skip_missing {
-            return Err(PtwmCoreError::MissingFlavor { needs });
-        }
-
-        // ── Trust Verifier pass (spec §6.5: trusted ⇒ allowed) ───────────────
-        //
-        // For every non-builtin entry in the Extension Table that IS installed
-        // (i.e. not flagged as missing above), verify that its author is
-        // trusted by the active keyring. Entries with no matching install
-        // (already covered by MissingFlavor above) are skipped here.
-        if !all_builtin {
-            // Build the active keyring: start from the bundled keys, merge the
-            // user keyring on top.
-            let mut keyring = match crate::trust::evaluate_bundled() {
-                Ok(crate::trust::BundleStatus::Match { keyring }) => keyring,
-                Ok(crate::trust::BundleStatus::FreshInstall { keyring, hash }) => {
-                    // First-run convenience: auto-trust the bundled keyring and
-                    // persist the lock so subsequent opens see Match.
-                    let _ = crate::trust::apply_fresh_install(&hash);
-                    keyring
-                }
-                // Bundled keyring changed since last acceptance — do not
-                // activate it until the user runs `ptwm trust update --bundled`.
-                Ok(crate::trust::BundleStatus::Mismatch { .. }) => crate::trust::Keyring::default(),
-                Err(_) => crate::trust::Keyring::default(),
-            };
-
-            // Merge user keyring (keys.toml lives beside bundled.lock).
-            let user_keys_path = crate::trust::lock_path().with_file_name("keys.toml");
-            if let Ok(user) = crate::trust::Keyring::load_from_path(&user_keys_path) {
-                keyring.entries.extend(user.entries);
-            }
-
-            let verifier = crate::trust::Verifier::new(keyring);
-
-            let mut untrusted: Vec<(crate::extension::CanonicalId, String)> = Vec::new();
-            for entry in &extension_table.entries {
-                if crate::extension::is_builtin(&entry.canonical_id) {
-                    // Built-ins are trusted by construction; verifier would
-                    // short-circuit anyway, but skip the lookup entirely.
-                    continue;
-                }
-                let Some((pubkey, contrib_idx)) =
-                    lookup_author_pubkey(&entry.canonical_id, &installed)
-                else {
-                    // No matching installed manifest — MissingFlavor already
-                    // accounts for this entry. If skip_missing is true we keep
-                    // going; treat as unverifiable (but not actively untrusted).
-                    continue;
-                };
-                // Recompute the signature's signed material from the on-disk
-                // bundle (manifest + binaries, in the order
-                // `ext_tooling/sign.py::sign_bundle` writes them). Tampering
-                // with either the manifest TOML or any binary after signing
-                // changes the digest and trips Ed25519 verification.
-                let signed_material = match installed[contrib_idx].signed_digest() {
-                    Ok(d) => d,
-                    Err(e) => {
-                        untrusted.push((entry.canonical_id, e.to_string()));
-                        continue;
-                    }
-                };
-                match verifier.verify(entry, &signed_material, &pubkey) {
-                    Ok(crate::trust::TrustVerdict::Trusted) => {}
-                    Ok(crate::trust::TrustVerdict::Untrusted { reason }) => {
-                        untrusted.push((entry.canonical_id, reason));
-                    }
-                    Err(e) => {
-                        untrusted.push((entry.canonical_id, e.to_string()));
-                    }
-                }
-            }
-            if !untrusted.is_empty() && !skip_missing {
-                let (id, reason) = untrusted.remove(0);
-                return Err(PtwmCoreError::ContributionUntrusted { id, reason });
-            }
-        }
+        let (installed, needs) = check_extensions(&extension_table, skip_missing)?;
 
         let prelude_off = usize::try_from(header.shared_prelude_offset).map_err(|_| {
             PtwmCoreError::InvalidContainer("shared_prelude_offset overflows usize".into())
@@ -1091,7 +1432,147 @@ impl<'a> ContainerReader<'a> {
             chain_registry_offset,
             missing_extensions: needs,
             builtin_version,
+            layout: ContainerLayout::Legacy,
+            codec_ids: Vec::new(),
+            registry_bound: Vec::new(),
         })
+    }
+
+    /// [`open_with`](Self::open_with) for the compact layout.
+    fn open_compact(buf: &'a [u8], skip_missing: bool) -> Result<Self, PtwmCoreError> {
+        use crate::extension::compact_table::read_compact_table;
+
+        let sec = crate::ptwc::locate_sections(buf)?;
+        let extension_table = read_compact_table(&buf[sec.extension_table.clone()])?;
+        let (installed, needs) = check_extensions(&extension_table, skip_missing)?;
+
+        let prelude_bytes = &buf[sec.prelude.clone()];
+        let (prelude, used) = parse_prelude(prelude_bytes)?;
+        if used != prelude_bytes.len() {
+            return Err(PtwmCoreError::InvalidContainer(format!(
+                "compact container: {} trailing bytes after the prelude",
+                prelude_bytes.len() - used
+            )));
+        }
+        // Reserved fields and padding must be zero: one encoding per prelude.
+        let mut rewritten = Vec::with_capacity(prelude_bytes.len());
+        write_prelude(&prelude, &mut rewritten)?;
+        if rewritten != prelude_bytes {
+            return Err(PtwmCoreError::InvalidContainer(
+                "compact container: prelude is not in canonical form".into(),
+            ));
+        }
+
+        let chain_registry =
+            crate::ptwc::read_registry(&buf[sec.registry.clone()], &extension_table)?;
+        let index = crate::ptwc::read_index(&buf[sec.index.clone()], sec.body.clone())?;
+        let registry_bound = chain_registry
+            .chains
+            .iter()
+            .map(|(_, c)| has_deferred_source(c))
+            .collect();
+        let codec_ids = plane_codec_ids(&extension_table);
+        let router = crate::flavor::PlaneCodecRouter::new(installed);
+
+        // The compact header has no fixed fields; this view gives code that
+        // reads offsets from `header` the section positions.
+        let header = Header {
+            magic: MAGIC_PTWC,
+            flags: 0,
+            extension_table_offset: sec.extension_table.start as u64,
+            extension_table_length: sec.extension_table.len() as u64,
+            extension_table_hash: [0u8; 32],
+            tensor_index_offset: sec.index.start as u64,
+            tensor_index_length: sec.index.len() as u64,
+            shared_prelude_offset: sec.prelude.start as u64,
+            shared_prelude_length: (sec.registry.end - sec.prelude.start) as u64,
+        };
+        Ok(Self {
+            buf,
+            header,
+            extension_table,
+            prelude,
+            router,
+            num_tensors: index.len() as u64,
+            index,
+            tensors_offset: sec.body.start as u64,
+            chain_registry_offset: if chain_registry.chains.is_empty() {
+                0
+            } else {
+                sec.registry.start as u64
+            },
+            chain_registry,
+            missing_extensions: needs,
+            builtin_version: None,
+            layout: ContainerLayout::Compact,
+            codec_ids,
+            registry_bound,
+        })
+    }
+
+    /// The context compact records are parsed against.
+    fn record_context(&self) -> RecordContext<'_> {
+        RecordContext {
+            codec_ids: &self.codec_ids,
+            registry_bound: &self.registry_bound,
+        }
+    }
+
+    /// Parse serialized record bytes of this container's layout. A compact
+    /// record does not hold its name, so the returned `name` is empty; use
+    /// [`tensor_record`](Self::tensor_record) for a record with its name.
+    pub fn parse_record(&self, bytes: &[u8]) -> Result<TensorRecord, PtwmCoreError> {
+        match self.layout {
+            ContainerLayout::Legacy => {
+                crate::tensor_record::parse_tensor_record(bytes).map(|(rec, _)| rec)
+            }
+            ContainerLayout::Compact => parse_compact_record(bytes, &self.record_context()),
+        }
+    }
+
+    /// The record bytes an index entry points at.
+    fn entry_bytes(&self, e: &IndexEntry) -> Result<&'a [u8], PtwmCoreError> {
+        let buf: &'a [u8] = self.buf;
+        usize::try_from(e.tensor_offset)
+            .ok()
+            .zip(usize::try_from(e.tensor_len).ok())
+            .and_then(|(start, len)| buf.get(start..start.checked_add(len)?))
+            .ok_or_else(|| {
+                PtwmCoreError::InvalidContainer(format!(
+                    "tensor index entry ({}+{}) exceeds buffer ({} bytes)",
+                    e.tensor_offset,
+                    e.tensor_len,
+                    buf.len()
+                ))
+            })
+    }
+
+    /// Parse the record of an index entry, with its name.
+    fn entry_record(&self, e: &IndexEntry) -> Result<TensorRecord, PtwmCoreError> {
+        let mut rec = self.parse_record(self.entry_bytes(e)?)?;
+        if let Some(name) = &e.name {
+            rec.name = name.to_string();
+        }
+        Ok(rec)
+    }
+
+    /// Look up a tensor by name and parse its record.
+    pub fn tensor_record(&self, name: &str) -> Result<TensorRecord, PtwmCoreError> {
+        let bytes = self.get_tensor_record_bytes(name).ok_or_else(|| {
+            PtwmCoreError::InvalidContainer(format!("tensor '{}' not found", name))
+        })?;
+        let mut rec = self.parse_record(bytes)?;
+        if self.layout == ContainerLayout::Compact {
+            rec.name = name.to_owned();
+        }
+        Ok(rec)
+    }
+
+    /// Index entries in body (file) order.
+    fn entries_in_body_order(&self) -> Vec<&IndexEntry> {
+        let mut entries: Vec<&IndexEntry> = self.index.iter().collect();
+        entries.sort_by_key(|e| e.tensor_offset);
+        entries
     }
 
     /// Look up a tensor by name and return a slice covering its serialized
@@ -1115,11 +1596,12 @@ impl<'a> ContainerReader<'a> {
         let lo = self.index.partition_point(|e| e.name_hash < target);
         let hi = lo + self.index[lo..].partition_point(|e| e.name_hash == target);
         self.index[lo..hi].iter().find_map(|e| {
-            let start = usize::try_from(e.tensor_offset).ok()?;
-            let len = usize::try_from(e.tensor_len).ok()?;
-            let end = start.checked_add(len)?;
-            let bytes = self.buf.get(start..end)?;
-            (peek_tensor_record_name(bytes).ok()? == name).then_some(bytes)
+            let bytes = self.entry_bytes(e).ok()?;
+            let found = match &e.name {
+                Some(n) => &**n,
+                None => peek_tensor_record_name(bytes).ok()?,
+            };
+            (found == name).then_some(bytes)
         })
     }
 
@@ -1128,24 +1610,29 @@ impl<'a> ContainerReader<'a> {
     /// malformed or the metadata isn't the expected shape-convention map.
     pub fn tensor_shape(&self, name: &str) -> Result<Option<(Vec<u64>, String)>, PtwmCoreError> {
         use crate::metadata::decode_shape_metadata;
-        use crate::tensor_record::parse_tensor_record;
 
-        let record_bytes = self.get_tensor_record_bytes(name).ok_or_else(|| {
-            PtwmCoreError::InvalidContainer(format!("tensor '{}' not found", name))
-        })?;
-        let (rec, _) = parse_tensor_record(record_bytes)?;
+        let rec = self.tensor_record(name)?;
         match rec.tensor_metadata {
             Some(bytes) => Ok(Some(decode_shape_metadata(&bytes)?)),
             None => Ok(None),
         }
     }
 
-    /// Return every tensor name in index order (i.e. sorted by name hash,
-    /// which is how the on-disk index is stored). Requires parsing each
-    /// tensor record header; use sparingly on very large containers.
+    /// Return every tensor name. For the legacy layout the names come in
+    /// index order (sorted by name hash, which is how the on-disk index is
+    /// stored) and each record header is parsed; use sparingly on very large
+    /// containers. For the compact layout they come from the index alone, in
+    /// body (write) order.
     pub fn tensor_names(&self) -> Result<Vec<String>, PtwmCoreError> {
         use crate::tensor_record::parse_tensor_record;
 
+        if self.layout == ContainerLayout::Compact {
+            return Ok(self
+                .entries_in_body_order()
+                .into_iter()
+                .map(|e| e.name.as_deref().unwrap_or_default().to_owned())
+                .collect());
+        }
         let mut names = Vec::with_capacity(self.index.len());
         for e in &self.index {
             let start = e.tensor_offset as usize;
@@ -1173,25 +1660,12 @@ impl<'a> ContainerReader<'a> {
         if self.index.is_empty() {
             return Ok(Vec::new());
         }
-        use crate::tensor_record::parse_tensor_record;
         // Parse each record header and decode it in the same parallel pass —
         // no sequential tensor_names() pre-pass.
         self.index
             .par_iter()
             .map(|e| {
-                let start = e.tensor_offset as usize;
-                let end = start.checked_add(e.tensor_len as usize).ok_or_else(|| {
-                    PtwmCoreError::InvalidContainer(
-                        "tensor_offset + tensor_len overflows usize".into(),
-                    )
-                })?;
-                if end > self.buf.len() {
-                    return Err(PtwmCoreError::InvalidContainer(format!(
-                        "tensor index entry ({start}..{end}) exceeds buffer ({} bytes)",
-                        self.buf.len()
-                    )));
-                }
-                let (rec, _) = parse_tensor_record(&self.buf[start..end])?;
+                let rec = self.entry_record(e)?;
                 let bytes = self.decode_tensor_record(&rec)?;
                 Ok((rec.name, bytes))
             })
@@ -1203,11 +1677,7 @@ impl<'a> ContainerReader<'a> {
     /// terminal planes to reconstruct the source bytes. Validates plane CRCs
     /// (when present) and the optional tensor-level `payload_hash`.
     pub fn decode_tensor(&self, name: &str) -> Result<Vec<u8>, PtwmCoreError> {
-        use crate::tensor_record::parse_tensor_record;
-        let record_bytes = self.get_tensor_record_bytes(name).ok_or_else(|| {
-            PtwmCoreError::InvalidContainer(format!("tensor '{}' not found", name))
-        })?;
-        let (rec, _consumed) = parse_tensor_record(record_bytes)?;
+        let rec = self.tensor_record(name)?;
         self.decode_tensor_record(&rec)
     }
 
@@ -1228,7 +1698,13 @@ impl<'a> ContainerReader<'a> {
         use crate::tensor_record::{CHAIN_REF_INLINE_BIT, TENSOR_FLAG_PAYLOAD_HASH};
         use crate::transforms::op::Plane;
 
+        // The compact layout requires exact sizes throughout: the Source
+        // equals the raw size and each plane decodes to its descriptor
+        // length. The legacy layout tolerates older writers' slack.
+        let strict = self.layout == ContainerLayout::Compact;
+
         // Resolve the chain via the inline bit or the chain registry.
+        let bound_chain: Chain;
         let chain: &Chain = if rec.chain_ref & CHAIN_REF_INLINE_BIT != 0 {
             rec.inline_chain.as_ref().ok_or_else(|| {
                 PtwmCoreError::InvalidContainer(
@@ -1237,11 +1713,27 @@ impl<'a> ContainerReader<'a> {
             })?
         } else {
             let chain_id = rec.chain_ref & !CHAIN_REF_INLINE_BIT;
-            self.chain_registry.lookup(chain_id).ok_or_else(|| {
+            let shared = self.chain_registry.lookup(chain_id).ok_or_else(|| {
                 PtwmCoreError::InvalidContainer(format!(
                     "decode_tensor: chain_id {chain_id} not in registry"
                 ))
-            })?
+            })?;
+            if strict && has_deferred_source(shared) {
+                // A bound Source takes its params from the record's shape.
+                let params = record_binding(rec.tensor_metadata.as_deref(), rec.dtype_code)
+                    .ok_or_else(|| {
+                        PtwmCoreError::InvalidContainer(format!(
+                            "decode_tensor: chain {chain_id} has a bound Source but the \
+                             record has no shape that binds it"
+                        ))
+                    })?;
+                let mut c = shared.clone();
+                bind_deferred_source(&mut c, &params);
+                bound_chain = c;
+                &bound_chain
+            } else {
+                shared
+            }
         };
 
         // Bound the chain by the record's `orig_size` before any plane is
@@ -1254,6 +1746,12 @@ impl<'a> ContainerReader<'a> {
         // small tensor. `chain_source_descriptor` checks node 0 itself and
         // needs no prior validation.
         let source_desc = chain_source_descriptor(chain)?;
+        if strict && source_desc.length_bytes != rec.orig_size {
+            return Err(PtwmCoreError::InvalidContainer(format!(
+                "decode_tensor: chain Source declares {} bytes for a {}-byte tensor",
+                source_desc.length_bytes, rec.orig_size
+            )));
+        }
         let max_source = rec.orig_size.saturating_mul(8);
         if source_desc.length_bytes > max_source {
             return Err(PtwmCoreError::InvalidContainer(format!(
@@ -1378,10 +1876,13 @@ impl<'a> ContainerReader<'a> {
                     .iter()
                     .try_fold(0u64, |acc, e| acc.checked_add(u64::from(e.decoded_size)))
                     .filter(|&t| t <= plane_bound)
+                    .filter(|&t| !strict || t == descriptor.length_bytes)
                     .ok_or_else(|| {
                         PtwmCoreError::InvalidContainer(format!(
-                            "chunk table decodes to more than {plane_bound} bytes for a \
+                            "chunk table decodes to more than {plane_bound} bytes (or, in \
+                             a compact container, not to the plane's {} bytes) for a \
                              {}-byte tensor",
+                            descriptor.length_bytes,
                             rec.orig_size
                         ))
                     })? as usize;
@@ -1512,14 +2013,26 @@ impl<'a> ContainerReader<'a> {
                 // the length check after `inverse_chain` and the payload hash
                 // cover the rest. The codec stops at the limit, so a corrupt
                 // payload cannot allocate past it.
-                codec.decode_bounded(
+                let limit = if strict {
+                    decoded_len
+                } else {
+                    usize::try_from(plane_bound).unwrap_or(usize::MAX)
+                };
+                let plane = codec.decode_bounded(
                     state_version,
                     &state_bytes,
                     &plane_rec.payload_bytes,
                     &plane_rec.layout,
                     decoded_len,
-                    usize::try_from(plane_bound).unwrap_or(usize::MAX),
-                )?
+                    limit,
+                )?;
+                if strict && plane.len() != decoded_len {
+                    return Err(PtwmCoreError::InvalidContainer(format!(
+                        "decoded plane is {} bytes, its descriptor says {decoded_len}",
+                        plane.len()
+                    )));
+                }
+                plane
             };
             // The codecs enforce the bound; this check keeps it for any
             // codec that does not.

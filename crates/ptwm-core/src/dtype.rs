@@ -57,6 +57,16 @@ pub struct PreprocessingModes {
     pub byte_reorder: i32,
 }
 
+/// Canonical dtype name of a public `dtype_code`, or `None` for a code
+/// outside the [`Dtype`] set. Compact formats store a tensor's dtype name
+/// only when it differs from this name.
+pub fn canonical_dtype_name(dtype_code: u16) -> Option<&'static str> {
+    u8::try_from(dtype_code)
+        .ok()
+        .and_then(|c| Dtype::from_code(c).ok())
+        .map(Dtype::canonical_name)
+}
+
 impl Dtype {
     /// Wire `dtype_code` for this dtype (matches Python
     /// `DType.code`).

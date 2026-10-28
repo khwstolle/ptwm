@@ -10,6 +10,10 @@ pub struct IndexEntry {
     pub name_hash: u64,
     pub tensor_offset: u64,
     pub tensor_len: u64,
+    /// Tensor name. The compact container stores names in its index, so
+    /// lookups compare them directly; the legacy index stores only the hash
+    /// and leaves this `None` (the name is in the record).
+    pub name: Option<Box<str>>,
 }
 
 pub fn write_index(entries: &mut [IndexEntry], out: &mut Vec<u8>) {
@@ -53,6 +57,7 @@ pub fn parse_index(buf: &[u8]) -> Result<Vec<IndexEntry>, PtwmCoreError> {
             name_hash: u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap()),
             tensor_offset: u64::from_le_bytes(buf[pos + 8..pos + 16].try_into().unwrap()),
             tensor_len: u64::from_le_bytes(buf[pos + 16..pos + 24].try_into().unwrap()),
+            name: None,
         });
         pos += 24;
     }
@@ -86,16 +91,19 @@ mod tests {
                 name_hash: 5,
                 tensor_offset: 100,
                 tensor_len: 10,
+                name: None,
             },
             IndexEntry {
                 name_hash: 1,
                 tensor_offset: 0,
                 tensor_len: 20,
+                name: None,
             },
             IndexEntry {
                 name_hash: 3,
                 tensor_offset: 50,
                 tensor_len: 30,
+                name: None,
             },
         ];
         let mut out = Vec::new();

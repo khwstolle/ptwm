@@ -89,7 +89,7 @@ use crate::chain::wire_compact::{
 };
 use crate::codec::{CodecId, StateSource, codec_for};
 use crate::compressor::{CompressorOptions, InputTensor, legacy_plane_layout, plan_model};
-use crate::dtype::Dtype;
+use crate::dtype::{Dtype, canonical_dtype_name};
 use crate::error::PtwmCoreError;
 use crate::transforms::op::Plane;
 use crate::transforms::source::bound_source_params;
@@ -157,13 +157,6 @@ pub struct CompactTensor {
 /// Return `true` when `buf` starts with the compact-frame magic.
 pub fn is_compact(buf: &[u8]) -> bool {
     buf.len() >= MAGIC_COMPACT.len() && buf[..MAGIC_COMPACT.len()] == MAGIC_COMPACT
-}
-
-fn canonical_dtype_name(dtype_code: u16) -> Option<&'static str> {
-    u8::try_from(dtype_code)
-        .ok()
-        .and_then(|c| Dtype::from_code(c).ok())
-        .map(Dtype::canonical_name)
 }
 
 /// Raw byte count implied by a shape and a public dtype code:

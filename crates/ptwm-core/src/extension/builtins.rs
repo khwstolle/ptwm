@@ -144,6 +144,19 @@ impl BuiltinRegistry {
         self.by_id.get(id)
     }
 
+    /// The Extension Table entry at position `index` of
+    /// [`builtin_entries`], without cloning the list.
+    pub fn entry_at(&self, index: usize) -> Option<&ExtensionTableEntry> {
+        self.entries.get(index)
+    }
+
+    /// The Extension Table entry of the built-in named `name` at the crate
+    /// version, if it has one.
+    pub fn entry_by_name(&self, name: &str) -> Option<&ExtensionTableEntry> {
+        let id = self.by_name.get(name)?;
+        self.entry_at(self.by_id.get(id)?.entry_index?)
+    }
+
     /// Current canonical id of the built-in named `name` that has an
     /// Extension Table entry.
     pub fn id_for_entry_name(&self, name: &str) -> Option<CanonicalId> {

@@ -136,6 +136,28 @@ impl ExtensionTable {
 }
 
 impl ExtensionTableEntry {
+    /// This entry in the legacy table layout (the bytes one entry takes in
+    /// [`ExtensionTable::to_bytes`]).
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ExtensionError> {
+        let mut buf = Vec::new();
+        self.write(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Parse one entry in the legacy table layout that fills `bytes`
+    /// exactly.
+    pub fn from_bytes_exact(bytes: &[u8]) -> Result<Self, ExtensionError> {
+        let mut c = Cursor::new(bytes);
+        let entry = Self::read(&mut c)?;
+        if c.position() as usize != bytes.len() {
+            return Err(ExtensionError::TableParse(format!(
+                "{} trailing bytes after the entry",
+                bytes.len() - c.position() as usize
+            )));
+        }
+        Ok(entry)
+    }
+
     fn write<W: Write>(&self, w: &mut W) -> Result<(), ExtensionError> {
         w.write_all(self.canonical_id.as_bytes())
             .map_err(io_err("write canonical_id"))?;

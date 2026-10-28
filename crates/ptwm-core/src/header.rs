@@ -23,7 +23,34 @@ use crate::error::PtwmCoreError;
 pub const MAGIC_PTWM: [u8; 9] = [0x89, b'P', b'T', b'W', b'M', b'\r', b'\n', 0x1A, b'\n'];
 pub const MAGIC_PTWX: [u8; 9] = [0x89, b'P', b'T', b'W', b'X', b'\r', b'\n', 0x1A, b'\n'];
 
+/// Magic of the compact container (`ContainerLayout::Compact`). Readers that
+/// predate it fail [`Header::read`] with "bad magic".
+pub const MAGIC_PTWC: [u8; 9] = [0x89, b'P', b'T', b'W', b'C', b'\r', b'\n', 0x1A, b'\n'];
+
 pub const FLAG_PTWX: u16 = 0x0001;
+
+/// Container kind named by the first 9 bytes of a file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContainerMagic {
+    /// `\x89PTWM`: legacy container.
+    Ptwm,
+    /// `\x89PTWX`: legacy container with embedded WASM.
+    Ptwx,
+    /// `\x89PTWC`: compact container.
+    Ptwc,
+}
+
+/// Identify the container magic at the start of `buf`, or `None` when `buf`
+/// does not start with one of the three 9-byte container magics.
+pub fn sniff(buf: &[u8]) -> Option<ContainerMagic> {
+    let magic: [u8; 9] = buf.get(..9)?.try_into().ok()?;
+    match magic {
+        MAGIC_PTWM => Some(ContainerMagic::Ptwm),
+        MAGIC_PTWX => Some(ContainerMagic::Ptwx),
+        MAGIC_PTWC => Some(ContainerMagic::Ptwc),
+        _ => None,
+    }
+}
 
 pub const HEADER_LEN: usize = 91;
 
@@ -176,6 +203,25 @@ mod tests {
         bytes[1] = b'Z'; // corrupt 'P'
         let res = Header::from_bytes(&bytes);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn ptwc_magic_is_bad_magic_for_the_legacy_header() {
+        // A reader that only knows the legacy header must fail on the magic,
+        // not on a later field.
+        let mut bytes = Header::new_ptwm().to_bytes().unwrap();
+        bytes[..9].copy_from_slice(&MAGIC_PTWC);
+        let err = Header::from_bytes(&bytes).unwrap_err().to_string();
+        assert!(err.contains("bad magic"), "{err}");
+    }
+
+    #[test]
+    fn sniff_names_each_magic() {
+        assert_eq!(sniff(&MAGIC_PTWM), Some(ContainerMagic::Ptwm));
+        assert_eq!(sniff(&MAGIC_PTWX), Some(ContainerMagic::Ptwx));
+        assert_eq!(sniff(&MAGIC_PTWC), Some(ContainerMagic::Ptwc));
+        assert_eq!(sniff(&MAGIC_PTWC[..8]), None);
+        assert_eq!(sniff(b"\x89PTWS\r\n\x1a\n"), None);
     }
 
     #[test]

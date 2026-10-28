@@ -108,6 +108,41 @@ pub fn op_from_wire_ref(op_ref: u64) -> Result<OpId, PtwmCoreError> {
 pub fn write_chain_compact(
     chain: &Chain,
     bound_source: Option<&[u8]>,
+    op_ref: impl FnMut(OpId) -> Result<u64, PtwmCoreError>,
+    out: &mut Vec<u8>,
+) -> Result<(), PtwmCoreError> {
+    write_chain_with(chain, SourceBinding::Tensor(bound_source), op_ref, out)
+}
+
+/// Encode a shared chain (a container registry entry) as CW2 into `out`.
+///
+/// A registry chain serves many tensors, so it cannot be bound to one. In
+/// memory, a Source node with empty params stands for a bound Source: it is
+/// written as one, and each tensor record that uses the chain supplies the
+/// params ([`SourceBinding::Deferred`]). Other Source nodes are written with
+/// their params.
+pub fn write_chain_compact_deferred(
+    chain: &Chain,
+    op_ref: impl FnMut(OpId) -> Result<u64, PtwmCoreError>,
+    out: &mut Vec<u8>,
+) -> Result<(), PtwmCoreError> {
+    write_chain_with(chain, SourceBinding::Deferred, op_ref, out)
+}
+
+/// How a chain's Source params relate to the tensor it encodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceBinding<'a> {
+    /// The chain belongs to one tensor, whose bound Source params are given
+    /// (`None` when the tensor cannot bind a Source).
+    Tensor(Option<&'a [u8]>),
+    /// The chain is shared; a bound Source stays unbound (empty params) in
+    /// memory, and the tensor record that uses the chain binds it.
+    Deferred,
+}
+
+fn write_chain_with(
+    chain: &Chain,
+    binding: SourceBinding<'_>,
     mut op_ref: impl FnMut(OpId) -> Result<u64, PtwmCoreError>,
     out: &mut Vec<u8>,
 ) -> Result<(), PtwmCoreError> {
@@ -137,11 +172,17 @@ pub fn write_chain_compact(
         }
         write_varint(out, op_ref(node.op)?);
         if node.op == OpId::Source {
-            if node.params.is_empty() {
-                // An empty Source would read back as a bound Source.
-                return Err(err("Source node with empty params".into()));
-            }
-            if bound_source == Some(node.params.as_slice()) {
+            let bind = match binding {
+                SourceBinding::Tensor(bound_source) => {
+                    if node.params.is_empty() {
+                        // An empty Source would read back as a bound Source.
+                        return Err(err("Source node with empty params".into()));
+                    }
+                    bound_source == Some(node.params.as_slice())
+                }
+                SourceBinding::Deferred => node.params.is_empty(),
+            };
+            if bind {
                 write_varint(out, 0);
                 continue;
             }
@@ -206,6 +247,16 @@ pub fn write_chain_compact(
 pub fn read_chain_compact(
     r: &mut Cursor<'_>,
     bound_source: Option<&[u8]>,
+    resolve: impl FnMut(u64) -> Result<OpId, PtwmCoreError>,
+) -> Result<Chain, PtwmCoreError> {
+    read_chain_with(r, SourceBinding::Tensor(bound_source), resolve)
+}
+
+/// Decode one CW2 chain with an explicit [`SourceBinding`]. With
+/// [`SourceBinding::Deferred`] a bound Source is returned with empty params.
+pub fn read_chain_with(
+    r: &mut Cursor<'_>,
+    binding: SourceBinding<'_>,
     mut resolve: impl FnMut(u64) -> Result<OpId, PtwmCoreError>,
 ) -> Result<Chain, PtwmCoreError> {
     let n_nodes = r.varint_max(MAX_COUNT, "chain node count")? as usize;
@@ -226,14 +277,20 @@ pub fn read_chain_compact(
         let op = resolve(op_ref)?;
         let param_len = r.varint_max(MAX_PARAMS, "chain node params length")? as usize;
         let params = if op == OpId::Source && param_len == 0 {
-            bound_source
-                .ok_or_else(|| {
-                    r.err("chain has a bound Source but the tensor has no bindable shape and dtype")
-                })?
-                .to_vec()
+            match binding {
+                SourceBinding::Tensor(bound_source) => bound_source
+                    .ok_or_else(|| {
+                        r.err(
+                            "chain has a bound Source but the tensor has no bindable shape \
+                             and dtype",
+                        )
+                    })?
+                    .to_vec(),
+                SourceBinding::Deferred => Vec::new(),
+            }
         } else {
             let params = r.take(param_len)?;
-            if op == OpId::Source && bound_source == Some(params) {
+            if op == OpId::Source && binding == SourceBinding::Tensor(Some(params)) {
                 return Err(r.err("chain Source params equal the bound Source (non-canonical)"));
             }
             params.to_vec()
@@ -313,6 +370,37 @@ pub fn read_chain_compact(
         edges,
         terminals,
     })
+}
+
+/// Decode a shared (registry) CW2 chain that must fill `buf` exactly. A
+/// bound Source comes back with empty params; see
+/// [`write_chain_compact_deferred`].
+pub fn read_chain_compact_deferred_exact(
+    buf: &[u8],
+    resolve: impl FnMut(u64) -> Result<OpId, PtwmCoreError>,
+) -> Result<Chain, PtwmCoreError> {
+    let mut r = Cursor::new(buf, "compact chain");
+    let chain = read_chain_with(&mut r, SourceBinding::Deferred, resolve)?;
+    r.finish("chain")?;
+    Ok(chain)
+}
+
+/// Whether `chain` has a bound Source that a tensor record must supply (a
+/// Source node with empty params; see [`write_chain_compact_deferred`]).
+pub fn has_deferred_source(chain: &Chain) -> bool {
+    chain
+        .nodes
+        .iter()
+        .any(|n| n.op == OpId::Source && n.params.is_empty())
+}
+
+/// Replace the params of every bound Source of `chain` with `params`.
+pub fn bind_deferred_source(chain: &mut Chain, params: &[u8]) {
+    for n in &mut chain.nodes {
+        if n.op == OpId::Source && n.params.is_empty() {
+            n.params = params.to_vec();
+        }
+    }
 }
 
 /// Decode a CW2 chain that must fill `buf` exactly.
@@ -450,6 +538,51 @@ pub fn read_role_compact(r: &mut Cursor<'_>) -> Result<Role, PtwmCoreError> {
 mod tests {
     use super::*;
     use crate::transforms::source::bound_source_params;
+
+    #[test]
+    fn deferred_source_round_trips_unbound() {
+        let params = bound_source_params(&[4, 8], 1).unwrap();
+        let mut chain = Chain {
+            nodes: vec![
+                ChainNode {
+                    op: OpId::Source,
+                    params: Vec::new(),
+                },
+                ChainNode {
+                    op: OpId::BytePassthrough,
+                    params: Vec::new(),
+                },
+            ],
+            edges: vec![spine_edge(0)],
+            terminals: vec![TerminalRef {
+                node_idx: 1,
+                output_idx: 0,
+                role: Role::Raw,
+            }],
+        };
+        let mut deferred = Vec::new();
+        write_chain_compact_deferred(&chain, op_wire_ref, &mut deferred).unwrap();
+        // The tensor-bound writer refuses an unbound Source.
+        let mut out = Vec::new();
+        assert!(write_chain_compact(&chain, Some(&params), op_wire_ref, &mut out).is_err());
+        let back = read_chain_compact_deferred_exact(&deferred, op_from_wire_ref).unwrap();
+        assert_eq!(back, chain);
+        assert!(has_deferred_source(&back));
+        // The same bytes read with a tensor binding give the bound chain.
+        let bound = read(&deferred, Some(&params)).unwrap();
+        bind_deferred_source(&mut chain, &params);
+        assert_eq!(bound, chain);
+        assert!(!has_deferred_source(&bound));
+        // An explicit Source stays explicit in a shared chain, even when its
+        // params equal some tensor's binding.
+        let mut explicit = Vec::new();
+        write_chain_compact_deferred(&chain, op_wire_ref, &mut explicit).unwrap();
+        assert_eq!(
+            read_chain_compact_deferred_exact(&explicit, op_from_wire_ref).unwrap(),
+            chain
+        );
+        assert!(explicit.len() > deferred.len());
+    }
 
     fn write(chain: &Chain, bound: Option<&[u8]>) -> Vec<u8> {
         let mut out = Vec::new();

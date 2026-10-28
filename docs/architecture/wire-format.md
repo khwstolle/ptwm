@@ -164,19 +164,20 @@ entry × count:
 ```
 
 The table lists every contribution the file needs at decode time:
-first the ops of every registry chain, then the plane codecs that the
-plane records reference, in built-in registry order. Chain nodes and
-plane records refer to entries by position. A built-in entry costs
-about 130 bytes (six entries take 779 bytes in a one-tensor fp32
-file), which is why the compact container stores built-ins by wire id
-instead.
+first the ops of every registry chain, then the plane codecs, in
+built-in registry order. Chain nodes and plane records refer to entries
+by position. A built-in entry costs about 130 bytes, which is why the
+compact container stores built-ins by wire id instead.
 
-Writers up to the v1.1.0 release interned all 16 built-in plane
-codecs, about 2 KB per file, whether or not a plane used them. Readers resolve
-`codec_table_idx` by position and check the table hash against the
-bytes present, so they read both forms. The transcoder rebuilds the
-table from the chain registry and the codec list and keeps whichever
-form reproduces the recorded hash.
+The legacy writers intern all 16 built-in plane codecs, about 2 KB per
+file, whether or not a plane uses them. This is the v1.1.0 layout, and
+the v1.1 transcoder depends on it (see [Compatibility](#compatibility)).
+`ContainerWriter::set_chain_registry_with_codecs` writes a table with
+only the referenced codecs. Readers resolve `codec_table_idx` by
+position and check the table hash against the bytes present, so they
+read both forms. The transcoder rebuilds the table from the chain
+registry and the codec list and keeps whichever form reproduces the
+recorded hash.
 
 The flavor hints are a bitfield rather than an enum because a
 contribution can ship in several flavours and the reader picks one by
@@ -536,10 +537,10 @@ and shared codec state.
 
 | Case | PTWC B/tensor | Legacy B/tensor |
 |---|---|---|
-| 64 tensors, same shape, hash and CRC on | 83 | 235 |
-| 64 tensors, distinct shapes, hash and CRC on | 83 | 288 |
-| 64 tensors, same shape, hash and CRC off | 59 | 211 |
-| 1 tensor, hash and CRC on | 165 | 1,176 |
+| 64 tensors, same shape, hash and CRC on | 83 | 262 |
+| 64 tensors, distinct shapes, hash and CRC on | 83 | 317 |
+| 64 tensors, same shape, hash and CRC off | 59 | 238 |
+| 1 tensor, hash and CRC on | 165 | 3,029 |
 
 Per tensor, the PTWC index entry takes 31 bytes (mostly the name) and
 the record about 50 bytes with the payload hash and four plane CRCs,
@@ -557,11 +558,10 @@ the PTWS frame use it.
 n_nodes, n_edges, n_terms    varint each (n_nodes 1..=255, others <= 255)
 node:      op_ref varint, param_len varint (<= 255), params
 n_spine    varint (<= n_edges; only when n_edges > 0)
-edge:      src, src_out, dst, dst_in varint; etag u8 (bit 0 role,
-           bit 1 vendor; other bits zero); [compact role];
+edge:      src, src_out, dst, dst_in varint each (<= 255); etag u8
+           (bit 0 role, bit 1 vendor; other bits zero); [compact role];
            [varint length (1..=65,535) + vendor bytes]
-terminal:  ref u8 (node << 4 | out, or 0xFF + node u8 + out u8);
-           compact role
+terminal:  ref u8; compact role
 ```
 
 - `op_ref` is an Extension Table index in PTWC and the `OpId` wire id
@@ -577,17 +577,36 @@ terminal:  ref u8 (node << 4 | out, or 0xFF + node u8 + out u8);
   that equal them. Real Source params are never empty, so the marker
   cannot collide with an explicit Source. A record without a shape
   cannot use a chain with a bound Source.
-- A compact role is one byte for every role production chains use
-  (scale formats, nibble kinds, mantissa and integer bytes up to 8,
-  `IntN` up to 32 bits, raw, index, exponent byte, fp4 value, XOR
-  residual), and `0xFF` followed by the legacy role encoding for the
-  rest. An escaped role that has a one-byte form is rejected.
+- A terminal `ref` is one byte, `node << 4 | out`, when `node <= 14`
+  and `out <= 15`. Otherwise it is `0xFF` followed by `node` u8 and
+  `out` u8. The reader rejects bytes `0xF0` to `0xFE` (reserved) and an
+  escape for a pair that fits the one-byte form.
+- A compact role is one byte for every role production chains use, and
+  `0xFF` followed by the legacy role encoding (`Role::write`) for the
+  rest. The reader rejects every other byte and an escaped role that
+  has a one-byte form:
+
+  | byte | role |
+  |---|---|
+  | `0x00` to `0x04` | `Scale { format }`, format tag 0 E8M0, 1 E4M3, 2 E5M2, 3 F32, 4 F16 |
+  | `0x08` to `0x0C` | `GlobalScale { format }`, `0x08` + format tag |
+  | `0x10` to `0x12` | `Nibble { kind }`, kind 0 Exponent, 1 SignMantissa, 2 Value |
+  | `0x18` | `Value { Fp4E2m1 }` |
+  | `0x19` | `ExponentByte` |
+  | `0x1A` | `Raw` |
+  | `0x1B` | `Index` |
+  | `0x1C` | `Residual { Xor }` |
+  | `0x40 + 8 × (of − 1) + index` | `MantissaByte { index, of }`, `index < of <= 8` |
+  | `0x80 + 8 × (of − 1) + index` | `IntegerByte { index, of }`, `index < of <= 8` |
+  | `0xC0 + bits − 1` | `Value { IntN { bits } }`, `1 <= bits <= 32` |
+  | `0xFF` | escape, then the legacy role bytes |
 
 ## Compact single-tensor frame (`\x89PTWS`)
 
-`Compressor.compress` writes one tensor. A container's sections cost
-about 120 to 140 bytes (PTWC) or 500 to 1,000 bytes (legacy) for one
-tensor, which is more than the payload of a small tensor. By default
+`Compressor.compress` writes one tensor. For one tensor, a container's
+sections cost about 85 to 120 bytes for bf16 and 125 to 140 bytes for
+fp32 (PTWC), or 2.5 to 2.9 KB (legacy, which interns every built-in
+codec). That is more than the payload of a small tensor. By default
 the compressor writes a compact frame instead:
 
 ```
@@ -639,10 +658,11 @@ chain.
 
 The fixed cost is about 20 to 70 bytes, depending on the chain and on
 which integrity fields are on. With the default settings (payload hash
-on) it is at most 43 bytes for a bf16 tensor, 55 bytes for an fp32
-tensor with the split chain, and 61 bytes for an fp32 tensor with the
-IntDelta or PredictorXor chain that smooth data selects. Plane CRCs
-instead of the hash add up to 8 bytes more for four planes.
+on) it is at most 43 bytes for a bf16 tensor and 55 bytes for an fp32
+tensor with the split chain, and 49 bytes for a bf16 tensor and 61
+bytes for an fp32 tensor with the IntDelta or PredictorXor chain that
+smooth data selects. Plane CRCs instead of the hash add up to 8 bytes
+more for four planes.
 
 A tensor whose planes need shared state (a prelude) or chunked encoding
 cannot use the frame; the compressor writes a full container for it,
@@ -656,16 +676,22 @@ instead of the frame, for the random-access, store and transcode tools.
 
 | File | Readers before v1.2 | v1.2 and later |
 |---|---|---|
-| `\x89PTWS` frame (default single-tensor output) | reject: "not a .ptwm container" | read |
-| `\x89PTWC` container (default multi-tensor output) | reject: bad magic | read |
+| `\x89PTWS` frame (default single-tensor output) | reject: Python `Decompressor` "not a .ptwm container"; Rust and `_rust` container functions "missing EOF sentinel (file may be truncated)" | read |
+| `\x89PTWC` container (default multi-tensor output) | reject: Python `Decompressor` "not a .ptwm container"; Rust and `_rust` container functions "bad magic" | read |
 | `\x89PTWM` container | read if its built-in ids are of the reader's version | read, built-in ids of any release |
 
-Old readers fail cleanly on the new formats. A Rust reader before v1.2
-passes the EOF sentinel check and fails in `Header::read` with "bad
-magic". A Python reader before v1.2 checks the 5-byte `\x89PTWM`
-prefix and reports that the input is not a container. The transcoder
-before v1.2 rejects the `"ptwm-manifest-c"` manifest of a PTWC
-container.
+Old readers fail cleanly on the new formats; none misreads them. The
+Python `Decompressor` before v1.2 checks the 5-byte `\x89PTWM` prefix
+and reports that the input is not a container. The Rust reader before
+v1.2 (`ContainerReader::open`, and through it `_rust.decode_model`,
+`_rust.decode_tensor`, `_rust.list_tensor_names` and the transcoder)
+checks the EOF sentinel first. A PTWC container ends with the
+sentinel, so the reader goes on to `Header::read` and fails with "bad
+magic". A PTWS frame has no sentinel, so the reader fails with
+"missing EOF sentinel (file may be truncated)", although the file is
+intact. From v1.2 the container functions name a PTWS frame as such
+and point to `decode_compact`. The transcoder before v1.2 rejects the
+`"ptwm-manifest-c"` manifest of a PTWC container.
 
 To write files that a v1.1 reader opens:
 
@@ -684,6 +710,17 @@ A v1.1 reader recognises only the built-in ids of version 1.1.0. The
 legacy writers stamp those ids whatever their own crate version (see
 [Built-in entries](#built-in-entries)), so their output opens in v1.1.
 
+The legacy writers also keep the v1.1.0 Extension Table layout: the
+chain ops, then all 16 built-in plane codecs in built-in order. The
+LMDB (`layout="exploded"`) and WebDataset stores hold exploded
+`"ptwm-manifest"` version 1 manifests, and a v1.1 reader rebuilds each
+tensor with the v1.1 transcoder. That transcoder always interns all 16
+codecs and copies each plane's `codec_table_idx` from the manifest
+unchanged, so the indices must refer to that table. A legacy container
+whose table holds only the referenced codecs (written with
+`ContainerWriter::set_chain_registry_with_codecs`) still opens in v1.1,
+but its exploded stores decode there with the wrong codecs.
+
 ## Reader limits
 
 The readers treat every file as untrusted input. In both layouts:
@@ -700,6 +737,11 @@ The readers treat every file as untrusted input. In both layouts:
   plane is decoded, and no plane may exceed `16 × orig_size + 4096`
   bytes (`max_plane_len`), so a corrupt file cannot make a codec
   allocate far more than the tensor;
+- `orig_size` and the shape come from the file too, so the declared
+  plane length does not size an allocation by itself. The Zstd decoders
+  reserve at most what the payload can decode to (32 KiB per compressed
+  byte) and grow the buffer as data arrives; reservations use
+  `try_reserve`, so a failed allocation is an error, not an abort;
 - a decoded plane must have exactly its derived length in PTWC and
   PTWS. In the legacy layout it may differ (older files carry Sources
   that overstate or understate the raw size) but stays under the plane

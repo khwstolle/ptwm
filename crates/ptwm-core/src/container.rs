@@ -1222,6 +1222,58 @@ fn check_extensions(
     Ok((installed, needs))
 }
 
+/// Parse the Extension Table of a legacy container whose header is
+/// `header`. The region is bounds-checked and its BLAKE3 hash verified.
+/// Built-in ids are not normalized.
+fn legacy_extension_table(buf: &[u8], header: &Header) -> Result<ExtensionTable, PtwmCoreError> {
+    if header.extension_table_length == 0 {
+        return Ok(ExtensionTable::empty());
+    }
+    let table_bytes = usize::try_from(header.extension_table_offset)
+        .ok()
+        .zip(usize::try_from(header.extension_table_length).ok())
+        .and_then(|(start, len)| buf.get(start..start.checked_add(len)?))
+        .ok_or_else(|| {
+            PtwmCoreError::InvalidContainer(format!(
+                "extension table region at offset {} with length {} exceeds the buffer ({} bytes)",
+                header.extension_table_offset,
+                header.extension_table_length,
+                buf.len()
+            ))
+        })?;
+    if ExtensionTable::hash(table_bytes) != header.extension_table_hash {
+        return Err(PtwmCoreError::ExtensionTableHashMismatch);
+    }
+    ExtensionTable::from_bytes(table_bytes)
+        .map_err(|e| PtwmCoreError::InvalidContainer(format!("extension table: {e}")))
+}
+
+/// Read the Extension Table of a container in either layout without opening
+/// the rest of it: no extension check, prelude, registry or index parse.
+///
+/// A legacy (`\x89PTWM` / `\x89PTWX`) file has its table region
+/// bounds-checked and its hash verified, and built-in ids written by other
+/// releases are mapped to the current ones (see
+/// [`crate::extension::normalize_builtin_ids`]). A compact (`\x89PTWC`) file
+/// has its EOF sentinel, sections and `meta_xxh64` checked, and its compact
+/// entries expanded to full entries. Any other magic is an error.
+pub fn read_extension_table(buf: &[u8]) -> Result<ExtensionTable, PtwmCoreError> {
+    if sniff(buf) == Some(ContainerMagic::Ptwc) {
+        verify_eof_sentinel(buf)?;
+        let sec = crate::ptwc::locate_sections(buf)?;
+        return crate::extension::compact_table::read_compact_table(&buf[sec.extension_table]);
+    }
+    if buf.len() < HEADER_LEN {
+        return Err(PtwmCoreError::InvalidContainer(
+            "file shorter than header".into(),
+        ));
+    }
+    let header = Header::from_bytes(&buf[..HEADER_LEN])?;
+    let mut table = legacy_extension_table(buf, &header)?;
+    crate::extension::normalize_builtin_ids(&mut table);
+    Ok(table)
+}
+
 /// Zero-copy reader for a `.ptwm` container backed by an in-memory byte slice.
 #[derive(Debug)]
 pub struct ContainerReader<'a> {
@@ -1318,35 +1370,7 @@ impl<'a> ContainerReader<'a> {
             ));
         }
 
-        // Parse the Extension Table (sits at extension_table_offset for
-        // extension_table_length bytes, immediately after the header).
-        let mut extension_table = if header.extension_table_length == 0 {
-            ExtensionTable::empty()
-        } else {
-            let et_start = usize::try_from(header.extension_table_offset).map_err(|_| {
-                PtwmCoreError::InvalidContainer("extension_table_offset overflows usize".into())
-            })?;
-            let et_len = usize::try_from(header.extension_table_length).map_err(|_| {
-                PtwmCoreError::InvalidContainer("extension_table_length overflows usize".into())
-            })?;
-            let et_end = et_start.checked_add(et_len).ok_or_else(|| {
-                PtwmCoreError::InvalidContainer(
-                    "extension_table_offset + extension_table_length overflows".into(),
-                )
-            })?;
-            if et_end > buf.len() {
-                return Err(PtwmCoreError::InvalidContainer(
-                    "extension table region exceeds buffer".into(),
-                ));
-            }
-            let table_bytes = &buf[et_start..et_end];
-            let actual_hash = ExtensionTable::hash(table_bytes);
-            if actual_hash != header.extension_table_hash {
-                return Err(PtwmCoreError::ExtensionTableHashMismatch);
-            }
-            ExtensionTable::from_bytes(table_bytes)
-                .map_err(|e| PtwmCoreError::InvalidContainer(format!("extension table: {e}")))?
-        };
+        let mut extension_table = legacy_extension_table(buf, &header)?;
         // Map built-in ids written by other releases to the current ones.
         // This runs after the hash check, which covers the on-disk bytes.
         let builtin_version = crate::extension::normalize_builtin_ids(&mut extension_table);
@@ -1620,37 +1644,20 @@ impl<'a> ContainerReader<'a> {
         }
     }
 
-    /// Return every tensor name. For the legacy layout the names come in
-    /// index order (sorted by name hash, which is how the on-disk index is
-    /// stored) and each record header is parsed; use sparingly on very large
-    /// containers. For the compact layout they come from the index alone, in
-    /// body (write) order.
+    /// Return every tensor name in body (write) order: the order of the
+    /// records in the file, which is the order the writer appended them. The
+    /// compact layout reads the names from the index alone; the legacy layout
+    /// parses the name at the start of each record.
     pub fn tensor_names(&self) -> Result<Vec<String>, PtwmCoreError> {
-        use crate::tensor_record::parse_tensor_record;
+        use crate::tensor_record::peek_tensor_record_name;
 
-        if self.layout == ContainerLayout::Compact {
-            return Ok(self
-                .entries_in_body_order()
-                .into_iter()
-                .map(|e| e.name.as_deref().unwrap_or_default().to_owned())
-                .collect());
-        }
-        let mut names = Vec::with_capacity(self.index.len());
-        for e in &self.index {
-            let start = e.tensor_offset as usize;
-            let end = start.checked_add(e.tensor_len as usize).ok_or_else(|| {
-                PtwmCoreError::InvalidContainer("tensor_offset + tensor_len overflows usize".into())
-            })?;
-            if end > self.buf.len() {
-                return Err(PtwmCoreError::InvalidContainer(format!(
-                    "tensor index entry ({start}..{end}) exceeds buffer ({} bytes)",
-                    self.buf.len()
-                )));
-            }
-            let (rec, _) = parse_tensor_record(&self.buf[start..end])?;
-            names.push(rec.name);
-        }
-        Ok(names)
+        self.entries_in_body_order()
+            .into_iter()
+            .map(|e| match &e.name {
+                Some(name) => Ok(name.to_string()),
+                None => peek_tensor_record_name(self.entry_bytes(e)?).map(str::to_owned),
+            })
+            .collect()
     }
 
     /// Decode every tensor in the container, in index order, across the rayon

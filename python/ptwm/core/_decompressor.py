@@ -7,13 +7,9 @@ import torch
 from .. import _rust
 from .._config import DecompressionConfig, Format
 from .._exceptions import HeaderParseError, InvalidDTypeError
+from .._magic import MAGIC_PTWS, container_kind
 from ..delta import decode as delta_decode
 from ..utils import DType
-
-# Full multi-tensor container and compact single-tensor frame.
-_MAGIC_CONTAINER = b"\x89PTWM"
-_MAGIC_COMPACT = b"\x89PTWS"
-
 
 def _torch_dtype_for_code(dtype_code: int) -> torch.dtype | None:
     """Map a wire ``dtype_code`` to a concrete ``torch.dtype`` if supported."""
@@ -42,8 +38,8 @@ class Decompressor:
         r"""Decompress a ``.ptwm`` blob.
 
         Accepts a compact single-tensor frame (magic ``\x89PTWS``) or a
-        full container (magic ``\x89PTWM``). The single-tensor container
-        uses name ``"_"``. Raw decompressed bytes
+        full container in either layout (magic ``\x89PTWM``, ``\x89PTWX``
+        or ``\x89PTWC``). The single-tensor container uses name ``"_"``. Raw decompressed bytes
         come from ``decode_tensor``; shape/dtype/input_format (when present)
         come from the CBOR shape-metadata map. Format recovery:
 
@@ -79,14 +75,14 @@ class Decompressor:
             raise ValueError(msg)
 
         mv_data = memoryview(data)
-        magic = bytes(mv_data[: len(_MAGIC_CONTAINER)])
-        if len(magic) < len(_MAGIC_CONTAINER):
+        if mv_data.nbytes < len(MAGIC_PTWS):
             msg = "too short to be a .ptwm container"
             raise HeaderParseError(msg)
 
-        blob = bytes(mv_data)
+        blob = data if isinstance(data, bytes) else bytes(mv_data)
+        kind = container_kind(blob)
         info: tuple[list[int], str, int, int] | None
-        if magic == _MAGIC_COMPACT:
+        if kind == "ptws":
             raw, shape, dtype_name, dtype_code, input_format, expected_hash, _ = (
                 _rust.decode_compact(blob)
             )
@@ -95,11 +91,12 @@ class Decompressor:
                 if shape is not None
                 else None
             )
-        elif magic == _MAGIC_CONTAINER:
-            skip = self.config.skip_missing
-            raw = _rust.decode_tensor(blob, "_", skip)
-            expected_hash = _rust.decode_tensor_delta_hash(blob, "_", skip)
-            info = _rust.decode_tensor_info(blob, "_", skip)
+        elif kind is not None:
+            # One open serves the decode and both metadata lookups.
+            handle = _rust.ContainerHandle(blob, self.config.skip_missing)
+            raw = handle.decode("_")
+            expected_hash = handle.delta_hash("_")
+            info = handle.info("_")
         else:
             msg = "not a .ptwm container"
             raise HeaderParseError(msg)
@@ -174,15 +171,14 @@ class Decompressor:
         return arr.reshape(tuple(shape)) if shape else arr.reshape(())
 
     def decompress_container_to_state_dict(self, blob: bytes) -> dict[str, bytes]:
-        """Decompress a container into a ``{name: raw_bytes}`` map.
+        """Decompress a container (either layout) into ``{name: raw_bytes}``.
 
-        Iterates the embedded tensor index and decodes each tensor in input
-        order. Result keys preserve the tensor names from the source
-        safetensors archive.
+        Opens the container once and decodes each tensor in write order, so
+        the keys come in the order the tensors were compressed. Result keys
+        preserve the tensor names from the source safetensors archive.
         """
-        skip = self.config.skip_missing
-        names = _rust.list_tensor_names(blob, skip)
-        return {name: bytes(_rust.decode_tensor(blob, name, skip)) for name in names}
+        handle = _rust.ContainerHandle(blob, self.config.skip_missing)
+        return {name: handle.decode(name) for name in handle.names()}
 
     def decompress_file(self, path: str) -> bytes | np.ndarray | torch.Tensor:
         """Decompress data from a file."""

@@ -1404,3 +1404,101 @@ fn old_implode_rejects_compact_manifests() {
     let e = v1_1_implode_gate(&compact_reg).unwrap_err();
     assert!(e.contains("missing field"), "{e}");
 }
+
+// ── read_extension_table and tensor_names (synthesis section 3, E3 / E14) ──
+
+#[test]
+fn read_extension_table_dispatches_on_the_magic() {
+    use ptwm_core::container::read_extension_table;
+
+    for name in FIXTURES {
+        let legacy = load(name);
+        let compact = to_compact(&legacy);
+        for blob in [&legacy, &compact] {
+            let reader = ContainerReader::open(blob).unwrap();
+            let table = read_extension_table(blob).unwrap();
+            assert_eq!(table.entries, reader.extension_table.entries, "{name}");
+        }
+    }
+
+    let data = feature_tensors();
+    let compact = compress(&data, options(true, true, None, ContainerLayout::Compact));
+    let table = read_extension_table(&compact).unwrap();
+    assert!(!table.entries.is_empty());
+    assert!(
+        table
+            .entries
+            .iter()
+            .all(|e| ptwm_core::extension::is_builtin(&e.canonical_id))
+    );
+
+    assert!(read_extension_table(b"not a container").is_err());
+    assert!(read_extension_table(b"").is_err());
+}
+
+#[test]
+fn read_extension_table_checks_the_legacy_region_and_hash() {
+    use ptwm_core::container::read_extension_table;
+
+    let legacy = load("legacy_v1_1_0.ptwm");
+    let header = Header::from_bytes(&legacy[..HEADER_LEN]).unwrap();
+    assert!(header.extension_table_length > 0);
+
+    let patched = |h: &Header| {
+        let mut out = legacy.clone();
+        out[..HEADER_LEN].copy_from_slice(&h.to_bytes().unwrap());
+        out
+    };
+
+    // offset + length overflows u64 / usize.
+    let mut h = header.clone();
+    h.extension_table_offset = u64::MAX - 4;
+    let err = read_extension_table(&patched(&h)).unwrap_err().to_string();
+    assert!(err.contains("exceeds the buffer"), "{err}");
+
+    let mut h = header.clone();
+    h.extension_table_length = u64::MAX;
+    let err = read_extension_table(&patched(&h)).unwrap_err().to_string();
+    assert!(err.contains("exceeds the buffer"), "{err}");
+
+    // A region that runs past the end of the file.
+    let mut h = header.clone();
+    h.extension_table_length = legacy.len() as u64;
+    assert!(read_extension_table(&patched(&h)).is_err());
+
+    // A table byte that no longer matches the header hash.
+    let mut corrupt = legacy.clone();
+    corrupt[header.extension_table_offset as usize + 2] ^= 0x01;
+    let err = read_extension_table(&corrupt).unwrap_err();
+    assert!(
+        matches!(err, ptwm_core::PtwmCoreError::ExtensionTableHashMismatch),
+        "{err}"
+    );
+}
+
+#[test]
+fn read_extension_table_checks_the_compact_meta_hash() {
+    use ptwm_core::container::read_extension_table;
+
+    let compact = to_compact(&load("legacy_v1_1_0.ptwm"));
+    // meta_xxh64 covers the Extension Table: flip its first byte.
+    let sec = ptwm_core::ptwc::locate_sections(&compact).unwrap();
+    let mut corrupt = compact.clone();
+    corrupt[sec.extension_table.start] ^= 0x01;
+    assert!(read_extension_table(&corrupt).is_err());
+}
+
+#[test]
+fn tensor_names_come_in_write_order_in_both_layouts() {
+    let mut rng = Rng(7);
+    let names = ["zeta", "alpha", "mid", "beta", "omega", "a.b.c"];
+    let data: Vec<Tensor> = names
+        .iter()
+        .map(|n| fp32(n, vec![8, 4], &mut rng))
+        .collect();
+    for layout in [ContainerLayout::Legacy, ContainerLayout::Compact] {
+        let blob = compress(&data, options(true, true, None, layout));
+        let reader = ContainerReader::open(&blob).unwrap();
+        assert_eq!(reader.tensor_names().unwrap(), names, "{layout:?}");
+    }
+}

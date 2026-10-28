@@ -14,6 +14,7 @@ import json
 import tarfile
 from pathlib import Path
 
+from .._magic import MAGIC_LEN, is_container
 from ._common import (
     ExplodedModel,
     WeightStore,
@@ -52,7 +53,8 @@ def detect_format(path: str | Path) -> str | None:
     Detection follows the resolved spec: WebDataset via
     ``index.json.ptwm_format == "ptwm-wds"`` (or a ``__shardmeta__.json`` member
     in a single shard); LMDB via the ``\\x00fmt`` key (an env directory contains
-    ``data.mdb``); native ``.ptwm`` via the container magic.
+    ``data.mdb``); native ``.ptwm`` via the container magic of either layout
+    (``\x89PTWM``, ``\x89PTWX`` or ``\x89PTWC``; see :mod:`ptwm._magic`).
     """
     p = Path(path)
     if p.is_dir():
@@ -78,7 +80,7 @@ def detect_format(path: str | Path) -> str | None:
                 pass
         try:
             with p.open("rb") as fh:
-                if fh.read(5) == b"\x89PTWM":
+                if is_container(fh.read(MAGIC_LEN)):
                     return "ptwm"
         except OSError:
             pass

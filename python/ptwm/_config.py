@@ -49,9 +49,13 @@ class Framing(Enum):
     with a fixed cost of at most about 70 bytes, and stores the raw bytes when
     no codec makes them smaller. It falls back to ``CONTAINER`` when the
     tensor cannot use the frame (streaming, or a plane that selects shared
-    codec state). ``CONTAINER`` writes a full ``.ptwm`` container (magic
-    ``\x89PTWM``), which readers before v1.2 require, and which the
+    codec state). ``CONTAINER`` writes a full ``.ptwm`` container in the
+    layout :attr:`CompressionConfig.container_layout` selects, which the
     random-access, store and transcode tools open.
+
+    Readers before v1.2 read only ``CONTAINER`` output in the
+    :attr:`ContainerLayout.LEGACY` layout (magic ``\x89PTWM``); they reject
+    the ``\x89PTWS`` frame and the ``\x89PTWC`` compact container.
     """
 
     COMPACT = 1
@@ -64,6 +68,45 @@ class Framing(Enum):
             if value in cls.__members__:
                 return cls.__members__[value]
         return None
+
+
+class ContainerLayout(Enum):
+    r"""On-disk layout of a multi-tensor ``.ptwm`` container.
+
+    ``COMPACT`` (magic ``\x89PTWC``) stores built-in extensions by id,
+    integers as varints and tensor names only in the index; it needs v1.2 or
+    later to read. ``LEGACY`` (magic ``\x89PTWM``) is the fixed-width layout
+    that every release reads.
+
+    Strings coerce case-insensitively: ``ContainerLayout("compact")`` and
+    ``ContainerLayout("LEGACY")`` work, and the bindings take the lower-case
+    :attr:`value`.
+    """
+
+    COMPACT = "compact"
+    LEGACY = "legacy"
+
+    @classmethod
+    def _missing_(cls, value):
+        if isinstance(value, str):
+            value = value.upper()
+            if value in cls.__members__:
+                return cls.__members__[value]
+        return None
+
+
+def container_layout_name(layout: ContainerLayout | str) -> str:
+    """Return the binding name (``"compact"`` or ``"legacy"``) of ``layout``.
+
+    A string that names no layout is returned unchanged, so the binding
+    rejects it with an error that names ``container_layout``.
+    """
+    if isinstance(layout, ContainerLayout):
+        return layout.value
+    try:
+        return ContainerLayout(layout).value
+    except ValueError:
+        return layout
 
 
 class Lossy(Enum):
@@ -113,6 +156,10 @@ class CompressionConfig:
     device: int | None = None
     framing: Framing = Framing.COMPACT
     """Output layout; see :class:`Framing`."""
+    container_layout: ContainerLayout = ContainerLayout.LEGACY
+    """Layout of a full container written with ``Framing.CONTAINER`` (or as
+    the ``Framing.COMPACT`` fallback); see :class:`ContainerLayout`. A string
+    such as ``"compact"`` is coerced on construction."""
     emit_payload_hash: bool = True
     """Store an xxh64 of the raw bytes (8 B per tensor), checked on decode."""
     emit_plane_crc: bool = True
@@ -121,6 +168,14 @@ class CompressionConfig:
     A compact frame stores plane CRCs only when ``emit_payload_hash`` is off:
     the payload hash already covers every plane of its one tensor.
     """
+
+    def __post_init__(self) -> None:
+        # Accept "compact" / "legacy" (any case); unknown names raise
+        # ValueError here rather than when the container is written.
+        if not isinstance(self.container_layout, ContainerLayout):
+            object.__setattr__(
+                self, "container_layout", ContainerLayout(self.container_layout)
+            )
 
     @classmethod
     def from_resolved_policy(

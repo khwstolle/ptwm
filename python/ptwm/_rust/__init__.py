@@ -13,11 +13,13 @@ from ptwm import _core as _ext
 from ._errors import translate_errors
 
 __all__ = [
+    "ContainerHandle",
     "blake3_hash",
     "builtin_canonical_id",
     "codec_id_registry",
     "compress_compact",
     "compress_model",
+    "container_layout",
     "decode_compact",
     "decode_model",
     "decode_tensor",
@@ -328,7 +330,10 @@ def decode_tensor_delta_hash(
 
 @translate_errors
 def list_tensor_names(blob: bytes, skip_missing: bool = False) -> list[str]:
-    """Return every tensor name stored in a ``.ptwm`` container."""
+    """Return every tensor name stored in a ``.ptwm`` container.
+
+    Names come in write (body) order for both layouts.
+    """
     return list(_ext.list_tensor_names(blob, skip_missing))
 
 
@@ -350,6 +355,100 @@ def decode_tensor_info(
 ) -> tuple[list[int], str, int, int] | None:
     """Return ``(shape, dtype_name, dtype_code, input_format)`` or ``None``."""
     return _ext.decode_tensor_info(blob, name, skip_missing)
+
+
+def container_layout(blob: bytes | bytearray | memoryview) -> str | None:
+    r"""Return the multi-tensor layout of ``blob`` from its magic.
+
+    ``"legacy"`` for ``\x89PTWM`` / ``\x89PTWX``, ``"compact"`` for
+    ``\x89PTWC``, ``None`` for anything else (including a ``\x89PTWS``
+    single-tensor frame). Only the magic is read; the container is not
+    validated.
+    """
+    return _ext.container_layout(blob)
+
+
+class ContainerHandle:
+    """One opened ``.ptwm`` container (either layout).
+
+    Opening parses the header, Extension Table, prelude, chain registry and
+    index once; the methods then query that state. Use a handle instead of
+    the free functions (:func:`decode_tensor`, :func:`list_tensor_names`,
+    ...) when a container is queried more than once: each free function
+    opens the container again.
+
+    ``blob`` is any buffer. ``bytes``, a read-only ``memoryview`` and a
+    read-only ``mmap`` are borrowed without a copy (the handle keeps them
+    alive); a writable buffer such as ``bytearray`` is copied once.
+    ``skip_missing`` opens the container even when non-builtin extensions it
+    references are not installed; tensors that need them fail at decode.
+
+    Errors from the binding surface as :class:`ptwm.Error`.
+    """
+
+    __slots__ = ("_h",)
+
+    @translate_errors
+    def __init__(
+        self, blob: bytes | bytearray | memoryview, skip_missing: bool = False
+    ) -> None:
+        self._h = _ext.ContainerHandle(blob, skip_missing)
+
+    @property
+    def layout(self) -> str:
+        """``"legacy"`` or ``"compact"``."""
+        return self._h.layout
+
+    @property
+    def zero_copy(self) -> bool:
+        """Whether the handle borrows ``blob`` (``False``: it holds a copy)."""
+        return self._h.zero_copy
+
+    @translate_errors
+    def names(self) -> list[str]:
+        """Every tensor name, in write (body) order."""
+        return list(self._h.names())
+
+    @translate_errors
+    def decode(self, name: str) -> bytes:
+        """Decode tensor ``name`` and return its raw bytes."""
+        return self._h.decode(name)
+
+    @translate_errors
+    def decode_model(self) -> list[tuple[str, bytes]]:
+        """Decode every tensor in parallel; ``(name, raw_bytes)`` pairs."""
+        return self._h.decode_model()
+
+    @translate_errors
+    def info(self, name: str) -> tuple[list[int], str, int, int] | None:
+        """``(shape, dtype_name, dtype_code, input_format)`` or ``None``."""
+        return self._h.info(name)
+
+    @translate_errors
+    def delta_hash(self, name: str) -> bytes | None:
+        """BLAKE3 hash of the delta reference of ``name``, or ``None``."""
+        got = self._h.delta_hash(name)
+        return bytes(got) if got is not None else None
+
+    @translate_errors
+    def shape(self, name: str) -> tuple[list[int], str] | None:
+        """``(shape, dtype_name)`` of ``name``, or ``None``."""
+        return self._h.shape(name)
+
+    @translate_errors
+    def plane_summaries(self) -> list[tuple[str, int, int, int, int, int]]:
+        """One ``(tensor_name, plane_index, role, codec_id, state_source,
+        payload_len)`` row per plane, tensors in write order."""
+        return list(self._h.plane_summaries())
+
+    def __len__(self) -> int:  # noqa: D105
+        return len(self._h)
+
+    def __contains__(self, name: object) -> bool:  # noqa: D105
+        return isinstance(name, str) and name in self._h
+
+    def __repr__(self) -> str:  # noqa: D105
+        return f"ContainerHandle(layout={self.layout!r}, n={len(self)})"
 
 
 # --- Container ⇄ canonical PTWM-JSON manifest transcoder -------------------

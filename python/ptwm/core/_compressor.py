@@ -222,4 +222,5 @@ class Compressor:
             method_hint,
             streaming_chunk,
             codec_menu_ids,
+            container_layout=self.config.container_layout.value,
         )

@@ -620,10 +620,22 @@ impl PlaneCodec for Order1ScaleAC {
         let row_len = resolve_row_len_decode(decoded_len, layout)?;
 
         let mut dec = crate::range_coder::RangeDecoder::new(payload);
-        let mut out = Vec::with_capacity(decoded_len);
+        // `decoded_len` comes from the file, so it does not size one up-front
+        // allocation. The buffer grows in chunks with `try_reserve`, and a
+        // failed allocation is an error instead of an abort.
+        const RESERVE_CHUNK: usize = 1 << 20;
+        let mut out: Vec<u8> = Vec::new();
         let mut row_pos = 0usize;
         let mut prev: Option<u8> = None;
         for _ in 0..decoded_len {
+            if out.len() == out.capacity() {
+                let want = (decoded_len - out.len()).min(out.len().max(RESERVE_CHUNK));
+                out.try_reserve_exact(want)
+                    .map_err(|e| PtwmCoreError::CodecDecode {
+                        codec: "Order1ScaleAC",
+                        msg: format!("cannot reserve {want} bytes for the decoded plane: {e}"),
+                    })?;
+            }
             if row_pos == 0 {
                 prev = None;
             }

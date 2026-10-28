@@ -1372,6 +1372,15 @@ impl<'a> ContainerReader<'a> {
     /// Shared implementation for [`open`](Self::open) and
     /// [`open_partial`](Self::open_partial).
     fn open_with(buf: &'a [u8], skip_missing: bool) -> Result<Self, PtwmCoreError> {
+        // A compact single-tensor frame has no EOF sentinel. Name it here so
+        // the sentinel check does not report a valid frame as truncated.
+        if buf.starts_with(&crate::compact::MAGIC_COMPACT) {
+            return Err(PtwmCoreError::InvalidContainer(
+                "this is a compact single-tensor frame (\\x89PTWS), not a container; \
+                 decode it with decode_compact"
+                    .into(),
+            ));
+        }
         verify_eof_sentinel(buf)?;
         if sniff(buf) == Some(ContainerMagic::Ptwc) {
             return Self::open_compact(buf, skip_missing);
@@ -1455,7 +1464,7 @@ impl<'a> ContainerReader<'a> {
         // point-in-time snapshot of the host's extension directory.
         let router = crate::flavor::PlaneCodecRouter::new(installed.clone());
 
-        Ok(Self {
+        let reader = Self {
             buf,
             header,
             extension_table,
@@ -1471,7 +1480,40 @@ impl<'a> ContainerReader<'a> {
             layout: ContainerLayout::Legacy,
             codec_ids: Vec::new(),
             registry_bound: Vec::new(),
-        })
+        };
+        reader.check_legacy_record_names()?;
+        Ok(reader)
+    }
+
+    /// Check that every legacy record's name hashes to its index entry's
+    /// `name_hash` and that no two records share a name.
+    ///
+    /// The legacy index stores only the hash, and nothing else covers the
+    /// name bytes, so without this check a bit flip in a record name renames
+    /// the tensor: two records then report the same name and the original
+    /// name is not found. The compact index stores the names and rejects
+    /// duplicates in [`crate::ptwc::read_index`].
+    fn check_legacy_record_names(&self) -> Result<(), PtwmCoreError> {
+        use crate::tensor_record::peek_tensor_record_name;
+
+        let mut names: HashSet<&str> = HashSet::with_capacity(self.index.len());
+        for e in &self.index {
+            let name = peek_tensor_record_name(self.entry_bytes(e)?)?;
+            if name_hash(name) != e.name_hash {
+                return Err(PtwmCoreError::InvalidContainer(format!(
+                    "tensor record name {name:?} does not match its index entry \
+                     (name hash {:#018x}, index has {:#018x})",
+                    name_hash(name),
+                    e.name_hash
+                )));
+            }
+            if !names.insert(name) {
+                return Err(PtwmCoreError::InvalidContainer(format!(
+                    "duplicate tensor name {name:?}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// [`open_with`](Self::open_with) for the compact layout.
@@ -2643,6 +2685,71 @@ mod tests {
             .to_string();
         assert!(err.contains("duplicate tensor name"), "{err}");
         w.finalize().unwrap();
+    }
+
+    /// A compact frame passed to the container reader is named as such, not
+    /// reported as a truncated file (it has no EOF sentinel).
+    #[test]
+    fn container_open_names_a_compact_frame() {
+        let mut frame = crate::compact::MAGIC_COMPACT.to_vec();
+        frame.extend_from_slice(&[0u8; 40]);
+        for open in [ContainerReader::open, ContainerReader::open_partial] {
+            let Err(err) = open(&frame) else {
+                panic!("compact frame opened as a container")
+            };
+            let err = err.to_string();
+            assert!(err.contains("compact single-tensor frame"), "{err}");
+            assert!(!err.contains("truncated"), "{err}");
+        }
+    }
+
+    /// A legacy record whose name does not hash to its index entry, or two
+    /// records with one name, are rejected when the container opens. A bit
+    /// flip in a record name once renamed the tensor silently.
+    #[test]
+    fn legacy_open_rejects_renamed_and_duplicate_records() {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut w = ContainerWriter::new(&mut buf).unwrap();
+            for name in ["layer.0.weight", "layer.1.weight"] {
+                w.append_tensor(&sample_tensor_record(name)).unwrap();
+            }
+            w.finalize().unwrap();
+        }
+        let good = buf.into_inner();
+        ContainerReader::open(&good).unwrap();
+        let find = |hay: &[u8], needle: &[u8]| {
+            let at: Vec<usize> = hay
+                .windows(needle.len())
+                .enumerate()
+                .filter(|(_, w)| *w == needle)
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(at.len(), 1, "{needle:?} must occur once");
+            at[0]
+        };
+
+        // One bit flip turns the '0' of "layer.0.weight" into '1'.
+        let mut renamed = good.clone();
+        let at = find(&renamed, b"layer.0.weight");
+        renamed[at + 6] ^= 1;
+        for open in [ContainerReader::open, ContainerReader::open_partial] {
+            let Err(err) = open(&renamed) else {
+                panic!("renamed record accepted")
+            };
+            let err = err.to_string();
+            assert!(err.contains("does not match its index entry"), "{err}");
+        }
+
+        // The same rename with the index hash patched to match.
+        let mut dup = renamed.clone();
+        let at = find(&dup, &name_hash("layer.0.weight").to_le_bytes());
+        dup[at..at + 8].copy_from_slice(&name_hash("layer.1.weight").to_le_bytes());
+        let Err(err) = ContainerReader::open(&dup) else {
+            panic!("duplicate name accepted")
+        };
+        let err = err.to_string();
+        assert!(err.contains("duplicate tensor name"), "{err}");
     }
 
     /// Two names with the same index hash: lookups compare the record name

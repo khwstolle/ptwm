@@ -214,31 +214,54 @@ pub fn zstd_decode(blob: &[u8]) -> Result<Vec<u8>, PtwmCoreError> {
     })
 }
 
-/// Decode a Zstd blob (one or more frames) to at most `max_len` bytes.
+/// Largest number of bytes one compressed Zstd byte can decode to.
 ///
-/// The output buffer starts at `size_hint.min(max_len)` bytes and the
-/// decoder stops reading one byte past `max_len`, so a small frame that
-/// expands to gigabytes fails after at most `max_len + 1` decoded bytes.
-/// `size_hint` is the expected length; a plane that turns out longer is
-/// still read, up to the bound.
+/// A Zstd block decodes to at most 128 KiB, and the smallest block that
+/// produces output (an RLE block: 3-byte header plus 1 byte) takes 4 bytes,
+/// so no input decodes to more than 32 KiB per byte.
 #[cfg(feature = "codec-zstd")]
-pub fn zstd_decode_bounded(
-    blob: &[u8],
+const ZSTD_MAX_EXPANSION: usize = 128 * 1024 / 4;
+
+/// Initial output reservation for a Zstd payload of `blob_len` bytes.
+///
+/// `size_hint` and `max_len` come from the file, so neither alone may size
+/// an allocation: a 53-byte frame could otherwise ask for 32 GiB before any
+/// byte is decoded. The reservation is also capped by what `blob_len` bytes
+/// can decode to. The output still grows past it while real data arrives.
+#[cfg(feature = "codec-zstd")]
+fn zstd_initial_capacity(blob_len: usize, size_hint: usize, max_len: usize) -> usize {
+    size_hint
+        .min(max_len)
+        .min(blob_len.saturating_mul(ZSTD_MAX_EXPANSION))
+}
+
+/// Read at most `max_len` decoded bytes from `decoder` into a new buffer.
+///
+/// The buffer starts at [`zstd_initial_capacity`] bytes, reserved with
+/// `try_reserve` so a failed allocation is an error, not an abort. The read
+/// stops one byte past `max_len`, so a small frame that expands to
+/// gigabytes fails after at most `max_len + 1` decoded bytes.
+#[cfg(feature = "codec-zstd")]
+pub(crate) fn zstd_read_bounded<R: std::io::Read>(
+    mut decoder: R,
+    codec: &'static str,
+    blob_len: usize,
     size_hint: usize,
     max_len: usize,
 ) -> Result<Vec<u8>, PtwmCoreError> {
     use std::io::Read;
-    if blob.is_empty() {
-        return Ok(Vec::new());
-    }
     let err = |e: std::io::Error| PtwmCoreError::CodecDecode {
-        codec: "zstd",
+        codec,
         msg: e.to_string(),
     };
-    let mut decoder = zstd::stream::read::Decoder::with_buffer(blob).map_err(err)?;
-    let first = size_hint.min(max_len);
-    let mut out = Vec::with_capacity(first);
-    // Read the expected length into the exact-size buffer first, then probe
+    let first = zstd_initial_capacity(blob_len, size_hint, max_len);
+    let mut out = Vec::new();
+    out.try_reserve_exact(first)
+        .map_err(|e| PtwmCoreError::CodecDecode {
+            codec,
+            msg: format!("cannot reserve {first} bytes for the decoded plane: {e}"),
+        })?;
+    // Read the expected length into the reserved buffer first, then probe
     // for more. In the usual case the probe reads nothing and the buffer is
     // never grown.
     (&mut decoder)
@@ -254,11 +277,33 @@ pub fn zstd_decode_bounded(
     }
     if out.len() > max_len {
         return Err(PtwmCoreError::CodecDecode {
-            codec: "zstd",
+            codec,
             msg: format!("frame decodes to more than {max_len} bytes"),
         });
     }
     Ok(out)
+}
+
+/// Decode a Zstd blob (one or more frames) to at most `max_len` bytes.
+///
+/// `size_hint` is the expected length. It only sizes the first reservation,
+/// together with the payload length (see [`zstd_read_bounded`]); a plane
+/// that turns out longer is still read, up to the bound.
+#[cfg(feature = "codec-zstd")]
+pub fn zstd_decode_bounded(
+    blob: &[u8],
+    size_hint: usize,
+    max_len: usize,
+) -> Result<Vec<u8>, PtwmCoreError> {
+    if blob.is_empty() {
+        return Ok(Vec::new());
+    }
+    let decoder =
+        zstd::stream::read::Decoder::with_buffer(blob).map_err(|e| PtwmCoreError::CodecDecode {
+            codec: "zstd",
+            msg: e.to_string(),
+        })?;
+    zstd_read_bounded(decoder, "zstd", blob.len(), size_hint, max_len)
 }
 
 #[cfg(test)]
@@ -396,5 +441,39 @@ mod tests {
     fn zstd_empty_roundtrip() {
         let blob = zstd_encode(&[], 3).unwrap();
         assert!(zstd_decode(&blob).unwrap().is_empty());
+    }
+
+    /// A file-supplied size hint must not size the first allocation. A
+    /// 1 TiB hint on a small frame used to abort the process in
+    /// `Vec::with_capacity`.
+    #[cfg(feature = "codec-zstd")]
+    #[test]
+    fn zstd_bounded_ignores_huge_size_hint() {
+        let data = vec![0u8; 4096];
+        let blob = zstd_encode(&data, 3).unwrap();
+        let back = zstd_decode_bounded(&blob, 1 << 40, 1 << 41).unwrap();
+        assert_eq!(back, data);
+        assert!(back.capacity() <= blob.len() * ZSTD_MAX_EXPANSION);
+    }
+
+    #[cfg(feature = "codec-zstd")]
+    #[test]
+    fn zstd_bounded_rejects_output_past_max_len() {
+        let data = vec![7u8; 10_000];
+        let blob = zstd_encode(&data, 3).unwrap();
+        let err = zstd_decode_bounded(&blob, 1 << 40, 9_999).unwrap_err();
+        assert!(err.to_string().contains("more than 9999 bytes"), "{err}");
+        assert_eq!(zstd_decode_bounded(&blob, 0, 10_000).unwrap(), data);
+    }
+
+    #[cfg(feature = "codec-zstd")]
+    #[test]
+    fn zstd_initial_capacity_is_capped_by_payload() {
+        assert_eq!(
+            zstd_initial_capacity(10, 1 << 40, 1 << 41),
+            10 * ZSTD_MAX_EXPANSION
+        );
+        assert_eq!(zstd_initial_capacity(1 << 20, 4096, 1 << 41), 4096);
+        assert_eq!(zstd_initial_capacity(1 << 20, 1 << 30, 100), 100);
     }
 }

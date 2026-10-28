@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
+
 import numpy as np
 import pytest
 import torch
@@ -207,6 +211,90 @@ def test_corrupted_frame_is_rejected() -> None:
         Decompressor().decompress(bytes(blob))
     with pytest.raises(Error):
         Decompressor().decompress(bytes(blob[:-3]))
+
+
+_SHAPE_BOMB = textwrap.dedent(
+    """
+    import numpy as np
+    from ptwm import CompressionConfig, Compressor, Decompressor, Format, Method
+    from ptwm._exceptions import Error
+
+
+    def varint(n):
+        out = bytearray()
+        while True:
+            b, n = n & 0x7F, n >> 7
+            if n:
+                out.append(b | 0x80)
+            else:
+                out.append(b)
+                return bytes(out)
+
+
+    def read_varint(b, i):
+        v = shift = 0
+        while True:
+            c = b[i]
+            i += 1
+            v |= (c & 0x7F) << shift
+            shift += 7
+            if c < 0x80:
+                return v, i
+
+
+    cfg = CompressionConfig(input_format=Format.NUMPY, method=Method.ZSTD)
+    f = Compressor(cfg).compress(np.zeros((64, 64), dtype=np.uint8))
+    assert f[:5] == b"\\x89PTWS"
+    _, i = read_varint(f, 6)  # dtype code
+    i += 1  # input format
+    ndim, i = read_varint(f, i)
+    start = i
+    for _ in range(ndim):
+        _, i = read_varint(f, i)
+    # A 32 GiB plane declared by a frame of about 50 bytes.
+    bomb = f[:start] + varint(1 << 20) + varint(1 << 15) + f[i:]
+    try:
+        Decompressor().decompress(bomb)
+    except Error as e:
+        print("rejected:", e)
+    else:
+        raise SystemExit("decoded a 32 GiB shape from a 4 KiB payload")
+    """
+)
+
+
+def test_declared_shape_does_not_size_allocation() -> None:
+    """A frame whose shape claims 32 GiB fails with an error, not an abort.
+
+    The decoder once reserved the declared plane length before decoding,
+    so this frame killed the process with SIGABRT. It runs in a child
+    process so a regression fails this test instead of the whole session.
+    """
+    r = subprocess.run(
+        [sys.executable, "-c", _SHAPE_BOMB],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "rejected:" in r.stdout
+
+
+def test_container_readers_name_a_compact_frame() -> None:
+    """Container APIs report a frame as a frame, not as a truncated file."""
+    blob = Compressor(CompressionConfig(input_format=Format.NUMPY)).compress(
+        np.arange(64, dtype=np.float32)
+    )
+    assert blob[:5] == COMPACT
+    for call in (
+        lambda: _rust.decode_model(blob),
+        lambda: _rust.list_tensor_names(blob),
+        lambda: _rust.decode_tensor(blob, "_"),
+    ):
+        with pytest.raises(Error, match="compact single-tensor frame") as e:
+            call()
+        assert "truncated" not in str(e.value)
 
 
 def test_unknown_magic_is_rejected() -> None:

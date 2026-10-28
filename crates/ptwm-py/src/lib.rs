@@ -317,7 +317,7 @@ fn py_dtype_element_size(dtype_code: u8) -> PyResult<u32> {
 /// Returns the entire container as a ``bytes`` object.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (records, chains_per_tensor, emit_payload_hash, emit_plane_crc, method_hint=3, streaming_chunk=None, codec_menu=None))]
+#[pyo3(signature = (records, chains_per_tensor, emit_payload_hash, emit_plane_crc, method_hint=3, streaming_chunk=None, codec_menu=None, *, container_layout="legacy"))]
 fn compress_model<'py>(
     py: Python<'py>,
     records: Vec<(
@@ -338,7 +338,15 @@ fn compress_model<'py>(
     // trial-encode menu is filtered to codecs in this set on every plane;
     // empty intersection on a plane raises `InvalidContainer`.
     codec_menu: Option<Vec<u16>>,
+    // Container layout: "legacy" (\x89PTWM) or "compact" (\x89PTWC).
+    container_layout: &str,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+    let container_layout = ptwm_core::container::ContainerLayout::parse(container_layout)
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown container_layout {container_layout:?} (expected \"legacy\" or \"compact\")"
+            ))
+        })?;
     if chains_per_tensor.len() != records.len() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "chains_per_tensor length {} != records length {}",
@@ -438,7 +446,7 @@ fn compress_model<'py>(
             forced_codec,
             allow_codec_ids,
             chunk_size: streaming_chunk,
-            ..Default::default()
+            container_layout,
         };
 
         let cursor = std::io::Cursor::new(&mut out);

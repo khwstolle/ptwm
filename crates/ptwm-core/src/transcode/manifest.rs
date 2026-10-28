@@ -5,6 +5,10 @@
 //! large/opaque binaries (compressed plane payloads, externalized codec state,
 //! embedded modules) are referenced by member key and live outside the JSON.
 //!
+//! The registry manifest has one form per container layout:
+//! [`RegistryManifest`] for the legacy layout and [`CompactRegistryManifest`]
+//! for the compact one. Per-tensor manifests ([`TensorManifest`]) are shared.
+//!
 //! The schema restricts scalars to integers, strings, booleans, and `null`;
 //! opaque byte fields are carried as base64 (`*_b64`). See `super::jcs` for
 //! the canonicalization that makes manifest hashes reproducible.
@@ -13,6 +17,12 @@ use serde::{Deserialize, Serialize};
 
 pub const PTWM_MANIFEST_FORMAT: &str = "ptwm-manifest";
 pub const MANIFEST_VERSION: u32 = 1;
+/// `ptwm_format` of a compact-layout (`\x89PTWC`) registry manifest.
+pub const PTWM_MANIFEST_FORMAT_COMPACT: &str = "ptwm-manifest-c";
+/// `manifest_version` of a compact-layout registry manifest.
+pub const MANIFEST_VERSION_COMPACT: u32 = 2;
+/// `container_flags.layout` of a compact-layout registry manifest.
+pub const LAYOUT_COMPACT: &str = "compact";
 
 /// Archive-scoped registry manifest. Lifts the binary `extension_table` and
 /// `shared_prelude` to archive scope so codecs/ops/codebooks/chains are defined
@@ -52,6 +62,60 @@ pub struct Registry {
     /// `builtin_version`. `implode` then writes them verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extension_table_b64: Option<String>,
+}
+
+/// Archive-scoped registry manifest of a compact-layout (`\x89PTWC`)
+/// container: `ptwm_format` [`PTWM_MANIFEST_FORMAT_COMPACT`],
+/// `manifest_version` [`MANIFEST_VERSION_COMPACT`].
+///
+/// It lists the Extension Table entry by entry instead of carrying its hash,
+/// because the compact table is rebuilt from that list. Per-tensor manifests
+/// are [`TensorManifest`]s, as for the legacy layout.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactRegistryManifest {
+    pub ptwm_format: String,
+    pub manifest_version: u32,
+    pub container_flags: CompactContainerFlags,
+    pub registry: CompactRegistry,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactContainerFlags {
+    /// Always `false`: embedded WASM needs the legacy layout.
+    pub embedded_wasm: bool,
+    /// Always [`LAYOUT_COMPACT`].
+    pub layout: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactRegistry {
+    /// The Extension Table entries in table order. Plane `codec_table_idx`
+    /// values and the chains' op references index this list.
+    pub extension_table: Vec<ExtensionEntryJson>,
+    pub shared_state: Vec<SharedStateEntry>,
+    /// Registry chains in registry order; `id` is the position. A Source
+    /// node with `params_b64` `null` is bound: it takes its params from the
+    /// shape and dtype of each record that uses the chain.
+    pub chains: Vec<ChainEntry>,
+}
+
+/// One compact Extension Table entry (see
+/// [`crate::extension::compact_table`]). Serialized as a one-key object:
+/// `{"op": u16}`, `{"codec": u16}`, `{"named": str}` or `{"full_b64": str}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExtensionEntryJson {
+    /// Built-in transform by `OpId` wire id.
+    Op(u16),
+    /// Built-in plane codec by `CodecId` wire id.
+    Codec(u16),
+    /// Built-in without a wire id, by name.
+    Named(String),
+    /// Third-party entry: the legacy entry bytes, base64.
+    FullB64(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -181,9 +245,12 @@ pub struct PlaneJson {
     pub role: String,
     /// Exact `PlaneRole` discriminant, used for reconstruction.
     pub role_code: u8,
-    /// `CodecId` wire value.
+    /// `CodecId` wire value. The compact layout does not store it: it is
+    /// informational there, and `implode` rejects a value that differs from
+    /// the codec of the table entry `codec_table_idx` names.
     pub codec: u16,
-    /// Extension-table index for the codec (`0xFFFF` = absent).
+    /// Extension-table index for the codec (`0xFFFF` = absent). The compact
+    /// layout's `codec_ref`.
     pub codec_table_idx: u16,
     /// Where the codec state lives in the manifest:
     /// `none` | `inline` | `member` | `shared` | `external`.

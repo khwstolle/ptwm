@@ -25,6 +25,7 @@ __all__ = [
     "decode_member_tensor",
     "raw_from_members",
     "jcs_canonicalize",
+    "manifest_container_layout",
     "shared_member_keys",
     "tensor_member_keys",
 ]
@@ -66,6 +67,11 @@ class ExplodedModel:
 
     __slots__ = ("registry_json", "tensors", "members", "_by_name")
 
+    @property
+    def container_layout(self) -> str:
+        """The source container's layout, ``"legacy"`` or ``"compact"``."""
+        return manifest_container_layout(self.registry_json)
+
     def __init__(
         self,
         registry_json: str,
@@ -99,6 +105,22 @@ def explode_model(blob: bytes) -> ExplodedModel:
     return ExplodedModel(registry_json, list(tensors), dict(members))
 
 
+def manifest_container_layout(registry_json: str) -> str:
+    """Return the container layout a registry manifest rebuilds.
+
+    ``"compact"`` for a ``"ptwm-manifest-c"`` manifest, ``"legacy"`` for a
+    ``"ptwm-manifest"`` one; raises ``ValueError`` for anything else.
+    """
+    reg = json.loads(registry_json)
+    fmt = reg.get("ptwm_format")
+    if fmt == "ptwm-manifest-c":
+        return "compact"
+    if fmt == "ptwm-manifest":
+        return "legacy"
+    msg = f"unknown registry manifest format {fmt!r}"
+    raise ValueError(msg)
+
+
 def tensor_member_keys(members: dict[str, bytes], sample_key: str) -> dict[str, bytes]:
     """Return the subset of ``members`` owned by the tensor ``sample_key``."""
     prefix = f"{sample_key}."
@@ -121,7 +143,10 @@ def raw_from_members(
     """Reconstruct a one-tensor container and return its raw decompressed bytes.
 
     ``members`` must contain the tensor's plane/state members plus any
-    archive-global shared state referenced by ``registry_json``.
+    archive-global shared state referenced by ``registry_json``. The container
+    has the layout of ``registry_json`` (legacy or compact) and the archive-wide
+    Extension Table and chain registry, so the tensor's table indices and chain
+    reference stay valid.
     """
     blob = _rust.implode_ptwm(registry_json, [tensor_json], members)
     name = json.loads(tensor_json)["name"]

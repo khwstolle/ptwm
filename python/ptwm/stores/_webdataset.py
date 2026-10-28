@@ -70,18 +70,25 @@ def write_webdataset(
     max_shard_size: int = _DEFAULT_MAX_SHARD_SIZE,
     method_hint: int = 3,
     chains_per_tensor: list[list[bytes]] | None = None,
+    container_layout: str = "legacy",
 ) -> Path:
     """Write ``tensors`` as a WebDataset shard set rooted at ``out_dir``.
 
     Returns the directory path. ``tensors`` is a sequence of
     ``(name, raw_bytes, dtype, shape)``; shards are packed by compressed size
     via :func:`ptwm.sharding.plan_shards` so a tensor never straddles a shard.
+    ``container_layout`` (``"legacy"`` or ``"compact"``) selects the
+    container the tensors are compressed into; the registry manifest records
+    it, and readers rebuild each tensor in that layout.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     blob = compress_ptwm_blob(
-        tensors, chains_per_tensor=chains_per_tensor, method_hint=method_hint
+        tensors,
+        chains_per_tensor=chains_per_tensor,
+        method_hint=method_hint,
+        container_layout=container_layout,
     )
     model = explode_model(blob)
     _write_exploded(out_dir, model, max(1, max_shard_size))

@@ -190,8 +190,10 @@ def compress_model(
     method_hint: int = 3,
     streaming_chunk: int | None = None,
     codec_menu: list[int] | None = None,
+    *,
+    container_layout: str = "legacy",
 ) -> bytes:
-    """Compress a list of tensors into a ``.ptwm`` container.
+    r"""Compress a list of tensors into a ``.ptwm`` container.
 
     Each element of ``records`` is a 7-tuple:
     ``(name, dtype_code, input_format, raw_bytes, shape,
@@ -204,6 +206,9 @@ def compress_model(
     ``codec_menu``: optional list of wire-stable ``CodecId`` integers
     restricting the trial-encode menu. ``None`` uses the full menu;
     empty intersection on a plane raises ``InvalidContainer``.
+    ``container_layout``: ``"legacy"`` writes ``\x89PTWM`` (readable by every
+    release), ``"compact"`` writes ``\x89PTWC`` (readable by v1.2 and later).
+    Other values raise ``ValueError``.
     """
     return bytes(
         _ext.compress_model(
@@ -214,6 +219,7 @@ def compress_model(
             method_hint,
             streaming_chunk,
             codec_menu,
+            container_layout=container_layout,
         )
     )
 
@@ -352,12 +358,18 @@ def decode_tensor_info(
 def explode_ptwm(
     blob: bytes,
 ) -> tuple[str, list[tuple[str, str, str]], dict[str, bytes]]:
-    """Explode a ``.ptwm`` container into its canonical PTWM-JSON projection.
+    r"""Explode a ``.ptwm`` container into its canonical PTWM-JSON projection.
 
     Returns ``(registry_json, tensors, members)`` where ``registry_json`` is
     the canonical (JCS) archive-scoped registry manifest, ``tensors`` is a list
     of ``(name, key, tensor_manifest_json)`` in file order, and ``members`` maps
     member name → bytes. ``implode_ptwm`` reproduces ``blob`` byte-for-byte.
+
+    A legacy (``\x89PTWM``) container gives a ``"ptwm-manifest"`` version 1
+    registry manifest; a compact (``\x89PTWC``) container gives a
+    ``"ptwm-manifest-c"`` version 2 manifest that lists the Extension Table
+    entries and records ``container_flags.layout == "compact"``. Tensors are
+    in body order for both.
 
     The extension already returns ``str``/``bytes`` of the correct type, so the
     result is returned without re-wrapping (avoids copying large payloads).
@@ -374,5 +386,7 @@ def implode_ptwm(
     """Reconstruct a ``.ptwm`` container from a manifest projection.
 
     ``tensor_jsons`` must be in file order. Inverse of :func:`explode_ptwm`.
+    The registry manifest selects the layout of the result. A subset of the
+    tensors gives a container of those tensors with the archive-wide tables.
     """
     return _ext.implode_ptwm(registry_json, tensor_jsons, members)

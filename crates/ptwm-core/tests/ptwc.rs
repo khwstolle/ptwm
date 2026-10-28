@@ -14,11 +14,18 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 use ptwm_core::chain::{Chain, ChainEdge, ChainNode, TerminalRef};
+use ptwm_core::codec::CodecId;
 use ptwm_core::compressor::{CompressorOptions, InputTensor, compress_model};
 use ptwm_core::container::{ContainerLayout, ContainerReader, ContainerWriter};
+use ptwm_core::extension::compact_table::{CompactEntry, classify};
+use ptwm_core::extension::{
+    Attestation, CanonicalId, CapabilityMap, ExtensionTableEntry, Kind, Lifecycle, builtin_entries,
+    builtin_registry,
+};
 use ptwm_core::header::{HEADER_LEN, Header, MAGIC_PTWC};
 use ptwm_core::tensor_record::TensorRecord;
 use ptwm_core::tensor_record_compact::TF_RAW_META;
+use ptwm_core::transcode::{Exploded, explode, implode};
 use ptwm_core::transforms::op::OpId;
 use ptwm_core::types::{Role, ScaleFormat, ValueFormat};
 
@@ -115,6 +122,7 @@ fn legacy_fixtures_round_trip_through_the_compact_layout() {
             to_compact(&compact) == compact,
             "{fixture}: rewrite differs"
         );
+        assert_transcodes(&compact, fixture);
     }
 }
 
@@ -167,6 +175,9 @@ fn p4_source_slack_is_rejected_in_the_compact_layout() {
     let reader = ContainerReader::open(&compact).unwrap();
     let err = reader.decode_model().unwrap_err().to_string();
     assert!(err.contains("Source declares"), "{err}");
+    // The transcoder carries the file unchanged; per-tensor implodes fail to
+    // decode the same way.
+    assert_transcodes(&compact, "legacy_p4_byte_fp32.ptwm");
 }
 
 // ── compress_model in the compact layout ───────────────────────────────────
@@ -442,6 +453,10 @@ fn compress_model_matrix_round_trips_in_both_layouts() {
                 let mut all = reader.decode_model().unwrap();
                 all.sort();
                 decoded.push(all);
+                assert_transcodes(
+                    &blob,
+                    &format!("{layout:?} hash={hash} crc={crc} chunk={chunk:?}"),
+                );
                 if layout == ContainerLayout::Compact {
                     // parse then write is the identity.
                     assert!(to_compact(&blob) == blob, "rewrite differs");
@@ -479,6 +494,7 @@ fn bound_source_shares_one_chain_across_shapes() {
     for t in &data {
         assert_eq!(cr.decode_tensor(&t.name).unwrap(), t.bytes);
     }
+    assert_transcodes(&compact, "bound Source");
 
     // A record without shape metadata cannot use the bound chain: the writer
     // refuses it.
@@ -586,6 +602,7 @@ fn byte_input_tensor_round_trips_in_the_compact_layout() {
         assert_eq!(reader.tensor_shape("model.raw").unwrap(), None);
         assert_eq!(reader.decode_tensor("model.raw").unwrap(), raw);
         assert!(to_compact(&blob) == blob, "rewrite differs");
+        assert_transcodes(&blob, "BYTE input");
     }
 }
 
@@ -618,6 +635,7 @@ fn raw_cbor_metadata_round_trips_in_a_compact_container() {
         assert_ne!(bytes[0] & TF_RAW_META, 0, "stored as TF_RAW_META");
         assert_eq!(reader.decode_tensor("model.raw").unwrap(), raw);
         assert!(to_compact(&compact) == compact, "rewrite differs");
+        assert_transcodes(&compact, "raw metadata");
     }
 }
 
@@ -651,6 +669,7 @@ fn external_state_plane_round_trips_in_a_compact_container() {
     assert_eq!(rec.terminals[0].state_source, StateSource::External);
     assert_eq!(rec.terminals[0].external_state.as_ref(), Some(&ext));
     assert!(to_compact(&compact) == compact, "rewrite differs");
+    assert_transcodes(&compact, "external state");
     // The other tensors are unaffected.
     for t in data.iter().filter(|t| t.name != target) {
         assert_eq!(
@@ -904,4 +923,484 @@ fn write_fuzz_seeds() {
         write_compact_record(&rec, &ctx, &mut out).unwrap();
         write("parse_wire_compact", &format!("record_{i}"), &out);
     }
+}
+
+// ── Transcode (synthesis section 6) ─────────────────────────────────────────
+
+fn members_of(exploded: &Exploded) -> HashMap<String, &[u8]> {
+    exploded
+        .members
+        .iter()
+        .map(|(k, v)| (k.clone(), v.as_slice()))
+        .collect()
+}
+
+fn manifests_of(exploded: &Exploded) -> Vec<String> {
+    exploded
+        .tensors
+        .iter()
+        .map(|t| t.manifest_json.clone())
+        .collect()
+}
+
+/// The members one tensor needs: its own (`<key>.`) and the archive-wide
+/// shared state, as the exploded stores keep them.
+fn tensor_members<'a>(exploded: &'a Exploded, key: &str) -> HashMap<String, &'a [u8]> {
+    let prefix = format!("{key}.");
+    exploded
+        .members
+        .iter()
+        .filter(|(k, _)| k.starts_with(&prefix) || k.starts_with("shared/"))
+        .map(|(k, v)| (k.clone(), v.as_slice()))
+        .collect()
+}
+
+/// `implode(explode(blob)) == blob`, the manifest has the layout's form,
+/// tensors come in body order, and each tensor imploded on its own (as the
+/// exploded stores do) decodes like the full file.
+fn assert_transcodes(blob: &[u8], what: &str) {
+    let reader = ContainerReader::open_partial(blob).unwrap();
+    let exploded = explode(blob).unwrap_or_else(|e| panic!("{what}: explode: {e}"));
+    let rebuilt = implode(
+        &exploded.registry_json,
+        &manifests_of(&exploded),
+        members_of(&exploded),
+    )
+    .unwrap_or_else(|e| panic!("{what}: implode: {e}"));
+    assert!(rebuilt == blob, "{what}: implode(explode(x)) != x");
+
+    let reg: serde_json::Value = serde_json::from_str(&exploded.registry_json).unwrap();
+    match reader.layout {
+        ContainerLayout::Compact => {
+            assert_eq!(reg["ptwm_format"], "ptwm-manifest-c", "{what}");
+            assert_eq!(reg["manifest_version"], 2, "{what}");
+            assert_eq!(reg["container_flags"]["layout"], "compact", "{what}");
+            assert!(reg.get("registry_hash_blake3").is_none(), "{what}");
+            let table = reg["registry"]["extension_table"].as_array().unwrap();
+            assert_eq!(table.len(), reader.extension_table.entries.len(), "{what}");
+            let chains = reg["registry"]["chains"].as_array().unwrap();
+            assert_eq!(chains.len(), reader.chain_registry.chains.len(), "{what}");
+            for (pos, c) in chains.iter().enumerate() {
+                assert_eq!(c["id"], pos, "{what}: chains in registry order");
+            }
+        }
+        ContainerLayout::Legacy => {
+            assert_eq!(reg["ptwm_format"], "ptwm-manifest", "{what}");
+            assert_eq!(reg["manifest_version"], 1, "{what}");
+        }
+    }
+
+    // Tensors in body order.
+    let names: Vec<String> = reader
+        .tensor_records()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    let exploded_names: Vec<&str> = exploded.tensors.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(exploded_names, names, "{what}: tensor order");
+
+    // Per-tensor implode with the archive-wide registry.
+    for t in &exploded.tensors {
+        let single = implode(
+            &exploded.registry_json,
+            std::slice::from_ref(&t.manifest_json),
+            tensor_members(&exploded, &t.key),
+        )
+        .unwrap_or_else(|e| panic!("{what}: implode {}: {e}", t.name));
+        let one = ContainerReader::open_partial(&single).unwrap();
+        assert_eq!(one.layout, reader.layout, "{what}");
+        assert_eq!(one.tensor_names().unwrap(), vec![t.name.clone()], "{what}");
+        match reader.decode_tensor(&t.name) {
+            Ok(want) => assert_eq!(
+                one.decode_tensor(&t.name).unwrap(),
+                want,
+                "{what}: subset implode of {}",
+                t.name
+            ),
+            Err(_) => assert!(one.decode_tensor(&t.name).is_err(), "{what}: {}", t.name),
+        }
+    }
+}
+
+fn compact_feature_blob() -> Vec<u8> {
+    compress(
+        &feature_tensors(),
+        options(true, true, None, ContainerLayout::Compact),
+    )
+}
+
+#[test]
+fn compact_manifest_lists_the_table_and_binds_sources() {
+    let blob = compact_feature_blob();
+    let reader = ContainerReader::open(&blob).unwrap();
+    let exploded = explode(&blob).unwrap();
+    let reg: serde_json::Value = serde_json::from_str(&exploded.registry_json).unwrap();
+    assert_eq!(
+        reg["container_flags"],
+        serde_json::json!({"embedded_wasm": false, "layout": "compact"})
+    );
+    let keys: Vec<&String> = reg["registry"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["chains", "extension_table", "shared_state"]);
+
+    // Every entry is a one-key object naming a built-in by wire id.
+    let table = reg["registry"]["extension_table"].as_array().unwrap();
+    for (i, entry) in table.iter().enumerate() {
+        let obj = entry.as_object().unwrap();
+        assert_eq!(obj.len(), 1, "{entry}");
+        let (kind, value) = obj.iter().next().unwrap();
+        let e = &reader.extension_table.entries[i];
+        match kind.as_str() {
+            "op" => {
+                let op = OpId::from_u16(value.as_u64().unwrap() as u16).unwrap();
+                assert_eq!(
+                    e.human_label,
+                    format!(
+                        "io.ptwm.builtin.{}@{}",
+                        op.builtin_name(),
+                        env!("CARGO_PKG_VERSION")
+                    )
+                );
+            }
+            "codec" => assert!(value.is_u64()),
+            other => panic!("unexpected entry kind {other} in {entry}"),
+        }
+    }
+
+    // Registry chains with a bound Source carry params_b64 null.
+    let chains = reg["registry"]["chains"].as_array().unwrap();
+    let bound = chains
+        .iter()
+        .filter(|c| {
+            c["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n["op"] == OpId::Source.as_u16() && n["params_b64"].is_null())
+        })
+        .count();
+    assert!(bound > 0, "no bound Source in {chains:?}");
+
+    // Plane codec_table_idx names a codec entry of the listed table.
+    for t in &exploded.tensors {
+        let tm: serde_json::Value = serde_json::from_str(&t.manifest_json).unwrap();
+        for p in tm["planes"].as_array().unwrap() {
+            let idx = p["codec_table_idx"].as_u64().unwrap() as usize;
+            assert_eq!(
+                table[idx],
+                serde_json::json!({"codec": p["codec"]}),
+                "{}",
+                t.name
+            );
+        }
+    }
+}
+
+/// Rewrite `blob` in the compact layout with `extra` appended to its
+/// Extension Table. Existing table indices stay valid.
+fn with_extra_entries(blob: &[u8], extra: Vec<ExtensionTableEntry>) -> Vec<u8> {
+    let reader = ContainerReader::open(blob).unwrap();
+    let mut table = reader.extension_table.clone();
+    table.entries.extend(extra);
+    let mut out = Vec::new();
+    let mut w =
+        ContainerWriter::with_layout(Cursor::new(&mut out), ContainerLayout::Compact).unwrap();
+    w.set_prelude(&reader.prelude).unwrap();
+    w.set_compact_tables(table, reader.chain_registry.clone())
+        .unwrap();
+    for rec in reader.tensor_records().unwrap() {
+        w.append_tensor(&rec).unwrap();
+    }
+    w.finalize().unwrap();
+    out
+}
+
+fn third_party_entry() -> ExtensionTableEntry {
+    ExtensionTableEntry {
+        canonical_id: CanonicalId::derive(&[7; 32], "acme_codec", "0.1.0"),
+        human_label: "com.acme.codec@0.1.0".into(),
+        kind: Kind::PlaneCodec,
+        abi_version: 1,
+        lifecycle: Lifecycle::Thread,
+        flavor_hints: ptwm_core::extension::table::FLAVOR_NATIVE,
+        capabilities: CapabilityMap::new(),
+        attestation: Attestation::PgpSignature(vec![1, 2, 3]),
+        install_hint: Some("pip install acme".into()),
+        embedded_wasm_offset: None,
+        embedded_wasm_length: None,
+    }
+}
+
+#[test]
+fn compact_manifest_carries_named_and_third_party_entries() {
+    let blob = compact_feature_blob();
+    let reader = ContainerReader::open(&blob).unwrap();
+    // A built-in without a wire id (stored by name).
+    let named: Vec<ExtensionTableEntry> = builtin_entries()
+        .into_iter()
+        .filter(|e| {
+            matches!(classify(e), Ok(CompactEntry::Named(_)))
+                && !reader.extension_table.entries.contains(e)
+        })
+        .take(1)
+        .collect();
+    assert_eq!(named.len(), 1, "no built-in without a wire id");
+    let mut extra = named.clone();
+    extra.push(third_party_entry());
+    let file = with_extra_entries(&blob, extra);
+
+    let exploded = explode(&file).unwrap();
+    let reg: serde_json::Value = serde_json::from_str(&exploded.registry_json).unwrap();
+    let table = reg["registry"]["extension_table"].as_array().unwrap();
+    let last = table.last().unwrap();
+    assert!(last["full_b64"].is_string(), "{last}");
+    assert!(table[table.len() - 2]["named"].is_string(), "{table:?}");
+    let rebuilt = implode(
+        &exploded.registry_json,
+        &manifests_of(&exploded),
+        members_of(&exploded),
+    )
+    .unwrap();
+    assert!(rebuilt == file, "implode(explode(x)) != x");
+}
+
+/// Implode `registry` (a JSON value) with the tensors of `exploded`.
+fn implode_with(
+    exploded: &Exploded,
+    registry: &serde_json::Value,
+) -> Result<Vec<u8>, ptwm_core::error::PtwmCoreError> {
+    implode(
+        &registry.to_string(),
+        &manifests_of(exploded),
+        members_of(exploded),
+    )
+}
+
+#[test]
+fn implode_rejects_malformed_compact_manifests() {
+    let blob = compact_feature_blob();
+    let exploded = explode(&blob).unwrap();
+    let reg: serde_json::Value = serde_json::from_str(&exploded.registry_json).unwrap();
+    assert!(implode_with(&exploded, &reg).unwrap() == blob);
+
+    let cases: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>, &str)> = vec![
+        (
+            "compact format, legacy version",
+            Box::new(|r| r["manifest_version"] = 1.into()),
+            "unsupported manifest",
+        ),
+        (
+            "compact format, version 3",
+            Box::new(|r| r["manifest_version"] = 3.into()),
+            "unsupported manifest",
+        ),
+        (
+            "legacy format, compact version",
+            Box::new(|r| r["ptwm_format"] = "ptwm-manifest".into()),
+            "unsupported manifest",
+        ),
+        (
+            "legacy layout name",
+            Box::new(|r| r["container_flags"]["layout"] = "legacy".into()),
+            "container_flags.layout",
+        ),
+        (
+            "missing layout",
+            Box::new(|r| {
+                r["container_flags"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("layout");
+            }),
+            "missing field",
+        ),
+        (
+            "embedded WASM",
+            Box::new(|r| r["container_flags"]["embedded_wasm"] = true.into()),
+            "embedded WASM",
+        ),
+        (
+            "legacy registry hash",
+            Box::new(|r| r["registry_hash_blake3"] = "00".repeat(32).into()),
+            "unknown field",
+        ),
+        (
+            "legacy op list",
+            Box::new(|r| r["registry"]["ops"] = serde_json::json!([])),
+            "unknown field",
+        ),
+        (
+            "unknown entry kind",
+            Box::new(|r| r["registry"]["extension_table"][0] = serde_json::json!({"wasm": 1})),
+            "unknown variant",
+        ),
+        (
+            "two keys in an entry",
+            Box::new(|r| {
+                r["registry"]["extension_table"][0] = serde_json::json!({"op": 1, "codec": 1})
+            }),
+            "parse registry manifest",
+        ),
+        (
+            "unknown op id",
+            Box::new(|r| r["registry"]["extension_table"][0] = serde_json::json!({"op": 0x7FFF})),
+            "unknown op id",
+        ),
+        (
+            "unknown built-in name",
+            Box::new(|r| {
+                r["registry"]["extension_table"][0] = serde_json::json!({"named": "no_such"})
+            }),
+            "unknown built-in name",
+        ),
+        (
+            "duplicate entry",
+            Box::new(|r| {
+                let first = r["registry"]["extension_table"][0].clone();
+                r["registry"]["extension_table"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(first);
+            }),
+            "duplicate entry",
+        ),
+        (
+            "chain id not its position",
+            Box::new(|r| r["registry"]["chains"][0]["id"] = 7.into()),
+            "compact chain ids are positions",
+        ),
+    ];
+    for (what, mutate, needle) in cases {
+        let mut bad = reg.clone();
+        mutate(&mut bad);
+        let e = implode_with(&exploded, &bad).unwrap_err().to_string();
+        assert!(e.contains(needle), "{what}: {e}");
+    }
+
+    // A built-in stored as a full entry is not canonical.
+    let mut bad = reg.clone();
+    let zstd = builtin_registry()
+        .entry_by_name("zstd")
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    bad["registry"]["extension_table"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({ "full_b64": b64(&zstd) }));
+    let e = implode_with(&exploded, &bad).unwrap_err().to_string();
+    assert!(e.contains("built-in id"), "{e}");
+
+    // codec is informational, but must agree with the table entry that
+    // codec_table_idx names.
+    let mut tm: serde_json::Value =
+        serde_json::from_str(&exploded.tensors[0].manifest_json).unwrap();
+    tm["planes"][0]["codec"] = 0x7FFE.into();
+    let e = implode(
+        &exploded.registry_json,
+        &[tm.to_string()],
+        tensor_members(&exploded, &exploded.tensors[0].key),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("codec"), "{e}");
+    let mut tm: serde_json::Value =
+        serde_json::from_str(&exploded.tensors[0].manifest_json).unwrap();
+    let other = if tm["planes"][0]["codec"] == CodecId::Zstd.as_u16() {
+        CodecId::Identity
+    } else {
+        CodecId::Zstd
+    };
+    tm["planes"][0]["codec"] = other.as_u16().into();
+    let e = implode(
+        &exploded.registry_json,
+        &[tm.to_string()],
+        tensor_members(&exploded, &exploded.tensors[0].key),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("codec"), "{e}");
+}
+
+/// Standard base64 with padding, for building manifests by hand.
+fn b64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(A[(n >> (18 - 6 * i)) as usize & 63] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The registry-manifest gate of the v1.1 `implode`, frozen: the v1.1
+/// manifest struct (no `deny_unknown_fields`) and its `ptwm_format` check.
+fn v1_1_implode_gate(registry_json: &str) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Flags {
+        embedded_wasm: bool,
+    }
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Registry {
+        ops: Vec<serde_json::Value>,
+        codecs: Vec<serde_json::Value>,
+        shared_state: Vec<serde_json::Value>,
+        chains: Vec<serde_json::Value>,
+    }
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct Manifest {
+        ptwm_format: String,
+        manifest_version: u32,
+        container_flags: Flags,
+        registry_hash_blake3: String,
+        registry: Registry,
+    }
+    let m: Manifest = serde_json::from_str(registry_json).map_err(|e| e.to_string())?;
+    if m.ptwm_format != "ptwm-manifest" {
+        return Err(format!("unexpected ptwm_format {:?}", m.ptwm_format));
+    }
+    Ok(())
+}
+
+/// The gate of an implode that accepts only `("ptwm-manifest", 1)`.
+fn legacy_only_implode_gate(registry_json: &str) -> Result<(), String> {
+    let v: serde_json::Value = serde_json::from_str(registry_json).map_err(|e| e.to_string())?;
+    if v["ptwm_format"] != "ptwm-manifest" || v["manifest_version"] != 1 {
+        return Err(format!(
+            "unsupported manifest {} version {}",
+            v["ptwm_format"], v["manifest_version"]
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn old_implode_rejects_compact_manifests() {
+    let data = feature_tensors();
+    let legacy = compress(&data, options(true, true, None, ContainerLayout::Legacy));
+    let legacy_reg = explode(&legacy).unwrap().registry_json;
+    let compact_reg = explode(&compact_feature_blob()).unwrap().registry_json;
+
+    for gate in [v1_1_implode_gate, legacy_only_implode_gate] {
+        assert_eq!(gate(&legacy_reg), Ok(()));
+        let e = gate(&compact_reg).unwrap_err();
+        assert!(!e.is_empty());
+    }
+    // The v1.1 gate fails on the manifest structure before the format check.
+    let e = v1_1_implode_gate(&compact_reg).unwrap_err();
+    assert!(e.contains("missing field"), "{e}");
 }

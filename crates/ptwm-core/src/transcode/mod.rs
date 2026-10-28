@@ -11,6 +11,18 @@
 //!   that `implode(explode(blob)) == blob` byte-for-byte for every container the
 //!   compression engine produces.
 //!
+//! Both container layouts are supported. A legacy (`\x89PTWM`) container gives
+//! a [`RegistryManifest`] (`"ptwm-manifest"`, version 1); `implode` rebuilds
+//! its Extension Table from the chains and codecs and checks the recorded
+//! hash. A compact (`\x89PTWC`) container gives a [`CompactRegistryManifest`]
+//! (`"ptwm-manifest-c"`, version 2) that lists the table entries, the
+//! registry chains (a bound Source has `params_b64` `null`) and the tensors in
+//! body order; `implode` writes them back as listed. Readers that predate the
+//! compact manifest reject it on its format and version. Tensor manifests
+//! have the same form for both layouts. `implode` with a subset of the tensor
+//! manifests writes a container of those tensors with the archive-wide
+//! tables, so each tensor decodes as in the full container.
+//!
 //! The encoder may build a container transiently in memory; the stored artifact
 //! (WebDataset shard / LMDB exploded value) never contains one.
 
@@ -24,10 +36,13 @@ use std::io::Cursor;
 use crate::chain::graph::{Chain, ChainEdge, ChainNode, TerminalRef};
 use crate::codec::{CodecId, StateSource};
 use crate::container::{
-    BuiltExtensionTable, ChainRegistry, CodecSet, ContainerReader, ContainerWriter,
-    build_extension_table, encode_registry_for_table,
+    BuiltExtensionTable, ChainRegistry, CodecSet, ContainerLayout, ContainerReader,
+    ContainerWriter, build_extension_table, encode_registry_for_table,
 };
 use crate::error::PtwmCoreError;
+use crate::extension::compact_table::{
+    CompactEntry, TAG_CODEC, TAG_FULL, TAG_NAMED, TAG_OP, classify, read_compact_table,
+};
 use crate::extension::{CURRENT_BUILTIN_VERSION, CanonicalId, ExtensionTable};
 use crate::header::FLAG_PTWX;
 use crate::layout::PlaneLayout;
@@ -41,6 +56,7 @@ use crate::tensor_record::{
 use crate::transforms::op::OpId;
 use crate::types::PlaneRole;
 use crate::types::role::Role;
+use crate::varint::write_varint;
 
 use manifest::*;
 
@@ -303,14 +319,12 @@ fn extension_table_bytes<'a>(
 
 // ── Explode ───────────────────────────────────────────────────────────────────
 
-/// Parse a `.ptwm` container into a registry manifest, per-tensor manifests,
-/// and loose binary members.
+/// Parse a `.ptwm` container (either layout) into a registry manifest,
+/// per-tensor manifests in body order, and loose binary members.
 pub fn explode(blob: &[u8]) -> Result<Exploded, PtwmCoreError> {
     let reader = ContainerReader::open_partial(blob)?;
-    if reader.layout != crate::container::ContainerLayout::Legacy {
-        return Err(err(
-            "compact (\\x89PTWC) containers are not supported by the transcoder yet",
-        ));
+    if reader.layout == ContainerLayout::Compact {
+        return explode_compact(&reader);
     }
     let embedded_wasm = reader.header.flags & FLAG_PTWX != 0;
     if embedded_wasm {
@@ -322,35 +336,15 @@ pub fn explode(blob: &[u8]) -> Result<Exploded, PtwmCoreError> {
     let mut members: Vec<(String, Vec<u8>)> = Vec::new();
 
     // Shared state → registry + members.
-    let mut shared_state: Vec<SharedStateEntry> = Vec::with_capacity(reader.prelude.len());
-    for entry in &reader.prelude {
-        let payload = shared_state_key(entry.shared_state_id);
-        members.push((payload.clone(), entry.state_bytes.clone()));
-        shared_state.push(SharedStateEntry {
-            id: entry.shared_state_id,
-            codec: entry.codec_id.as_u16(),
-            state_format_version: entry.state_format_version,
-            applies_to_mask: entry.applies_to_mask,
-            hash_xxh64: format!("{:016x}", entry.state_xxhash64),
-            name: entry.name.clone(),
-            payload,
-        });
-    }
+    let shared_state = shared_state_to_manifest(&reader.prelude, &mut members);
 
     // Chains → registry + op projection.
-    let mut chains: Vec<ChainEntry> = Vec::with_capacity(reader.chain_registry.chains.len());
+    let chains = chains_to_manifest(&reader.chain_registry);
     let mut op_ids: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
-    for (id, chain) in &reader.chain_registry.chains {
-        let (nodes, edges, terminals) = chain_to_json(chain);
+    for (_, chain) in &reader.chain_registry.chains {
         for n in &chain.nodes {
             op_ids.insert(n.op.as_u16());
         }
-        chains.push(ChainEntry {
-            id: *id,
-            nodes,
-            edges,
-            terminals,
-        });
     }
 
     // File order = ascending tensor offset.
@@ -507,6 +501,147 @@ pub fn explode(blob: &[u8]) -> Result<Exploded, PtwmCoreError> {
     })
 }
 
+/// Project the shared-state prelude to manifest entries, moving each state
+/// into a member.
+fn shared_state_to_manifest(
+    prelude: &[PreludeEntry],
+    members: &mut Vec<(String, Vec<u8>)>,
+) -> Vec<SharedStateEntry> {
+    prelude
+        .iter()
+        .map(|entry| {
+            let payload = shared_state_key(entry.shared_state_id);
+            members.push((payload.clone(), entry.state_bytes.clone()));
+            SharedStateEntry {
+                id: entry.shared_state_id,
+                codec: entry.codec_id.as_u16(),
+                state_format_version: entry.state_format_version,
+                applies_to_mask: entry.applies_to_mask,
+                hash_xxh64: format!("{:016x}", entry.state_xxhash64),
+                name: entry.name.clone(),
+                payload,
+            }
+        })
+        .collect()
+}
+
+/// Project the chain registry to manifest entries, in registry order.
+fn chains_to_manifest(registry: &ChainRegistry) -> Vec<ChainEntry> {
+    registry
+        .chains
+        .iter()
+        .map(|(id, chain)| {
+            let (nodes, edges, terminals) = chain_to_json(chain);
+            ChainEntry {
+                id: *id,
+                nodes,
+                edges,
+                terminals,
+            }
+        })
+        .collect()
+}
+
+/// Project one Extension Table entry to its compact manifest form.
+fn extension_entry_to_json(
+    entry: &crate::extension::ExtensionTableEntry,
+) -> Result<ExtensionEntryJson, PtwmCoreError> {
+    Ok(match classify(entry)? {
+        CompactEntry::Op(op) => ExtensionEntryJson::Op(op.as_u16()),
+        CompactEntry::Codec(c) => ExtensionEntryJson::Codec(c.as_u16()),
+        CompactEntry::Named(name) => ExtensionEntryJson::Named(name.to_owned()),
+        CompactEntry::Full(e) => ExtensionEntryJson::FullB64(base64::encode(&e.to_bytes()?)),
+    })
+}
+
+/// Rebuild the Extension Table of a compact manifest. The entries are
+/// encoded as a compact table and parsed back, so the manifest gets every
+/// check the compact reader applies (unknown ids and names, duplicates,
+/// built-in ids in full entries, canonical entry bytes).
+fn extension_table_from_json(
+    entries: &[ExtensionEntryJson],
+) -> Result<ExtensionTable, PtwmCoreError> {
+    let mut bytes = Vec::new();
+    write_varint(&mut bytes, entries.len() as u64);
+    for entry in entries {
+        match entry {
+            ExtensionEntryJson::Op(id) => {
+                bytes.push(TAG_OP);
+                write_varint(&mut bytes, u64::from(*id));
+            }
+            ExtensionEntryJson::Codec(id) => {
+                bytes.push(TAG_CODEC);
+                write_varint(&mut bytes, u64::from(*id));
+            }
+            ExtensionEntryJson::Named(name) => {
+                bytes.push(TAG_NAMED);
+                write_varint(&mut bytes, name.len() as u64);
+                bytes.extend_from_slice(name.as_bytes());
+            }
+            ExtensionEntryJson::FullB64(b64) => {
+                let entry = base64::decode(b64)
+                    .ok_or_else(|| err("extension_table full_b64 not valid base64"))?;
+                bytes.push(TAG_FULL);
+                write_varint(&mut bytes, entry.len() as u64);
+                bytes.extend_from_slice(&entry);
+            }
+        }
+    }
+    read_compact_table(&bytes).map_err(|e| err(format!("registry.extension_table: {e}")))
+}
+
+/// [`explode`] for the compact layout (`\x89PTWC`).
+///
+/// The compact reader accepts only canonical encodings, so writing the
+/// parsed tables, prelude, registry and records again (as [`implode`] does)
+/// reproduces the file. Tensors come in body order.
+fn explode_compact(reader: &ContainerReader<'_>) -> Result<Exploded, PtwmCoreError> {
+    let mut members: Vec<(String, Vec<u8>)> = Vec::new();
+    let shared_state = shared_state_to_manifest(&reader.prelude, &mut members);
+    let chains = chains_to_manifest(&reader.chain_registry);
+    let extension_table = reader
+        .extension_table
+        .entries
+        .iter()
+        .map(extension_entry_to_json)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let records = reader.tensor_records()?;
+    let mut tensors: Vec<ExplodedTensor> = Vec::with_capacity(records.len());
+    for (file_idx, record) in records.iter().enumerate() {
+        let sample_key = format!("{file_idx:06}");
+        let tm = tensor_to_manifest(record, &sample_key, &mut members)?;
+        let value = serde_json::to_value(&tm)
+            .map_err(|e| err(format!("serialize tensor manifest: {e}")))?;
+        tensors.push(ExplodedTensor {
+            name: record.name.clone(),
+            key: sample_key,
+            manifest_json: jcs::to_string(&value)?,
+        });
+    }
+
+    let registry = CompactRegistryManifest {
+        ptwm_format: PTWM_MANIFEST_FORMAT_COMPACT.to_string(),
+        manifest_version: MANIFEST_VERSION_COMPACT,
+        container_flags: CompactContainerFlags {
+            embedded_wasm: false,
+            layout: LAYOUT_COMPACT.to_string(),
+        },
+        registry: CompactRegistry {
+            extension_table,
+            shared_state,
+            chains,
+        },
+    };
+    let registry_value =
+        serde_json::to_value(&registry).map_err(|e| err(format!("serialize registry: {e}")))?;
+    Ok(Exploded {
+        registry_json: jcs::to_string(&registry_value)?,
+        tensors,
+        members,
+    })
+}
+
 /// Fold any inline-chain ops into the op projection so `registry.ops` is a
 /// superset of every op referenced anywhere in the archive.
 fn check_no_inline_chain_ops(record: &TensorRecord, op_ids: &mut std::collections::BTreeSet<u16>) {
@@ -650,7 +785,9 @@ fn tensor_to_manifest(
 // ── Implode ───────────────────────────────────────────────────────────────────
 
 /// Reconstruct a `.ptwm` container from a registry manifest, per-tensor
-/// manifests (in file order), and loose binary members.
+/// manifests (in file order), and loose binary members. The registry
+/// manifest's `ptwm_format` and `manifest_version` select the layout; any
+/// other pair is rejected.
 pub fn implode(
     registry_json: &str,
     tensor_jsons: &[String],
@@ -662,11 +799,20 @@ pub fn implode(
         .map_err(|e| err(format!("parse registry manifest: {e}")))?;
     let format = value.get("ptwm_format").and_then(|v| v.as_str());
     let version = value.get("manifest_version").and_then(|v| v.as_u64());
-    if format != Some(PTWM_MANIFEST_FORMAT) || version != Some(u64::from(MANIFEST_VERSION)) {
-        return Err(err(format!(
-            "unsupported manifest: ptwm_format {format:?}, manifest_version {version:?} \
-             (this reader handles {PTWM_MANIFEST_FORMAT:?} version {MANIFEST_VERSION})"
-        )));
+    match (format, version) {
+        (Some(PTWM_MANIFEST_FORMAT), Some(v)) if v == u64::from(MANIFEST_VERSION) => {}
+        (Some(PTWM_MANIFEST_FORMAT_COMPACT), Some(v))
+            if v == u64::from(MANIFEST_VERSION_COMPACT) =>
+        {
+            return implode_compact(value, tensor_jsons, members);
+        }
+        _ => {
+            return Err(err(format!(
+                "unsupported manifest: ptwm_format {format:?}, manifest_version {version:?} \
+                 (this reader handles {PTWM_MANIFEST_FORMAT:?} version {MANIFEST_VERSION} \
+                 and {PTWM_MANIFEST_FORMAT_COMPACT:?} version {MANIFEST_VERSION_COMPACT})"
+            )));
+        }
     }
     let registry: RegistryManifest =
         serde_json::from_value(value).map_err(|e| err(format!("parse registry manifest: {e}")))?;
@@ -683,44 +829,9 @@ pub fn implode(
         .as_deref()
         .unwrap_or(CURRENT_BUILTIN_VERSION);
 
-    // Rebuild the shared-state prelude (order preserved).
-    let mut prelude_entries: Vec<PreludeEntry> =
-        Vec::with_capacity(registry.registry.shared_state.len());
-    for s in &registry.registry.shared_state {
-        // Materialize the (potentially large) state bytes here — this copy now
-        // runs with the GIL released (the caller borrows the Python buffers).
-        let state_bytes = members
-            .remove(&s.payload)
-            .ok_or_else(|| err(format!("missing shared-state member {:?}", s.payload)))?
-            .to_vec();
-        prelude_entries.push(PreludeEntry {
-            shared_state_id: s.id,
-            codec_id: CodecId::from_u16(s.codec)
-                .ok_or_else(|| err(format!("unknown shared-state codec id {:#06x}", s.codec)))?,
-            state_format_version: s.state_format_version,
-            applies_to_mask: s.applies_to_mask,
-            state_xxhash64: u64::from_str_radix(&s.hash_xxh64, 16)
-                .map_err(|_| err("shared-state hash_xxh64 not valid hex"))?,
-            name: s.name.clone(),
-            state_bytes,
-        });
-    }
-
-    // Rebuild the chain registry (order preserved).
-    let mut chain_registry = ChainRegistry::new();
-    for c in &registry.registry.chains {
-        chain_registry
-            .chains
-            .push((c.id, chain_from_json(&c.nodes, &c.edges, &c.terminals)?));
-    }
-
-    // Rebuild each tensor record.
-    let mut records: Vec<TensorRecord> = Vec::with_capacity(tensor_jsons.len());
-    for json in tensor_jsons {
-        let tm: TensorManifest =
-            serde_json::from_str(json).map_err(|e| err(format!("parse tensor manifest: {e}")))?;
-        records.push(record_from_manifest(&tm, &mut members)?);
-    }
+    let prelude_entries = prelude_from_manifest(&registry.registry.shared_state, &mut members)?;
+    let chain_registry = chains_from_manifest(&registry.registry.chains)?;
+    let records = records_from_manifests(tensor_jsons, &mut members)?;
 
     // Re-drive the deterministic container writer.
     let mut cursor = Cursor::new(Vec::<u8>::new());
@@ -775,6 +886,100 @@ pub fn implode(
         writer.finalize()?;
     }
     Ok(cursor.into_inner())
+}
+
+/// [`implode`] for a compact-layout manifest: writes the Extension Table,
+/// registry and tensor order of the manifest verbatim in the compact layout.
+fn implode_compact(
+    value: serde_json::Value,
+    tensor_jsons: &[String],
+    mut members: HashMap<String, &[u8]>,
+) -> Result<Vec<u8>, PtwmCoreError> {
+    let registry: CompactRegistryManifest =
+        serde_json::from_value(value).map_err(|e| err(format!("parse registry manifest: {e}")))?;
+    if registry.container_flags.embedded_wasm {
+        return Err(err("embedded WASM needs the legacy layout"));
+    }
+    if registry.container_flags.layout != LAYOUT_COMPACT {
+        return Err(err(format!(
+            "container_flags.layout {:?} in a {PTWM_MANIFEST_FORMAT_COMPACT:?} manifest \
+             (expected {LAYOUT_COMPACT:?})",
+            registry.container_flags.layout
+        )));
+    }
+    let table = extension_table_from_json(&registry.registry.extension_table)?;
+    let prelude_entries = prelude_from_manifest(&registry.registry.shared_state, &mut members)?;
+    let chain_registry = chains_from_manifest(&registry.registry.chains)?;
+    let records = records_from_manifests(tensor_jsons, &mut members)?;
+
+    let mut cursor = Cursor::new(Vec::<u8>::new());
+    {
+        let mut writer = ContainerWriter::with_layout(&mut cursor, ContainerLayout::Compact)?;
+        writer.set_prelude(&prelude_entries)?;
+        // The table and registry are written as listed. The table is
+        // archive-wide, so a one-tensor implode keeps every plane's
+        // `codec_table_idx` valid.
+        writer.set_compact_tables(table, chain_registry)?;
+        for record in &records {
+            writer.append_tensor(record)?;
+        }
+        writer.finalize()?;
+    }
+    Ok(cursor.into_inner())
+}
+
+/// Rebuild the shared-state prelude (order preserved), taking each state
+/// out of `members`.
+fn prelude_from_manifest(
+    shared_state: &[SharedStateEntry],
+    members: &mut HashMap<String, &[u8]>,
+) -> Result<Vec<PreludeEntry>, PtwmCoreError> {
+    let mut prelude_entries: Vec<PreludeEntry> = Vec::with_capacity(shared_state.len());
+    for s in shared_state {
+        // Materialize the (potentially large) state bytes here — this copy now
+        // runs with the GIL released (the caller borrows the Python buffers).
+        let state_bytes = members
+            .remove(&s.payload)
+            .ok_or_else(|| err(format!("missing shared-state member {:?}", s.payload)))?
+            .to_vec();
+        prelude_entries.push(PreludeEntry {
+            shared_state_id: s.id,
+            codec_id: CodecId::from_u16(s.codec)
+                .ok_or_else(|| err(format!("unknown shared-state codec id {:#06x}", s.codec)))?,
+            state_format_version: s.state_format_version,
+            applies_to_mask: s.applies_to_mask,
+            state_xxhash64: u64::from_str_radix(&s.hash_xxh64, 16)
+                .map_err(|_| err("shared-state hash_xxh64 not valid hex"))?,
+            name: s.name.clone(),
+            state_bytes,
+        });
+    }
+    Ok(prelude_entries)
+}
+
+/// Rebuild the chain registry (order preserved).
+fn chains_from_manifest(chains: &[ChainEntry]) -> Result<ChainRegistry, PtwmCoreError> {
+    let mut chain_registry = ChainRegistry::new();
+    for c in chains {
+        chain_registry
+            .chains
+            .push((c.id, chain_from_json(&c.nodes, &c.edges, &c.terminals)?));
+    }
+    Ok(chain_registry)
+}
+
+/// Rebuild each tensor record, taking its members out of `members`.
+fn records_from_manifests(
+    tensor_jsons: &[String],
+    members: &mut HashMap<String, &[u8]>,
+) -> Result<Vec<TensorRecord>, PtwmCoreError> {
+    let mut records: Vec<TensorRecord> = Vec::with_capacity(tensor_jsons.len());
+    for json in tensor_jsons {
+        let tm: TensorManifest =
+            serde_json::from_str(json).map_err(|e| err(format!("parse tensor manifest: {e}")))?;
+        records.push(record_from_manifest(&tm, members)?);
+    }
+    Ok(records)
 }
 
 fn record_from_manifest(

@@ -76,10 +76,14 @@ def write_lmdb(
     map_size: int = _DEFAULT_MAP_SIZE,
     method_hint: int = 3,
     chains_per_tensor: list[list[bytes]] | None = None,
+    container_layout: str = "legacy",
 ) -> Path:
     """Write ``tensors`` into an LMDB environment at ``path``.
 
-    ``layout`` is ``"blob"`` (default) or ``"exploded"``. Returns ``path``.
+    ``layout`` is ``"blob"`` (default) or ``"exploded"``. ``container_layout``
+    (``"legacy"`` or ``"compact"``) selects the container layout of the
+    per-tensor blobs (blob layout) or of the registry manifest the tensors are
+    rebuilt from (exploded layout). Returns ``path``.
     """
     if layout not in ("blob", "exploded"):
         msg = f"unknown LMDB layout {layout!r} (expected 'blob' or 'exploded')"
@@ -88,7 +92,10 @@ def write_lmdb(
     lmdb = _require_lmdb()
     path = Path(path)
     blob = compress_ptwm_blob(
-        tensors, chains_per_tensor=chains_per_tensor, method_hint=method_hint
+        tensors,
+        chains_per_tensor=chains_per_tensor,
+        method_hint=method_hint,
+        container_layout=container_layout,
     )
     model = explode_model(blob)
 
@@ -359,13 +366,15 @@ class LmdbWeightStore:
         *,
         delta_reference: str | None = None,
         method_hint: int = 3,
+        container_layout: str = "legacy",
     ) -> None:
         """Atomically insert or replace tensor ``name`` (blob layout only).
 
         When ``delta_reference`` names another tensor already in the store, the
         new tensor is stored as an XOR residual against it (a ``local_tensor``
         reference with BLAKE3 verification), turning small per-step changes into
-        small diffs.
+        small diffs. ``container_layout`` (``"legacy"`` or ``"compact"``)
+        selects the layout of the stored one-tensor container.
         """
         if self._readonly:
             msg = "store opened read-only; reopen with readonly=False to mutate"
@@ -392,7 +401,9 @@ class LmdbWeightStore:
             stored, store_shape, store_dtype = raw, shape, dtype
 
         blob = compress_ptwm_blob(
-            [(name, stored, store_dtype, store_shape)], method_hint=method_hint
+            [(name, stored, store_dtype, store_shape)],
+            method_hint=method_hint,
+            container_layout=container_layout,
         )
         entry["comp_size"] = len(blob)
         with self._env.begin(write=True) as txn:

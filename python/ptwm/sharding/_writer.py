@@ -40,14 +40,17 @@ def compress_ptwm_blob(
     emit_payload_hash: bool = True,
     emit_plane_crc: bool = True,
     streaming_chunk: int | None = None,
+    container_layout: str = "legacy",
 ) -> bytes:
-    """Compress ``tensors`` into a single in-memory ``.ptwm`` container blob.
+    r"""Compress ``tensors`` into a single in-memory ``.ptwm`` container blob.
 
     ``tensors`` is a sequence of ``(name, raw_bytes, dtype, shape)``.
     ``chains_per_tensor`` — one list of chain wire-byte blobs per tensor;
     each blob is produced by ``Chain.to_bytes()``. When ``None``, chains are
     auto-derived from each tensor's dtype via the STANDARD production table.
     ``method_hint``: 1=HUFFMAN, 2=ZSTD, 3=MICROSCALE, 4=RANS, 5=IDENTITY.
+    ``container_layout``: ``"legacy"`` (``\x89PTWM``) or ``"compact"``
+    (``\x89PTWC``).
     """
     records = []
     auto_chains: list[list[bytes]] = []
@@ -77,6 +80,7 @@ def compress_ptwm_blob(
         emit_plane_crc,
         method_hint,
         streaming_chunk,
+        container_layout=container_layout,
     )
 
 
@@ -89,6 +93,7 @@ def write_ptwm_shard(
     emit_payload_hash: bool = True,
     emit_plane_crc: bool = True,
     streaming_chunk: int | None = None,
+    container_layout: str = "legacy",
 ) -> None:
     """Write a single ``.ptwm`` container holding ``tensors``.
 
@@ -101,5 +106,6 @@ def write_ptwm_shard(
         emit_payload_hash=emit_payload_hash,
         emit_plane_crc=emit_plane_crc,
         streaming_chunk=streaming_chunk,
+        container_layout=container_layout,
     )
     Path(out_path).write_bytes(blob)

@@ -48,6 +48,32 @@ def test_framing_accepts_names() -> None:
 
 
 @pytest.mark.parametrize(
+    ("framing", "magic"),
+    [
+        ("compact", COMPACT),
+        ("COMPACT", COMPACT),
+        (1, COMPACT),
+        ("container", CONTAINER),
+        (2, CONTAINER),
+    ],
+)
+def test_config_coerces_framing(framing, magic: bytes) -> None:
+    """A framing name or value selects the same output as the enum.
+
+    The config once kept the raw value, which never equalled
+    ``Framing.COMPACT``, so ``framing="compact"`` wrote a full container.
+    """
+    cfg = _torch_cfg(framing=framing)
+    assert isinstance(cfg.framing, Framing)
+    assert Compressor(cfg).compress(torch.randn(64))[:5] == magic
+
+
+def test_config_rejects_unknown_framing() -> None:
+    with pytest.raises(ValueError, match="bogus"):
+        _torch_cfg(framing="bogus")
+
+
+@pytest.mark.parametrize(
     ("layout", "magic"),
     [
         (None, CONTAINER),

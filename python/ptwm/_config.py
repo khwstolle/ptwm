@@ -190,6 +190,11 @@ class CompressionConfig:
             object.__setattr__(
                 self, "container_layout", ContainerLayout(self.container_layout)
             )
+        # The same for framing ("compact" / "container", or the int value).
+        # Without it, a string never equals Framing.COMPACT and the output is
+        # silently a full container.
+        if not isinstance(self.framing, Framing):
+            object.__setattr__(self, "framing", Framing(self.framing))
 
     @classmethod
     def from_resolved_policy(

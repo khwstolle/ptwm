@@ -29,7 +29,7 @@ from ptwm.stores._common import (
     shared_member_keys,
     tensor_member_keys,
 )
-from ptwm.stores._lmdb import KEY_REG
+from ptwm.stores._lmdb import KEY_FMT, KEY_REG
 from ptwm.stores._webdataset import INDEX_NAME, SHARDMETA_MEMBER
 
 MAGIC = {"legacy": b"\x89PTWM", "compact": b"\x89PTWC"}
@@ -157,7 +157,9 @@ def test_lmdb_put_tensor_in_either_layout(tmp_path, raw_of):
     new = torch.arange(8, dtype=torch.float32)
     step = new + 1
     with LmdbWeightStore.open(path, readonly=False) as store:
-        store.put_tensor("w", raw_of(new), torch.float32, (8,))
+        store.put_tensor(
+            "w", raw_of(new), torch.float32, (8,), container_layout="legacy"
+        )
         assert store._get(b"t/w")[:5] == MAGIC["legacy"]
         store.put_tensor(
             "v", raw_of(new), torch.float32, (8,), container_layout="compact"
@@ -176,6 +178,44 @@ def test_lmdb_put_tensor_in_either_layout(tmp_path, raw_of):
         assert torch.equal(store.get_tensor("w"), new)
         assert torch.equal(store.get_tensor("v"), new)
         assert torch.equal(store.get_tensor("d"), step)
+
+
+@pytest.mark.parametrize("layout", ["legacy", "compact"])
+def test_lmdb_put_tensor_inherits_store_layout(tmp_path, raw_of, layout):
+    # put_tensor without container_layout uses the layout the store was
+    # written with, so a compact store does not silently gain legacy blobs.
+    tensors = [("w", raw_of(torch.zeros(8).float()), torch.float32, (8,))]
+    path = tmp_path / "m.lmdb"
+    write_lmdb(path, tensors, layout="blob", container_layout=layout)
+
+    new = torch.arange(8, dtype=torch.float32)
+    with LmdbWeightStore.open(path, readonly=False) as store:
+        fmt = json.loads(store._get(KEY_FMT))
+        if layout == "legacy":
+            # The legacy fmt record is unchanged from earlier releases.
+            assert "container_layout" not in fmt
+        else:
+            assert fmt["container_layout"] == "compact"
+        store.put_tensor("w", raw_of(new), torch.float32, (8,))
+        store.put_tensor("d", raw_of(new + 1), torch.float32, (8,), delta_reference="w")
+        assert store._get(b"t/w")[:5] == MAGIC[layout]
+        assert store._get(b"t/d")[:5] == MAGIC[layout]
+    # The layout survives a reopen.
+    with LmdbWeightStore.open(path, readonly=False) as store:
+        store.put_tensor("v", raw_of(new), torch.float32, (8,))
+        assert store._get(b"t/v")[:5] == MAGIC[layout]
+    with LmdbWeightStore.open(path) as store:
+        assert torch.equal(store.get_tensor("w"), new)
+        assert torch.equal(store.get_tensor("v"), new)
+        assert torch.equal(store.get_tensor("d"), new + 1)
+
+
+def test_compress_model_unknown_layout_raises_ptwm_error():
+    # The public wrapper translates the binding's ValueError to ptwm.Error.
+    with pytest.raises(Error, match="container_layout"):
+        _rust.compress_model([], [], True, True, container_layout="bogus")
+    with pytest.raises(ValueError, match="container_layout"):
+        _rust._ext.compress_model([], [], True, True, container_layout="bogus")
 
 
 # ── WebDataset ────────────────────────────────────────────────────────────────

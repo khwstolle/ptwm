@@ -78,12 +78,14 @@ def write_lmdb(
     chains_per_tensor: list[list[bytes]] | None = None,
     container_layout: str = "legacy",
 ) -> Path:
-    """Write ``tensors`` into an LMDB environment at ``path``.
+    r"""Write ``tensors`` into an LMDB environment at ``path``.
 
     ``layout`` is ``"blob"`` (default) or ``"exploded"``. ``container_layout``
     (``"legacy"`` or ``"compact"``) selects the container layout of the
     per-tensor blobs (blob layout) or of the registry manifest the tensors are
-    rebuilt from (exploded layout). Returns ``path``.
+    rebuilt from (exploded layout). A ``"compact"`` store records the layout
+    in its ``\x00fmt`` record so that later :meth:`LmdbWeightStore.put_tensor`
+    calls use it; a ``"legacy"`` store's record is unchanged. Returns ``path``.
     """
     if layout not in ("blob", "exploded"):
         msg = f"unknown LMDB layout {layout!r} (expected 'blob' or 'exploded')"
@@ -102,16 +104,16 @@ def write_lmdb(
     env = lmdb.open(str(path), map_size=map_size, subdir=True)
     try:
         with env.begin(write=True) as txn:
-            txn.put(
-                KEY_FMT,
-                jcs_canonicalize(
-                    {
-                        "ptwm_format": LMDB_FORMAT,
-                        "manifest_version": 1,
-                        "layout": layout,
-                    }
-                ).encode("utf-8"),
-            )
+            fmt_obj: dict[str, Any] = {
+                "ptwm_format": LMDB_FORMAT,
+                "manifest_version": 1,
+                "layout": layout,
+            }
+            # Recorded only for the compact layout: a legacy store's record
+            # stays byte-identical to the one older releases write.
+            if container_layout != "legacy":
+                fmt_obj["container_layout"] = container_layout
+            txn.put(KEY_FMT, jcs_canonicalize(fmt_obj).encode("utf-8"))
             if layout == "blob":
                 _write_blob_layout(txn, model)
             else:
@@ -220,6 +222,8 @@ class LmdbWeightStore:
             msg = f"{self._path}: not a {LMDB_FORMAT} environment"
             raise ValueError(msg)
         self._layout = fmt_obj["layout"]
+        # Stores written before the field existed hold legacy blobs.
+        self._container_layout = fmt_obj.get("container_layout", "legacy")
         idx = self._get(KEY_IDX)
         self._index = json.loads(idx) if idx is not None else {"weight_map": {}}
         self._weight_map = dict(self._index.get("weight_map", {}))
@@ -366,7 +370,7 @@ class LmdbWeightStore:
         *,
         delta_reference: str | None = None,
         method_hint: int = 3,
-        container_layout: str = "legacy",
+        container_layout: str | None = None,
     ) -> None:
         """Atomically insert or replace tensor ``name`` (blob layout only).
 
@@ -374,7 +378,9 @@ class LmdbWeightStore:
         new tensor is stored as an XOR residual against it (a ``local_tensor``
         reference with BLAKE3 verification), turning small per-step changes into
         small diffs. ``container_layout`` (``"legacy"`` or ``"compact"``)
-        selects the layout of the stored one-tensor container.
+        selects the layout of the stored one-tensor container; ``None``
+        (default) uses the layout the store was written with (see
+        :func:`write_lmdb`), or ``"legacy"`` for a store that records none.
         """
         if self._readonly:
             msg = "store opened read-only; reopen with readonly=False to mutate"
@@ -400,6 +406,8 @@ class LmdbWeightStore:
         else:
             stored, store_shape, store_dtype = raw, shape, dtype
 
+        if container_layout is None:
+            container_layout = self._container_layout
         blob = compress_ptwm_blob(
             [(name, stored, store_dtype, store_shape)],
             method_hint=method_hint,

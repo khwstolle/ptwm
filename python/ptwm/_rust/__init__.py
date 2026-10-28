@@ -208,7 +208,8 @@ def compress_model(
     empty intersection on a plane raises ``InvalidContainer``.
     ``container_layout``: ``"legacy"`` writes ``\x89PTWM`` (readable by every
     release), ``"compact"`` writes ``\x89PTWC`` (readable by v1.2 and later).
-    Other values raise ``ValueError``.
+    Other values raise :class:`ptwm.Error` (the binding's ``ValueError``
+    passes through ``translate_errors``).
     """
     return bytes(
         _ext.compress_model(

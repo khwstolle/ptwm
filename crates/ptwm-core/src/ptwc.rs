@@ -16,7 +16,8 @@
 //!                               field, then the Extension Table, prelude and
 //!                               registry bytes
 //! REGISTRY
-//!     count           varint    at most 32768
+//!     count           varint    at most 32768 (0x8000), so chain ids are
+//!                               0..=0x7FFF (container::MAX_CHAIN_ID)
 //!     chain × count   varint chain_len, then a CW2 chain (chain::wire_compact)
 //!                     whose op_ref is an Extension Table index of a
 //!                     built-in transform; chain id = position
@@ -36,6 +37,12 @@
 //! must consume all of it. Integers are little-endian and varints are
 //! canonical unsigned LEB128 ([`crate::varint`]), so each file has one
 //! encoding for what it holds.
+//!
+//! The registry limit is the same as the legacy `ChainRegistry` limit: the
+//! largest chain id is 0x7FFF, so a registry holds at most 0x8000 chains.
+//! Synthesis section 2 writes "count ≤ 0x7FFF"; this layout reads that as
+//! the bound on chain ids, so a model that fits the legacy registry also
+//! fits the compact one.
 //!
 //! There is no version field. A future layout change sets an `hflags` bit,
 //! which current readers reject.

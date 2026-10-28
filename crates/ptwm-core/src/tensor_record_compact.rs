@@ -60,11 +60,19 @@
 //! ([`bound_source_params`]). An inline chain binds its Source to the
 //! record the same way as the `\x89PTWS` frame does.
 //!
-//! **Derived fields.** The in-memory `flags`, `chain_ref` (`0x8000` for an
-//! inline chain), `payload_len`, and each plane's `codec_id` (from the
-//! Extension Table entry its `codec_ref` names) are not stored. The writer
-//! rejects a record whose stored values disagree with them, so each record
-//! has one encoding and parsing then writing gives the same bytes.
+//! **Derived fields.** The in-memory `chain_ref` (`0x8000` for an inline
+//! chain), `payload_len`, and each plane's `codec_id` (from the Extension
+//! Table entry its `codec_ref` names) are not stored. The writer rejects a
+//! record whose values disagree with what the reader derives, so each
+//! record has one encoding and parsing then writing gives the same bytes.
+//!
+//! The in-memory `flags` byte is not stored either. Like the legacy writer
+//! ([`crate::tensor_record::write_tensor_record`]), the compact writer
+//! ignores it and the reader recomputes it from `payload_hash`,
+//! `dependencies` and `tensor_metadata`. A record whose `flags` disagree
+//! with those fields (for example a legacy record parsed with the
+//! dependency bit set and no dependencies) therefore reads back with the
+//! derived flags.
 
 use crate::chain::Chain;
 use crate::chain::wire_compact::{read_chain_compact_exact, write_chain_compact};
@@ -962,6 +970,22 @@ mod tests {
         // tflags, chain, dtype, format, size, n_planes; pflags, role, codec,
         // payload_len, payload.
         assert_eq!(bytes, [0, 0, 1, 2, 16, 1, 0, 1, 1, 4, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn in_memory_flags_are_recomputed_not_stored() {
+        // The writer ignores `flags`, as the legacy writer does, and the
+        // reader derives them, so stale or unknown bits never reach the wire.
+        for rec in [record(), rich_record()] {
+            let want = encode(&rec);
+            for flags in [0x00, 0xFF, TENSOR_FLAG_DEPENDENCIES, rec.flags ^ 0x07] {
+                let mut odd = rec.clone();
+                odd.flags = flags;
+                assert_eq!(encode(&odd), want, "flags {flags:#04x}");
+                let back = parse_compact_record(&want, &ctx()).unwrap();
+                assert_eq!(back.flags, rec.flags);
+            }
+        }
     }
 
     #[test]

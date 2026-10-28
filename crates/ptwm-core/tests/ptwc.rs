@@ -17,6 +17,8 @@ use ptwm_core::chain::{Chain, ChainEdge, ChainNode, TerminalRef};
 use ptwm_core::compressor::{CompressorOptions, InputTensor, compress_model};
 use ptwm_core::container::{ContainerLayout, ContainerReader, ContainerWriter};
 use ptwm_core::header::{HEADER_LEN, Header, MAGIC_PTWC};
+use ptwm_core::tensor_record::TensorRecord;
+use ptwm_core::tensor_record_compact::TF_RAW_META;
 use ptwm_core::transforms::op::OpId;
 use ptwm_core::types::{Role, ScaleFormat, ValueFormat};
 
@@ -526,6 +528,177 @@ fn duplicate_names_are_rejected_and_lookup_is_exact() {
     }
 }
 
+/// Rewrite the compact or legacy container `blob` in the compact layout,
+/// applying `f` to each record first.
+fn rewrite_compact(blob: &[u8], mut f: impl FnMut(&mut TensorRecord)) -> Vec<u8> {
+    let reader = ContainerReader::open(blob).expect("open");
+    let mut out = Vec::new();
+    let mut w =
+        ContainerWriter::with_layout(Cursor::new(&mut out), ContainerLayout::Compact).unwrap();
+    w.set_prelude(&reader.prelude).unwrap();
+    w.set_compact_tables(
+        reader.extension_table.clone(),
+        reader.chain_registry.clone(),
+    )
+    .unwrap();
+    for mut rec in reader.tensor_records().unwrap() {
+        f(&mut rec);
+        w.append_tensor(&rec).unwrap();
+    }
+    w.finalize().unwrap();
+    out
+}
+
+/// A BYTE-input fp32 tensor: no shape metadata, an exact Source over the
+/// raw byte count (the P4-fixed Python byte path).
+fn byte_input_blob(hash: bool, crc: bool) -> (Vec<u8>, Vec<u8>) {
+    let mut rng = Rng(0xB7E);
+    let t = fp32("model.raw", vec![32], &mut rng);
+    let input = InputTensor {
+        name: t.name.clone(),
+        candidate_chains: vec![t.chain.clone()],
+        dtype_code: t.dtype_code,
+        input_format: 1,
+        raw_bytes: &t.bytes,
+        shape: None,
+        dtype_name: None,
+        delta_reference_blake3: None,
+    };
+    let mut out = Cursor::new(Vec::new());
+    compress_model(
+        &mut out,
+        &[input],
+        options(hash, crc, None, ContainerLayout::Compact),
+    )
+    .expect("compress_model");
+    (out.into_inner(), t.bytes)
+}
+
+#[test]
+fn byte_input_tensor_round_trips_in_the_compact_layout() {
+    for (hash, crc) in [(true, true), (false, false)] {
+        let (blob, raw) = byte_input_blob(hash, crc);
+        let reader = ContainerReader::open(&blob).unwrap();
+        assert_eq!(reader.layout, ContainerLayout::Compact);
+        let rec = reader.tensor_record("model.raw").unwrap();
+        assert_eq!(rec.input_format, 1);
+        assert!(rec.tensor_metadata.is_none());
+        assert_eq!(reader.tensor_shape("model.raw").unwrap(), None);
+        assert_eq!(reader.decode_tensor("model.raw").unwrap(), raw);
+        assert!(to_compact(&blob) == blob, "rewrite differs");
+    }
+}
+
+#[test]
+fn raw_cbor_metadata_round_trips_in_a_compact_container() {
+    // Metadata that is not the canonical shape map is stored as TF_RAW_META
+    // and must come back byte for byte. The tensor uses an explicit
+    // registry chain, so its Source does not depend on the metadata.
+    let (blob, raw) = byte_input_blob(true, true);
+    let metas: [&[u8]; 3] = [
+        // {"a": 1}
+        &[0xA1, 0x61, b'a', 0x01],
+        // Shape map with a non-canonical (two-byte) length for the shape.
+        &[
+            0xA2, 0x65, b's', b'h', b'a', b'p', b'e', 0x98, 0x01, 0x18, 0x20, 0x65, b'd', b't',
+            b'y', b'p', b'e', 0x67, b'f', b'l', b'o', b'a', b't', b'3', b'2',
+        ],
+        // Arbitrary bytes, not CBOR at all.
+        &[0xFF, 0x00, 0x13],
+    ];
+    for meta in metas {
+        let compact = rewrite_compact(&blob, |rec| {
+            rec.tensor_metadata = Some(meta.to_vec());
+            rec.flags |= ptwm_core::tensor_record::TENSOR_FLAG_METADATA;
+        });
+        let reader = ContainerReader::open(&compact).unwrap();
+        let rec = reader.tensor_record("model.raw").unwrap();
+        assert_eq!(rec.tensor_metadata.as_deref(), Some(meta));
+        let bytes = reader.get_tensor_record_bytes("model.raw").unwrap();
+        assert_ne!(bytes[0] & TF_RAW_META, 0, "stored as TF_RAW_META");
+        assert_eq!(reader.decode_tensor("model.raw").unwrap(), raw);
+        assert!(to_compact(&compact) == compact, "rewrite differs");
+    }
+}
+
+#[test]
+fn external_state_plane_round_trips_in_a_compact_container() {
+    // The reader does not resolve external state at open time; the record
+    // and the file must still round-trip exactly.
+    use ptwm_core::codec::StateSource;
+    use ptwm_core::plane_record::ExternalStateRef;
+    let data = feature_tensors();
+    let blob = compress(&data, options(true, true, None, ContainerLayout::Compact));
+    let target = "model.norm.weight";
+    let ext = ExternalStateRef {
+        ref_kind: 1,
+        expected_hash: Some([0x5A; 32]),
+        ref_bytes: b"dict/zstd-v1.bin".to_vec(),
+        state_format_version: 3,
+    };
+    let compact = rewrite_compact(&blob, |rec| {
+        if rec.name == target {
+            let p = &mut rec.terminals[0];
+            p.state_source = StateSource::External;
+            p.state_version = 0;
+            p.state_info = 0;
+            p.inline_state_bytes.clear();
+            p.external_state = Some(ext.clone());
+        }
+    });
+    let reader = ContainerReader::open(&compact).unwrap();
+    let rec = reader.tensor_record(target).unwrap();
+    assert_eq!(rec.terminals[0].state_source, StateSource::External);
+    assert_eq!(rec.terminals[0].external_state.as_ref(), Some(&ext));
+    assert!(to_compact(&compact) == compact, "rewrite differs");
+    // The other tensors are unaffected.
+    for t in data.iter().filter(|t| t.name != target) {
+        assert_eq!(
+            reader.decode_tensor(&t.name).unwrap(),
+            t.bytes,
+            "{}",
+            t.name
+        );
+    }
+}
+
+#[test]
+fn compact_source_of_4_gib_fails_without_allocating() {
+    // Shape metadata that declares [1 << 30] fp32 (4 GiB) binds the
+    // registry chain's Source to 4 GiB for a 256-byte tensor. Decoding must
+    // fail on the size check, not try to size buffers from the chain.
+    use ptwm_core::metadata::encode_shape_metadata;
+    let mut rng = Rng(0xB0B);
+    let one = vec![fp32("t", vec![64], &mut rng)];
+    let blob = compress(&one, options(true, true, None, ContainerLayout::Compact));
+    assert_eq!(
+        ContainerReader::open(&blob)
+            .unwrap()
+            .chain_registry
+            .chains
+            .len(),
+        1
+    );
+    let bomb = rewrite_compact(&blob, |rec| {
+        rec.tensor_metadata = Some(encode_shape_metadata(&[1 << 30], "float32"));
+        rec.orig_size = 4 << 30;
+    });
+    let reader = ContainerReader::open(&bomb).unwrap();
+    assert_eq!(reader.tensor_shape("t").unwrap().unwrap().0, vec![1 << 30]);
+    let check = |err: String, t0: std::time::Instant| {
+        eprintln!("4 GiB Source: {err}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1), "{err}");
+        assert!(
+            err.contains("1073741824") || err.contains("Source declares"),
+            "{err}"
+        );
+    };
+    let t0 = std::time::Instant::now();
+    check(reader.decode_tensor("t").unwrap_err().to_string(), t0);
+    let t0 = std::time::Instant::now();
+    check(reader.decode_model().unwrap_err().to_string(), t0);
+}
+
 // ── Size bounds (synthesis section 9 item 14) ─────────────────────────────
 
 /// Bytes of a compact file that are not plane payload, inline state or
@@ -589,6 +762,15 @@ fn compact_overhead_bounds() {
     assert!(ob <= 100.0, "case B: {ob:.1} B/tensor");
     assert!(obare <= 70.0, "no hash/CRC: {obare:.1} B/tensor");
     assert!(oa < olegacy / 2.0, "compact {oa:.1} vs legacy {olegacy:.1}");
+
+    // A single tensor pays the whole fixed overhead (header, tables,
+    // registry, index, footer) alone.
+    let mut rng = Rng(0x51);
+    let one = vec![fp32("model.bias", vec![64], &mut rng)];
+    let single = compress(&one, options(true, true, None, ContainerLayout::Compact));
+    let osingle = overhead_per_tensor(&single);
+    eprintln!("single-tensor overhead: {osingle:.0} B");
+    assert!(osingle <= 160.0, "single tensor: {osingle:.0} B");
 
     // A built-in-only Extension Table costs at most 4 B per entry.
     let reader = ContainerReader::open(&a).unwrap();

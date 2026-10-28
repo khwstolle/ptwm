@@ -120,25 +120,17 @@ pub fn classify(entry: &ExtensionTableEntry) -> Result<CompactEntry<'_>, PtwmCor
 
 /// Append the compact encoding of `table` to `out`. On error `out` is left
 /// unchanged.
-pub fn write_compact_table(
-    table: &ExtensionTable,
-    out: &mut Vec<u8>,
-) -> Result<(), PtwmCoreError> {
+pub fn write_compact_table(table: &ExtensionTable, out: &mut Vec<u8>) -> Result<(), PtwmCoreError> {
     let n = table.entries.len() as u64;
     if n > MAX_COMPACT_ENTRIES {
-        return Err(err(format_args!(
-            "{n} entries (max {MAX_COMPACT_ENTRIES})"
-        )));
+        return Err(err(format_args!("{n} entries (max {MAX_COMPACT_ENTRIES})")));
     }
     let mut buf = Vec::with_capacity(1 + 3 * table.entries.len());
     write_varint(&mut buf, n);
     let mut seen = HashSet::with_capacity(table.entries.len());
     for entry in &table.entries {
         if !seen.insert(entry.canonical_id) {
-            return Err(err(format_args!(
-                "duplicate entry {:?}",
-                entry.human_label
-            )));
+            return Err(err(format_args!("duplicate entry {:?}", entry.human_label)));
         }
         match classify(entry)? {
             CompactEntry::Op(op) => {
@@ -174,7 +166,10 @@ pub fn compact_table_bytes(table: &ExtensionTable) -> Result<Vec<u8>, PtwmCoreEr
 }
 
 /// The built-in entry for a wire id or name, or an error naming `what`.
-fn builtin_by_name(name: &str, what: impl std::fmt::Display) -> Result<ExtensionTableEntry, PtwmCoreError> {
+fn builtin_by_name(
+    name: &str,
+    what: impl std::fmt::Display,
+) -> Result<ExtensionTableEntry, PtwmCoreError> {
     builtin_registry()
         .entry_by_name(name)
         .cloned()
@@ -187,7 +182,8 @@ fn read_entry(r: &mut Cursor<'_>) -> Result<ExtensionTableEntry, PtwmCoreError> 
     match tag {
         TAG_OP => {
             let id = r.varint_max(u64::from(u16::MAX), "op id")? as u16;
-            let op = OpId::from_u16(id).map_err(|_| r.err(format_args!("unknown op id {id:#06x}")))?;
+            let op =
+                OpId::from_u16(id).map_err(|_| r.err(format_args!("unknown op id {id:#06x}")))?;
             builtin_by_name(op.builtin_name(), format_args!("op {op:?}"))
         }
         TAG_CODEC => {
@@ -205,7 +201,8 @@ fn read_entry(r: &mut Cursor<'_>) -> Result<ExtensionTableEntry, PtwmCoreError> 
                 return Err(r.err("empty built-in name"));
             }
             let bytes = r.take(len as usize)?;
-            let name = std::str::from_utf8(bytes).map_err(|_| r.err("built-in name is not UTF-8"))?;
+            let name =
+                std::str::from_utf8(bytes).map_err(|_| r.err("built-in name is not UTF-8"))?;
             let reg = builtin_registry();
             let id = reg
                 .id_for_entry_name(name)
@@ -368,9 +365,15 @@ mod tests {
         rejects(&[1, 0x04, 0], "unknown entry tag");
         rejects(&[1, TAG_OP, 0x7F], "unknown op id");
         rejects(&[1, TAG_CODEC, 0x7F], "unknown codec id");
-        rejects(&[1, TAG_NAMED, 3, b'f', b'o', b'o'], "unknown built-in name");
+        rejects(
+            &[1, TAG_NAMED, 3, b'f', b'o', b'o'],
+            "unknown built-in name",
+        );
         // huffman_nibble has a codec id but no built-in entry.
-        rejects(&[1, TAG_CODEC, CodecId::HuffmanNibble.as_u16() as u8], "no built-in entry");
+        rejects(
+            &[1, TAG_CODEC, CodecId::HuffmanNibble.as_u16() as u8],
+            "no built-in entry",
+        );
         // A named entry for a built-in that has a wire id.
         rejects(&[1, TAG_NAMED, 4, b'z', b's', b't', b'd'], "non-canonical");
         // Duplicates.

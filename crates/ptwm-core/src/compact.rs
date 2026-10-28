@@ -602,6 +602,7 @@ mod tests {
             forced_codec: None,
             allow_codec_ids: None,
             chunk_size: None,
+            ..Default::default()
         }
     }
 

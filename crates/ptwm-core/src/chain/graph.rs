@@ -3,13 +3,13 @@
 use crate::transforms::op::OpId;
 use crate::types::role::Role;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChainNode {
     pub op: OpId,
     pub params: Vec<u8>, // op-specific TLV payload (encoded by Op::write_params)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChainEdge {
     pub src_node: u8,
     pub src_output_idx: u8,
@@ -19,14 +19,14 @@ pub struct ChainEdge {
     pub vendor_bytes: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TerminalRef {
     pub node_idx: u8,
     pub output_idx: u8,
     pub role: Role,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Chain {
     pub nodes: Vec<ChainNode>,
     pub edges: Vec<ChainEdge>,

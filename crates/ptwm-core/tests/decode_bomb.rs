@@ -124,6 +124,7 @@ fn opts(chunk_size: Option<u32>) -> CompressorOptions {
         forced_codec: Some(CodecId::Zstd),
         allow_codec_ids: None,
         chunk_size,
+        ..Default::default()
     }
 }
 

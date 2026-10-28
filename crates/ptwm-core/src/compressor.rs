@@ -5,6 +5,7 @@
 //! capability-keyed [`dispatch`] menu, fits Pass-2 shared state on the
 //! chosen terminals, and writes a chain-registry-backed `.ptwm` container.
 
+use std::collections::HashMap;
 use std::io::{Seek, Write};
 use std::sync::Arc;
 
@@ -16,7 +17,7 @@ use crate::chain::runtime::{ForwardContext, chain_source_descriptor, forward_cha
 use crate::chain::validate::validate_chain;
 use crate::codec::{CodecId, StateSource, codec_for};
 use crate::codecs::order1_scale_ac;
-use crate::container::{ChainRegistry, ContainerWriter};
+use crate::container::{ChainRegistry, ContainerLayout, ContainerWriter};
 use crate::dispatch::dispatch;
 use crate::error::PtwmCoreError;
 use crate::extension::CanonicalId;
@@ -27,7 +28,8 @@ use crate::plane_record::PlaneRecord;
 use crate::prelude::PreludeEntry;
 use crate::select::{MenuItem, TrialResult, trial_encode_plane};
 use crate::tensor_record::{Dependency, RefKind, TENSOR_FLAG_PAYLOAD_HASH, TensorRecord};
-use crate::transforms::op::Plane;
+use crate::tensor_record_compact::record_binding;
+use crate::transforms::op::{OpId, Plane};
 use crate::types::PlaneRole;
 use crate::types::descriptor::{ElementWidth, Layout, PlaneDescriptor};
 use crate::types::role::{NibbleKind, Role};
@@ -87,7 +89,9 @@ pub struct InputTensor<'a> {
     pub delta_reference_blake3: Option<[u8; 32]>,
 }
 
-/// Compressor options.
+/// Compressor options. `Default` gives no hint, no hash or CRC, dispatcher
+/// codec selection, whole planes and the legacy container layout.
+#[derive(Default)]
 pub struct CompressorOptions {
     /// Header hint to readers about the dominant codec.
     pub method_hint: u16,
@@ -105,6 +109,8 @@ pub struct CompressorOptions {
     pub allow_codec_ids: Option<Vec<CodecId>>,
     /// When `Some`, encode each plane in fixed-size chunks.
     pub chunk_size: Option<u32>,
+    /// On-disk layout of the written container.
+    pub container_layout: ContainerLayout,
 }
 
 // ---------------------------------------------------------------------------
@@ -664,24 +670,38 @@ fn build_chain_registry_with_limit(
     max_chains: usize,
 ) -> Result<(ChainRegistry, Vec<u16>), PtwmCoreError> {
     let mut registry: Vec<(u16, Chain)> = Vec::new();
+    let mut ids: HashMap<&Chain, u16> = HashMap::with_capacity(chains.len());
     let mut tensor_to_idx: Vec<u16> = Vec::with_capacity(chains.len());
     for c in chains {
-        let existing = registry.iter().position(|(_, rc)| rc == c);
-        match existing {
-            Some(pos) => tensor_to_idx.push(pos as u16),
-            None => {
-                if registry.len() >= max_chains {
-                    return Err(PtwmCoreError::InvalidContainer(format!(
-                        "compress_model: more than {max_chains} distinct chains"
-                    )));
-                }
-                let new_id = registry.len() as u16;
-                registry.push((new_id, c.clone()));
-                tensor_to_idx.push(new_id);
-            }
+        if let Some(&id) = ids.get(c) {
+            tensor_to_idx.push(id);
+            continue;
         }
+        if registry.len() >= max_chains {
+            return Err(PtwmCoreError::InvalidContainer(format!(
+                "compress_model: more than {max_chains} distinct chains"
+            )));
+        }
+        let new_id = registry.len() as u16;
+        ids.insert(c, new_id);
+        registry.push((new_id, c.clone()));
+        tensor_to_idx.push(new_id);
     }
     Ok((ChainRegistry { chains: registry }, tensor_to_idx))
+}
+
+/// Replace the Source params of `chain` with empty params (a bound Source,
+/// see [`crate::chain::wire_compact::write_chain_compact_deferred`]) when
+/// they equal `binding`, the params the tensor record's shape gives. The
+/// compact layout then stores one registry chain for tensors that differ
+/// only in shape.
+fn bind_source(chain: &mut Chain, binding: Option<&[u8]>) {
+    if let (Some(node), Some(params)) = (chain.nodes.first_mut(), binding)
+        && node.op == OpId::Source
+        && node.params == params
+    {
+        node.params.clear();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -946,14 +966,30 @@ pub fn compress_model<W: Write + Seek>(
     }
     // ---- Pass 4: write container. -----------------------------------------
     // Build a deduped chain registry from the chosen chain per tensor.
+    let tensor_metadata: Vec<Option<Vec<u8>>> = inputs
+        .iter()
+        .map(|inp| match (&inp.shape, &inp.dtype_name) {
+            (Some(shape), Some(name)) => Some(encode_shape_metadata(shape, name)),
+            _ => None,
+        })
+        .collect();
+    let compact = opts.container_layout == ContainerLayout::Compact;
     let chosen_chains: Vec<Chain> = pass1
         .iter()
         .zip(inputs.iter())
-        .map(|(outcome, inp)| inp.candidate_chains[outcome.chain_idx].clone())
+        .zip(tensor_metadata.iter())
+        .map(|((outcome, inp), meta)| {
+            let mut chain = inp.candidate_chains[outcome.chain_idx].clone();
+            if compact {
+                let binding = record_binding(meta.as_deref(), inp.dtype_code);
+                bind_source(&mut chain, binding.as_deref());
+            }
+            chain
+        })
         .collect();
     let (registry, tensor_chain_indices) = build_chain_registry(&chosen_chains)?;
 
-    let mut writer = ContainerWriter::new(writer)?;
+    let mut writer = ContainerWriter::with_layout(writer, opts.container_layout)?;
     writer.set_prelude(&prelude_entries)?;
     // Intern only the codecs the planes reference: interning every built-in
     // codec costs about 125 B per unused entry, which dominates small files.
@@ -1007,6 +1043,7 @@ pub fn compress_model<W: Write + Seek>(
 
     prof!(prof_t, "pass4_chunked_encode");
 
+    let mut tensor_metadata = tensor_metadata;
     let mut tensor_records: Vec<TensorRecord> = Vec::with_capacity(inputs.len());
     for (idx, inp) in inputs.iter().enumerate() {
         let chosen_planes = &chosen_per_tensor[idx];
@@ -1080,11 +1117,6 @@ pub fn compress_model<W: Write + Seek>(
             None
         };
 
-        let tensor_metadata = match (&inp.shape, &inp.dtype_name) {
-            (Some(shape), Some(name)) => Some(encode_shape_metadata(shape, name)),
-            _ => None,
-        };
-
         let dependencies: Vec<Dependency> = match inp.delta_reference_blake3 {
             Some(hash) => vec![Dependency {
                 ref_kind: RefKind::ExternalSafetensors,
@@ -1105,26 +1137,20 @@ pub fn compress_model<W: Write + Seek>(
             payload_hash,
             inline_chain: None,
             dependencies,
-            tensor_metadata,
+            tensor_metadata: tensor_metadata[idx].take(),
             terminals: plane_records,
         };
         tensor_records.push(rec);
     }
 
     // Serialize tensor records (the payload-copy-heavy step) in parallel —
-    // write_tensor_record is pure per record — then append the finished byte
-    // blocks sequentially, which is all the ordered writer needs to do.
+    // encoding is pure per record — then append the finished byte blocks
+    // sequentially, which is all the ordered writer needs to do. The encoder
+    // writes the writer's layout.
+    let encoder = writer.record_encoder();
     let serialized: Vec<Vec<u8>> = tensor_records
         .par_iter()
-        .map(|rec| {
-            // Pre-size to the plane payloads (the dominant term) plus headroom
-            // for record/plane metadata, so the large payload copies don't
-            // repeatedly reallocate.
-            let est: usize = rec.terminals.iter().map(|t| t.payload_bytes.len()).sum();
-            let mut buf = Vec::with_capacity(est + 1024);
-            crate::tensor_record::write_tensor_record(rec, &mut buf)?;
-            Ok::<Vec<u8>, PtwmCoreError>(buf)
-        })
+        .map(|rec| encoder.encode(rec))
         .collect::<Result<Vec<_>, _>>()?;
     for (rec, buf) in tensor_records.iter().zip(serialized.iter()) {
         writer.append_serialized_tensor(&rec.name, buf)?;
@@ -1371,6 +1397,7 @@ mod tests {
                 forced_codec: None,
                 allow_codec_ids: None,
                 chunk_size: None,
+                ..Default::default()
             },
         )
         .expect("compress succeeds");
@@ -1445,6 +1472,7 @@ mod tests {
             forced_codec: None,
             allow_codec_ids: None,
             chunk_size: None,
+            ..Default::default()
         };
         let input = |chains: Vec<Chain>| InputTensor {
             name: "t".into(),
@@ -1565,6 +1593,7 @@ mod tests {
                 forced_codec: Some(CodecId::Rans),
                 allow_codec_ids: None,
                 chunk_size: Some(512), // small → multiple chunks per plane
+                ..Default::default()
             },
         )
         .expect("compress succeeds");
@@ -1684,6 +1713,7 @@ mod tests {
                 forced_codec: None,
                 allow_codec_ids: None,
                 chunk_size: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1771,6 +1801,7 @@ mod tests {
                 forced_codec: None,
                 allow_codec_ids: None,
                 chunk_size: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1853,6 +1884,7 @@ mod tests {
                 forced_codec: None,
                 allow_codec_ids: None,
                 chunk_size: None,
+                ..Default::default()
             },
         )
         .unwrap();

@@ -15,15 +15,17 @@ use crate::chain::wire_compact::{bind_deferred_source, has_deferred_source};
 use crate::codec::CodecId;
 use crate::error::PtwmCoreError;
 use crate::extension::{CanonicalId, ExtensionTable, ExtensionTableBuilder};
-use crate::header::{ContainerMagic, HEADER_LEN, Header, MAGIC_PTWC, MAGIC_PTWM, MAGIC_PTWX, sniff};
-use crate::tensor_record_compact::{
-    RecordContext, parse_compact_record, plane_codec_ids, record_binding, write_compact_record,
+use crate::header::{
+    ContainerMagic, HEADER_LEN, Header, MAGIC_PTWC, MAGIC_PTWM, MAGIC_PTWX, sniff,
 };
 use crate::index::{
     EOF_SENTINEL, IndexEntry, name_hash, parse_index, verify_eof_sentinel, write_index,
 };
 use crate::prelude::{PreludeEntry, parse_prelude, write_prelude};
 use crate::tensor_record::{TensorRecord, write_tensor_record_with_builtin_version};
+use crate::tensor_record_compact::{
+    RecordContext, parse_compact_record, plane_codec_ids, record_binding, write_compact_record,
+};
 
 // ── Chain registry ────────────────────────────────────────────────────────────
 
@@ -294,9 +296,7 @@ fn compact_registry_bytes(
         reg.id_for_entry_name(op.builtin_name())
             .and_then(|id| index.get(&id).copied())
             .ok_or_else(|| {
-                PtwmCoreError::InvalidContainer(format!(
-                    "op {op:?} is not in the extension table"
-                ))
+                PtwmCoreError::InvalidContainer(format!("op {op:?} is not in the extension table"))
             })
     })
 }
@@ -370,8 +370,9 @@ impl RecordEncoder {
                     codec_ids: &self.codec_ids,
                     registry_bound: &self.registry_bound,
                 };
-                write_compact_record(rec, &ctx, out)
-                    .map_err(|e| PtwmCoreError::InvalidContainer(format!("tensor '{}': {e}", rec.name)))
+                write_compact_record(rec, &ctx, out).map_err(|e| {
+                    PtwmCoreError::InvalidContainer(format!("tensor '{}': {e}", rec.name))
+                })
             }
         }
     }
@@ -818,15 +819,9 @@ impl<W: Write + Seek> ContainerWriter<W> {
         let et = crate::extension::compact_table::compact_table_bytes(&self.extension_table)?;
         let mut prelude = Vec::new();
         write_prelude(&self.prelude_entries, &mut prelude)?;
-        let registry = if self.chain_registry_bytes.is_empty() {
-            crate::ptwc::write_registry(&self.chain_registry, |op| {
-                Err(PtwmCoreError::InvalidContainer(format!(
-                    "op {op:?} is not in the extension table"
-                )))
-            })?
-        } else {
-            self.chain_registry_bytes.clone()
-        };
+        // Encode the registry against the final table: the table may have
+        // been replaced after the registry was set.
+        let registry = compact_registry_bytes(&self.chain_registry, &self.extension_table)?;
         let header = crate::ptwc::header_bytes(&et, &prelude, &registry);
         for part in [&header, &et, &prelude, &registry] {
             self.writer
@@ -1190,8 +1185,7 @@ fn check_extensions(
                 // short-circuit anyway, but skip the lookup entirely.
                 continue;
             }
-            let Some((pubkey, contrib_idx)) =
-                lookup_author_pubkey(&entry.canonical_id, &installed)
+            let Some((pubkey, contrib_idx)) = lookup_author_pubkey(&entry.canonical_id, &installed)
             else {
                 // No matching installed manifest — MissingFlavor already
                 // accounts for this entry. If skip_missing is true we keep
@@ -1568,6 +1562,14 @@ impl<'a> ContainerReader<'a> {
         Ok(rec)
     }
 
+    /// Every tensor record with its name, in body (file) order.
+    pub fn tensor_records(&self) -> Result<Vec<TensorRecord>, PtwmCoreError> {
+        self.entries_in_body_order()
+            .into_iter()
+            .map(|e| self.entry_record(e))
+            .collect()
+    }
+
     /// Index entries in body (file) order.
     fn entries_in_body_order(&self) -> Vec<&IndexEntry> {
         let mut entries: Vec<&IndexEntry> = self.index.iter().collect();
@@ -1882,8 +1884,7 @@ impl<'a> ContainerReader<'a> {
                             "chunk table decodes to more than {plane_bound} bytes (or, in \
                              a compact container, not to the plane's {} bytes) for a \
                              {}-byte tensor",
-                            descriptor.length_bytes,
-                            rec.orig_size
+                            descriptor.length_bytes, rec.orig_size
                         ))
                     })? as usize;
                 let decoded_chunks: Vec<Vec<u8>> = chunks
@@ -3023,6 +3024,7 @@ mod tests {
                 forced_codec: None,
                 allow_codec_ids: None,
                 chunk_size: None,
+                ..Default::default()
             },
         )
         .expect("compress succeeds");
@@ -3076,6 +3078,7 @@ mod tests {
                 forced_codec: Some(CodecId::Rans),
                 allow_codec_ids: None,
                 chunk_size: Some(256),
+                ..Default::default()
             },
         )
         .expect("compress succeeds");
@@ -3126,6 +3129,7 @@ mod tests {
                 forced_codec: None,
                 allow_codec_ids: None,
                 chunk_size: None,
+                ..Default::default()
             },
         )
         .expect("compress succeeds");
@@ -3269,6 +3273,7 @@ mod tests {
                 forced_codec: Some(crate::codec::CodecId::Identity),
                 allow_codec_ids: None,
                 chunk_size: None,
+                ..Default::default()
             },
         )
         .expect("compress succeeds");
@@ -3670,6 +3675,7 @@ label = "test-author"
                 forced_codec: None,
                 allow_codec_ids: None,
                 chunk_size: None,
+                ..Default::default()
             },
         )
         .expect("compress succeeds");
@@ -3734,6 +3740,7 @@ label = "test-author"
                 forced_codec: Some(CodecId::Identity),
                 allow_codec_ids: None,
                 chunk_size,
+                ..Default::default()
             },
         )
         .unwrap();

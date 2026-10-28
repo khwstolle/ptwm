@@ -3,7 +3,7 @@
 
 use crate::error::PtwmCoreError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ScaleFormat {
     E8M0,
     E4M3,
@@ -36,7 +36,7 @@ impl ScaleFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValueFormat {
     Fp4E2m1,
     IntN { bits: u8 },
@@ -75,7 +75,7 @@ impl ValueFormat {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NibbleKind {
     Exponent,
     SignMantissa,
@@ -102,7 +102,7 @@ impl NibbleKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResidualFormat {
     Xor,
     FloatDelta { dtype: u16 },
@@ -142,7 +142,7 @@ impl ResidualFormat {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Role {
     Scale { format: ScaleFormat },
     Value { format: ValueFormat },

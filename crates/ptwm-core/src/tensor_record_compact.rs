@@ -72,9 +72,7 @@ use crate::codec::{CodecId, StateSource};
 use crate::dtype::canonical_dtype_name;
 use crate::error::PtwmCoreError;
 use crate::extension::compact_table::{read_compact_table, write_compact_table};
-use crate::extension::{
-    BuiltinKind, ExtensionTable, Kind, builtin_registry, dispatch_builtin,
-};
+use crate::extension::{BuiltinKind, ExtensionTable, Kind, builtin_registry, dispatch_builtin};
 use crate::layout::PlaneLayout;
 use crate::metadata::{decode_shape_metadata, encode_shape_metadata};
 use crate::plane_record::{ChunkEntry, ExternalStateRef, PlaneRecord};
@@ -168,7 +166,8 @@ fn classify_meta(meta: Option<&[u8]>, dtype_code: u16) -> Meta<'_> {
         Ok((shape, name))
             if shape.len() <= MAX_NDIM && encode_shape_metadata(&shape, &name) == m =>
         {
-            let stored_name = (canonical_dtype_name(dtype_code) != Some(name.as_str())).then_some(name);
+            let stored_name =
+                (canonical_dtype_name(dtype_code) != Some(name.as_str())).then_some(name);
             Meta::Shape { shape, stored_name }
         }
         _ => Meta::Raw(m),
@@ -227,7 +226,10 @@ fn write_unchecked(
         )));
     }
     if rec.terminals.len() as u64 > MAX_PLANES {
-        return Err(err(format_args!("{} planes (max {MAX_PLANES})", rec.terminals.len())));
+        return Err(err(format_args!(
+            "{} planes (max {MAX_PLANES})",
+            rec.terminals.len()
+        )));
     }
     if rec.dependencies.len() > u16::MAX as usize {
         return Err(err(format_args!(
@@ -510,7 +512,9 @@ pub fn parse_compact_record(
         let n = ctx.registry_bound.len() as u64;
         let id = r.varint()?;
         if id >= n {
-            return Err(r.err(format_args!("chain id {id} is not in the registry ({n} chains)")));
+            return Err(r.err(format_args!(
+                "chain id {id} is not in the registry ({n} chains)"
+            )));
         }
         Some(id as usize)
     };
@@ -532,8 +536,7 @@ pub fn parse_compact_record(
         let canonical = canonical_dtype_name(dtype_code);
         let name: String = if tflags & TF_DTYPE_NAME != 0 {
             let bytes = r.len_bytes()?;
-            let name =
-                std::str::from_utf8(bytes).map_err(|_| r.err("dtype name is not UTF-8"))?;
+            let name = std::str::from_utf8(bytes).map_err(|_| r.err("dtype name is not UTF-8"))?;
             if canonical == Some(name) {
                 return Err(r.err("stored dtype name equals the canonical name (non-canonical)"));
             }
@@ -578,8 +581,8 @@ pub fn parse_compact_record(
 
     let inline_chain = if inline {
         let et_bytes = r.len_bytes()?;
-        let table = read_compact_table(et_bytes)
-            .map_err(|e| r.err(format_args!("inline chain: {e}")))?;
+        let table =
+            read_compact_table(et_bytes).map_err(|e| r.err(format_args!("inline chain: {e}")))?;
         let ops: Vec<OpId> = table
             .entries
             .iter()
@@ -759,7 +762,9 @@ fn read_plane(r: &mut Cursor<'_>, ctx: &RecordContext<'_>) -> Result<PlaneRecord
         let ref_kind = r.u8()?;
         let flags = r.u8()?;
         if flags & !DEP_FLAG_HASH != 0 {
-            return Err(r.err(format_args!("unknown external state flag bits {flags:#04x}")));
+            return Err(r.err(format_args!(
+                "unknown external state flag bits {flags:#04x}"
+            )));
         }
         let len = r.varint_max(u64::from(u16::MAX), "external state ref length")? as usize;
         let ref_bytes = r.take(len)?.to_vec();
@@ -795,4 +800,444 @@ fn read_plane(r: &mut Cursor<'_>, ctx: &RecordContext<'_>) -> Result<PlaneRecord
         payload_bytes,
         layout,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chain::{ChainEdge, ChainNode, TerminalRef};
+    use crate::types::Role;
+
+    const CODEC_IDS: &[Option<CodecId>] = &[None, Some(CodecId::Zstd), Some(CodecId::Identity)];
+    /// Chain 0 is explicit, chain 1 has a bound Source.
+    const BOUND: &[bool] = &[false, true];
+
+    fn ctx() -> RecordContext<'static> {
+        RecordContext {
+            codec_ids: CODEC_IDS,
+            registry_bound: BOUND,
+        }
+    }
+
+    fn plane(payload: &[u8]) -> PlaneRecord {
+        PlaneRecord {
+            role: PlaneRole::Value,
+            codec_id: CodecId::Zstd,
+            codec_table_idx: 1,
+            state_source: StateSource::None,
+            state_version: 0,
+            state_info: 0,
+            payload_len: payload.len() as u64,
+            crc32: None,
+            chunk_table: None,
+            external_state: None,
+            inline_state_bytes: Vec::new(),
+            payload_bytes: payload.to_vec(),
+            layout: PlaneLayout::Flat,
+        }
+    }
+
+    fn record() -> TensorRecord {
+        TensorRecord {
+            chain_ref: 0,
+            dtype_code: 1,
+            input_format: 2,
+            flags: 0,
+            orig_size: 16,
+            name: String::new(),
+            payload_hash: None,
+            inline_chain: None,
+            dependencies: Vec::new(),
+            tensor_metadata: None,
+            terminals: vec![plane(&[1, 2, 3, 4])],
+        }
+    }
+
+    /// A record with every optional field.
+    fn rich_record() -> TensorRecord {
+        let mut inline = plane(&[9; 7]);
+        inline.state_source = StateSource::Inline;
+        inline.inline_state_bytes = vec![5; 3];
+        inline.state_version = 2;
+        inline.layout = PlaneLayout::rows(32).unwrap();
+        inline.crc32 = Some(0xDEAD_BEEF);
+        let mut shared = plane(&[1; 20]);
+        shared.state_source = StateSource::Shared;
+        shared.state_info = 300;
+        shared.role = PlaneRole::Scale;
+        shared.chunk_table = Some(vec![
+            ChunkEntry {
+                offset_in_payload: 0,
+                decoded_size: 70_000,
+            },
+            ChunkEntry {
+                offset_in_payload: 10,
+                decoded_size: 5,
+            },
+        ]);
+        let mut external = plane(&[]);
+        external.codec_id = CodecId::Identity;
+        external.codec_table_idx = 2;
+        external.state_source = StateSource::External;
+        external.external_state = Some(ExternalStateRef {
+            ref_kind: 3,
+            expected_hash: Some([4; 32]),
+            ref_bytes: b"ref".to_vec(),
+            state_format_version: 7,
+        });
+        TensorRecord {
+            flags: TENSOR_FLAG_PAYLOAD_HASH | TENSOR_FLAG_DEPENDENCIES | TENSOR_FLAG_METADATA,
+            payload_hash: Some(0x0123_4567_89AB_CDEF),
+            dependencies: vec![
+                Dependency {
+                    ref_kind: RefKind::ExternalSafetensors,
+                    expected_hash: Some([1; 32]),
+                    ref_bytes: Vec::new(),
+                },
+                Dependency {
+                    ref_kind: RefKind::LocalTensor,
+                    expected_hash: None,
+                    ref_bytes: b"other".to_vec(),
+                },
+            ],
+            // Not the shape map: stored as raw metadata.
+            tensor_metadata: Some(vec![0xA0]),
+            terminals: vec![inline, shared, external],
+            ..record()
+        }
+    }
+
+    fn encode(rec: &TensorRecord) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_compact_record(rec, &ctx(), &mut out).unwrap();
+        out
+    }
+
+    fn round_trip(rec: &TensorRecord) -> Vec<u8> {
+        let bytes = encode(rec);
+        let back = parse_compact_record(&bytes, &ctx()).unwrap();
+        assert_eq!(&back, rec);
+        assert_eq!(encode(&back), bytes);
+        bytes
+    }
+
+    fn rejects(bytes: &[u8], needle: &str) {
+        let msg = parse_compact_record(bytes, &ctx()).unwrap_err().to_string();
+        assert!(msg.contains(needle), "{needle:?} not in {msg:?}");
+    }
+
+    fn fp32_chain(source_params: Vec<u8>) -> Chain {
+        Chain {
+            nodes: vec![
+                ChainNode {
+                    op: OpId::Source,
+                    params: source_params,
+                },
+                ChainNode {
+                    op: OpId::ByteSplit,
+                    params: vec![4],
+                },
+            ],
+            edges: vec![ChainEdge {
+                src_node: 0,
+                src_output_idx: 0,
+                dst_node: 1,
+                dst_input_idx: 0,
+                role_override: None,
+                vendor_bytes: Vec::new(),
+            }],
+            terminals: (0..4)
+                .map(|i| TerminalRef {
+                    node_idx: 1,
+                    output_idx: i,
+                    role: Role::Raw,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn minimal_record_is_a_few_bytes() {
+        let bytes = round_trip(&record());
+        // tflags, chain, dtype, format, size, n_planes; pflags, role, codec,
+        // payload_len, payload.
+        assert_eq!(bytes, [0, 0, 1, 2, 16, 1, 0, 1, 1, 4, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn every_optional_field_round_trips() {
+        let bytes = round_trip(&rich_record());
+        assert_eq!(bytes[0], TF_PAYLOAD_HASH | TF_DEPS | TF_RAW_META, "tflags");
+    }
+
+    #[test]
+    fn shape_metadata_is_stored_as_a_shape() {
+        let mut rec = record();
+        rec.flags = TENSOR_FLAG_METADATA;
+        rec.tensor_metadata = Some(encode_shape_metadata(&[2, 2], "float32"));
+        let bytes = round_trip(&rec);
+        assert_eq!(bytes[0], TF_SHAPE);
+        // A dtype name other than the canonical one is stored.
+        rec.tensor_metadata = Some(encode_shape_metadata(&[2, 2], "my_float"));
+        let bytes = round_trip(&rec);
+        assert_eq!(bytes[0], TF_SHAPE | TF_DTYPE_NAME);
+        // 0-d tensors keep their empty shape.
+        rec.tensor_metadata = Some(encode_shape_metadata(&[], "float32"));
+        round_trip(&rec);
+        // More than MAX_NDIM dimensions fall back to raw metadata.
+        rec.tensor_metadata = Some(encode_shape_metadata(&[1; MAX_NDIM + 1], "float32"));
+        assert_eq!(round_trip(&rec)[0], TF_RAW_META);
+    }
+
+    #[test]
+    fn inline_chain_binds_its_source_to_the_shape() {
+        let params = bound_source_params(&[2, 2], 1).unwrap();
+        let mut rec = record();
+        rec.chain_ref = CHAIN_REF_INLINE_BIT;
+        rec.inline_chain = Some(fp32_chain(params.clone()));
+        rec.flags = TENSOR_FLAG_METADATA;
+        rec.tensor_metadata = Some(encode_shape_metadata(&[2, 2], "float32"));
+        let bound = round_trip(&rec);
+        // Without shape metadata the Source params are stored.
+        rec.flags = 0;
+        rec.tensor_metadata = None;
+        let explicit = round_trip(&rec);
+        assert!(explicit.len() > bound.len() + params.len() - 4);
+    }
+
+    #[test]
+    fn bound_registry_chain_needs_a_binding_shape() {
+        let mut rec = record();
+        rec.chain_ref = 1;
+        let mut out = Vec::new();
+        let msg = write_compact_record(&rec, &ctx(), &mut out)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("bound Source"), "{msg}");
+        assert!(out.is_empty());
+        rec.flags = TENSOR_FLAG_METADATA;
+        rec.tensor_metadata = Some(encode_shape_metadata(&[2, 2], "float32"));
+        let mut bytes = round_trip(&rec);
+        // Same record bytes without the shape: rejected on read.
+        assert_eq!(bytes[0], TF_SHAPE);
+        bytes[0] = 0;
+        let shape_len = 1 + 1 + 2;
+        bytes.drain(5..5 + shape_len);
+        rejects(&bytes, "bound Source");
+    }
+
+    #[test]
+    fn writer_rejects_inconsistent_records() {
+        let check = |rec: TensorRecord, needle: &str| {
+            let mut out = Vec::new();
+            let msg = write_compact_record(&rec, &ctx(), &mut out)
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains(needle), "{needle:?} not in {msg:?}");
+            assert!(out.is_empty());
+        };
+        let mut rec = record();
+        rec.terminals[0].codec_id = CodecId::Rans;
+        check(rec, "differs from Zstd");
+        let mut rec = record();
+        rec.terminals[0].codec_table_idx = 0;
+        check(rec, "not a plane codec");
+        let mut rec = record();
+        rec.terminals[0].codec_table_idx = 9;
+        check(rec, "outside the Extension Table");
+        let mut rec = record();
+        rec.terminals[0].payload_len = 3;
+        check(rec, "payload_len");
+        let mut rec = record();
+        rec.chain_ref = 5;
+        check(rec, "not in the registry");
+        let mut rec = record();
+        rec.chain_ref = CHAIN_REF_INLINE_BIT;
+        check(rec, "disagree");
+        let mut rec = record();
+        rec.terminals[0].inline_state_bytes = vec![1];
+        check(rec, "inline state bytes");
+    }
+
+    #[test]
+    fn reader_rejects_reserved_bits_and_non_canonical_fields() {
+        let base = encode(&record());
+        // Reserved tflags bits.
+        for bit in [0x40u8, 0x80] {
+            let mut b = base.clone();
+            b[0] |= bit;
+            rejects(&b, "unknown tflags");
+        }
+        let mut b = base.clone();
+        b[0] = TF_DTYPE_NAME;
+        rejects(&b, "TF_DTYPE_NAME without TF_SHAPE");
+        let mut b = base.clone();
+        b[0] = TF_SHAPE | TF_RAW_META;
+        rejects(&b, "TF_RAW_META with TF_SHAPE");
+        // Reserved pflags bits (pflags at offset 6).
+        for bit in [0x40u8, 0x80] {
+            let mut b = base.clone();
+            b[6] |= bit;
+            rejects(&b, "unknown pflags");
+        }
+        // Overlong varint (dtype_code 1 as two bytes).
+        let mut b = base.clone();
+        b.splice(2..3, [0x81, 0x00]);
+        rejects(&b, "non-minimal");
+        // Unknown role, codec_ref to a transform or outside the table.
+        let mut b = base.clone();
+        b[7] = 0x7E;
+        rejects(&b, "unknown plane role");
+        let mut b = base.clone();
+        b[8] = 0;
+        rejects(&b, "not a plane codec");
+        let mut b = base.clone();
+        b[8] = 3;
+        rejects(&b, "outside the Extension Table");
+        // Chain id outside the registry.
+        let mut b = base.clone();
+        b[1] = 2;
+        rejects(&b, "not in the registry");
+        // Trailing and missing bytes.
+        let mut b = base.clone();
+        b.push(0);
+        rejects(&b, "trailing");
+        rejects(&base[..base.len() - 1], "");
+        // STATE_EXTRA with zero values.
+        let mut b = base.clone();
+        b[6] |= PF_STATE_EXTRA;
+        b.splice(9..9, [0, 0]);
+        rejects(&b, "PF_STATE_EXTRA with zero");
+        // Rows layout with row_len 0 (row_len follows payload_len).
+        let mut b = base.clone();
+        b[6] |= PF_LAYOUT_ROWS;
+        b.insert(10, 0);
+        rejects(&b, "row_len 0");
+    }
+
+    #[test]
+    fn reader_rejects_non_canonical_metadata() {
+        let mut rec = record();
+        rec.flags = TENSOR_FLAG_METADATA;
+        rec.tensor_metadata = Some(encode_shape_metadata(&[2], "my_float"));
+        let b = encode(&rec);
+        // The stored name (after ndim and dim at offsets 5-6) rewritten to
+        // the canonical name.
+        let mut c = b[..7].to_vec();
+        c.push(7);
+        c.extend_from_slice(b"float32");
+        c.extend_from_slice(&b[7 + 1 + 8..]);
+        rejects(&c, "equals the canonical name");
+        // Shape metadata stored as raw bytes.
+        let meta = encode_shape_metadata(&[2], "float32");
+        let mut c = b[..5].to_vec();
+        c[0] = TF_RAW_META;
+        c.push(meta.len() as u8);
+        c.extend_from_slice(&meta);
+        c.extend_from_slice(&b[7 + 1 + 8..]);
+        rejects(&c, "raw metadata that TF_SHAPE stores");
+        // A shape for a dtype without a canonical name needs a stored name.
+        let mut rec = record();
+        rec.dtype_code = 200;
+        let b = encode(&rec);
+        let mut c = b[..5].to_vec();
+        c[0] = TF_SHAPE;
+        c.extend_from_slice(&[1, 2]);
+        c.extend_from_slice(&b[5..]);
+        rejects(&c, "no canonical name");
+    }
+
+    #[test]
+    fn reader_rejects_a_wrong_inline_table_order() {
+        let mut rec = record();
+        rec.chain_ref = CHAIN_REF_INLINE_BIT;
+        rec.inline_chain = Some(fp32_chain(bound_source_params(&[4], 1).unwrap()));
+        let b = encode(&rec);
+        // Inline table after orig_size (offset 4): et_len, then the table
+        // [Source, ByteSplit]. Rewrite the chain with the node op refs
+        // swapped: the table then no longer lists the ops in first-use
+        // order.
+        let at = 4;
+        let et_len = usize::from(b[at]);
+        let chain_at = at + 1 + et_len;
+        let chain_len = usize::from(b[chain_at]);
+        let swapped = Chain {
+            nodes: vec![
+                ChainNode {
+                    op: OpId::ByteSplit,
+                    params: vec![1, 4, 0, 0, 0, 3, 0],
+                },
+                ChainNode {
+                    op: OpId::Source,
+                    params: vec![4],
+                },
+            ],
+            ..fp32_chain(Vec::new())
+        };
+        let mut chain = Vec::new();
+        write_chain_compact(
+            &swapped,
+            None,
+            |op| Ok(if op == OpId::Source { 0 } else { 1 }),
+            &mut chain,
+        )
+        .unwrap();
+        let mut c = b[..chain_at].to_vec();
+        write_varint(&mut c, chain.len() as u64);
+        c.extend_from_slice(&chain);
+        c.extend_from_slice(&b[chain_at + 1 + chain_len..]);
+        rejects(&c, "first-use order");
+    }
+
+    #[test]
+    fn reader_rejects_bad_dependencies() {
+        let mut rec = record();
+        rec.flags = TENSOR_FLAG_DEPENDENCIES;
+        rec.dependencies = vec![Dependency {
+            ref_kind: RefKind::LocalTensor,
+            expected_hash: None,
+            ref_bytes: vec![1],
+        }];
+        let b = encode(&rec);
+        // deps at offset 5: count, kind, flags, len, byte.
+        let mut c = b.clone();
+        c[5] = 0;
+        c.drain(6..10);
+        rejects(&c, "TF_DEPS with no dependencies");
+        let mut c = b.clone();
+        c[7] = 0x02;
+        rejects(&c, "unknown dependency flag");
+        let mut c = b.clone();
+        c[6] = 0x7F;
+        rejects(&c, "unknown ref_kind");
+    }
+
+    #[test]
+    fn huge_counts_fail_before_allocating() {
+        let huge = |prefix: &[u8], value: u64, suffix: &[u8]| {
+            let mut b = prefix.to_vec();
+            write_varint(&mut b, value);
+            b.extend_from_slice(suffix);
+            b
+        };
+        // n_planes above 255 and above the remaining bytes.
+        rejects(&huge(&[0, 0, 1, 2, 16], 255, &[]), "plane count exceeds");
+        rejects(&huge(&[0, 0, 1, 2, 16], 1 << 40, &[]), "exceeds 255");
+        // ndim above the limit.
+        rejects(&huge(&[TF_SHAPE, 0, 1, 2, 16], 1 << 30, &[]), "ndim");
+        // Dependency count above the remaining bytes.
+        rejects(
+            &huge(&[TF_DEPS, 0, 1, 2, 16], 60_000, &[]),
+            "dependency count",
+        );
+        // Payload length above the remaining bytes.
+        rejects(&huge(&[0, 0, 1, 2, 16, 1, 0, 1, 1], u64::MAX >> 1, &[]), "");
+        // Chunk count above the payload length.
+        rejects(
+            &huge(&[0, 0, 1, 2, 16, 1, PF_CHUNKS, 1, 1, 4], 5, &[0; 16]),
+            "chunk count",
+        );
+        // Raw metadata length above the remaining bytes.
+        rejects(&huge(&[TF_RAW_META, 0, 1, 2, 16], u32::MAX.into(), &[]), "");
+    }
 }

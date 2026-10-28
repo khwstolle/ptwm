@@ -194,7 +194,11 @@ pub fn read_registry(buf: &[u8], table: &ExtensionTable) -> Result<ChainRegistry
         let entry = usize::try_from(op_ref)
             .ok()
             .and_then(|i| table.entries.get(i))
-            .ok_or_else(|| err(format_args!("op_ref {op_ref} is outside the Extension Table")))?;
+            .ok_or_else(|| {
+                err(format_args!(
+                    "op_ref {op_ref} is outside the Extension Table"
+                ))
+            })?;
         match dispatch_builtin(&entry.canonical_id) {
             Some(BuiltinKind::Op(op)) => Ok(op),
             _ => Err(err(format_args!(
@@ -291,4 +295,147 @@ pub fn footer_bytes(index_len: u64) -> [u8; FOOTER_LEN] {
     f[..8].copy_from_slice(&index_len.to_le_bytes());
     f[8..].copy_from_slice(&EOF_SENTINEL);
     f
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file of the given sections, body and index (index bytes as given).
+    fn file(et: &[u8], prelude: &[u8], registry: &[u8], body: &[u8], index: &[u8]) -> Vec<u8> {
+        let mut f = header_bytes(et, prelude, registry);
+        for part in [et, prelude, registry, body, index] {
+            f.extend_from_slice(part);
+        }
+        f.extend_from_slice(&footer_bytes(index.len() as u64));
+        f
+    }
+
+    fn rejects(buf: &[u8], needle: &str) {
+        let msg = locate_sections(buf).unwrap_err().to_string();
+        assert!(msg.contains(needle), "{needle:?} not in {msg:?}");
+    }
+
+    #[test]
+    fn sections_are_located() {
+        let index = write_index(&[("a".into(), 3)]).unwrap();
+        let f = file(&[0], &[], &[0], &[1, 2, 3], &index);
+        let s = locate_sections(&f).unwrap();
+        // magic, hflags, three one-byte lengths, hash.
+        assert_eq!(s.header, 0..9 + 2 + 3 + 8);
+        assert_eq!(s.extension_table.len(), 1);
+        assert_eq!(s.prelude.len(), 0);
+        assert_eq!(s.registry.len(), 1);
+        assert_eq!(&f[s.body.clone()], &[1, 2, 3]);
+        assert_eq!(&f[s.index.clone()], &index[..]);
+        let entries = read_index(&f[s.index], s.body.clone()).unwrap();
+        assert_eq!(entries[0].tensor_offset, s.body.start as u64);
+        assert_eq!(entries[0].name.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn header_rejections() {
+        let f = file(&[0], &[], &[0], &[], &[0]);
+        // Every hflags bit is reserved.
+        for bit in 0..16 {
+            let mut b = f.clone();
+            let flags = 1u16 << bit;
+            b[9..11].copy_from_slice(&flags.to_le_bytes());
+            rejects(&b, "unknown hflags");
+        }
+        // Any flipped bit of the hashed bytes fails the hash.
+        let mut b = f.clone();
+        b[11 + 3 + 8] ^= 1; // the extension table byte
+        rejects(&b, "meta_xxh64 mismatch");
+        let mut b = f.clone();
+        b[11 + 3] ^= 1; // the hash itself
+        rejects(&b, "meta_xxh64 mismatch");
+        // Overlong section length.
+        let mut b = MAGIC_PTWC.to_vec();
+        b.extend_from_slice(&[0, 0, 0x81, 0x00, 0, 0]);
+        b.extend_from_slice(&[0; 8 + 16]);
+        rejects(&b, "non-minimal");
+        // A section that runs past the footer.
+        let mut b = MAGIC_PTWC.to_vec();
+        b.extend_from_slice(&[0, 0, 0x7F, 0, 0]);
+        b.extend_from_slice(&[0; 8]);
+        b.extend_from_slice(&footer_bytes(0));
+        rejects(&b, "exceeds the file");
+        // index_len beyond the file, and an index that overlaps the registry.
+        let mut b = f.clone();
+        let n = b.len();
+        b[n - 16..n - 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        rejects(&b, "index_len exceeds the file");
+        let mut b = f.clone();
+        b[n - 16..n - 8].copy_from_slice(&2u64.to_le_bytes());
+        rejects(&b, "index overlaps the registry");
+        // Wrong magic or too short.
+        rejects(&f[1..], "bad magic");
+        rejects(&MAGIC_PTWC, "bad magic");
+    }
+
+    fn index_rejects(index: &[u8], body_len: usize, needle: &str) {
+        let msg = read_index(index, 100..100 + body_len)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains(needle), "{needle:?} not in {msg:?}");
+    }
+
+    #[test]
+    fn index_rejections() {
+        let ok = write_index(&[("a".into(), 3), ("b".into(), 4)]).unwrap();
+        assert_eq!(read_index(&ok, 100..107).unwrap().len(), 2);
+        // A gap after the last record, and records past the body.
+        index_rejects(&ok, 8, "records cover 7 of 8 body bytes");
+        index_rejects(&ok, 6, "runs past the body");
+        // Duplicate and empty names, short records, trailing bytes.
+        let dup = write_index(&[("a".into(), 3), ("a".into(), 4)]).unwrap();
+        index_rejects(&dup, 7, "duplicate tensor name");
+        index_rejects(&[1, 0, 3], 3, "empty tensor name");
+        index_rejects(&[1, 1, b'a', 2], 2, "record of 2 bytes");
+        let mut trailing = ok.clone();
+        trailing.push(0);
+        index_rejects(&trailing, 7, "trailing");
+        // Bad UTF-8 and a huge count.
+        index_rejects(&[1, 1, 0xFF, 3], 3, "not UTF-8");
+        index_rejects(
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0x0F],
+            0,
+            "exceeds the index bytes",
+        );
+        // Names must fit their length limit on write.
+        assert!(write_index(&[(String::new(), 3)]).is_err());
+        assert!(write_index(&[("x".repeat(MAX_NAME_LEN + 1), 3)]).is_err());
+        assert!(write_index(&[("a".into(), 2)]).is_err());
+    }
+
+    #[test]
+    fn index_is_sorted_for_lookup_and_keeps_body_offsets() {
+        let names = ["w", "b", "q", "a"];
+        let entries: Vec<(String, u64)> = names.iter().map(|n| (n.to_string(), 3)).collect();
+        let index = write_index(&entries).unwrap();
+        let read = read_index(&index, 10..22).unwrap();
+        assert!(read.windows(2).all(|w| w[0].name_hash <= w[1].name_hash));
+        for (i, n) in names.iter().enumerate() {
+            let e = read.iter().find(|e| e.name.as_deref() == Some(*n)).unwrap();
+            assert_eq!(e.tensor_offset, 10 + 3 * i as u64);
+            assert_eq!(e.name_hash, name_hash(n));
+        }
+    }
+
+    #[test]
+    fn registry_rejections() {
+        let table = ExtensionTable::empty();
+        // Empty registry.
+        assert!(read_registry(&[0], &table).unwrap().chains.is_empty());
+        // Too many chains for the bytes, above the limit, trailing bytes.
+        let msg = read_registry(&[10, 0, 0], &table).unwrap_err().to_string();
+        assert!(msg.contains("exceeds the registry bytes"), "{msg}");
+        let mut huge = Vec::new();
+        write_varint(&mut huge, MAX_REGISTRY_CHAINS as u64 + 1);
+        let msg = read_registry(&huge, &table).unwrap_err().to_string();
+        assert!(msg.contains("chain count"), "{msg}");
+        let msg = read_registry(&[0, 0], &table).unwrap_err().to_string();
+        assert!(msg.contains("trailing"), "{msg}");
+    }
 }

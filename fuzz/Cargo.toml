@@ -107,3 +107,15 @@ name = "chain_wire_compact"
 path = "fuzz_targets/chain_wire_compact.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "parse_wire_compact"
+path = "fuzz_targets/parse_wire_compact.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "extension_table_compact"
+path = "fuzz_targets/extension_table_compact.rs"
+test = false
+doc = false

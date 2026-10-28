@@ -438,6 +438,7 @@ fn compress_model<'py>(
             forced_codec,
             allow_codec_ids,
             chunk_size: streaming_chunk,
+            ..Default::default()
         };
 
         let cursor = std::io::Cursor::new(&mut out);
@@ -524,6 +525,7 @@ fn compress_compact<'py>(
                 forced_codec,
                 allow_codec_ids,
                 chunk_size: None,
+                ..Default::default()
             };
             ptwm_core::compact::compress_compact(&input, &opts)
         })
@@ -649,7 +651,6 @@ fn decode_tensor_info(
     skip_missing: bool,
 ) -> PyResult<Option<(Vec<u64>, String, u16, u8)>> {
     use ptwm_core::metadata::decode_shape_metadata;
-    use ptwm_core::tensor_record::parse_tensor_record;
 
     let data: Vec<u8> = blob.as_bytes().to_vec();
     let name_owned = name.to_string();
@@ -661,11 +662,7 @@ fn decode_tensor_info(
                 } else {
                     ContainerReader::open(&data)?
                 };
-                let record_bytes =
-                    reader.get_tensor_record_bytes(&name_owned).ok_or_else(|| {
-                        PtwmCoreError::InvalidContainer(format!("tensor '{name_owned}' not found"))
-                    })?;
-                let (rec, _) = parse_tensor_record(record_bytes)?;
+                let rec = reader.tensor_record(&name_owned)?;
                 match rec.tensor_metadata {
                     Some(meta) => {
                         let (shape, dtype_name) = decode_shape_metadata(&meta)?;
@@ -690,7 +687,7 @@ fn decode_tensor_delta_hash<'py>(
     name: &str,
     skip_missing: bool,
 ) -> PyResult<Option<Bound<'py, pyo3::types::PyBytes>>> {
-    use ptwm_core::tensor_record::{RefKind, parse_tensor_record};
+    use ptwm_core::tensor_record::RefKind;
 
     let data: Vec<u8> = blob.as_bytes().to_vec();
     let name_owned = name.to_string();
@@ -701,10 +698,7 @@ fn decode_tensor_delta_hash<'py>(
             } else {
                 ContainerReader::open(&data)?
             };
-            let record_bytes = reader.get_tensor_record_bytes(&name_owned).ok_or_else(|| {
-                PtwmCoreError::InvalidContainer(format!("tensor '{name_owned}' not found"))
-            })?;
-            let (rec, _) = parse_tensor_record(record_bytes)?;
+            let rec = reader.tensor_record(&name_owned)?;
             for dep in &rec.dependencies {
                 if matches!(dep.ref_kind, RefKind::ExternalSafetensors)
                     && let Some(h) = dep.expected_hash
@@ -780,8 +774,6 @@ fn list_plane_summaries(
     blob: &Bound<'_, pyo3::types::PyBytes>,
     skip_missing: bool,
 ) -> PyResult<Vec<(String, u32, u8, u16, u8, u64)>> {
-    use ptwm_core::tensor_record::parse_tensor_record;
-
     let data: Vec<u8> = blob.as_bytes().to_vec();
     let summaries = py
         .allow_threads(
@@ -794,10 +786,7 @@ fn list_plane_summaries(
                 let names = reader.tensor_names()?;
                 let mut out = Vec::new();
                 for name in names {
-                    let record_bytes = reader.get_tensor_record_bytes(&name).ok_or_else(|| {
-                        PtwmCoreError::InvalidContainer(format!("tensor '{name}' not found"))
-                    })?;
-                    let (rec, _) = parse_tensor_record(record_bytes)?;
+                    let rec = reader.tensor_record(&name)?;
                     for (idx, plane) in rec.terminals.iter().enumerate() {
                         out.push((
                             name.clone(),

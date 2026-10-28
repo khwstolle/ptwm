@@ -307,6 +307,11 @@ fn extension_table_bytes<'a>(
 /// and loose binary members.
 pub fn explode(blob: &[u8]) -> Result<Exploded, PtwmCoreError> {
     let reader = ContainerReader::open_partial(blob)?;
+    if reader.layout != crate::container::ContainerLayout::Legacy {
+        return Err(err(
+            "compact (\\x89PTWC) containers are not supported by the transcoder yet",
+        ));
+    }
     let embedded_wasm = reader.header.flags & FLAG_PTWX != 0;
     if embedded_wasm {
         return Err(err(

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::error::PtwmCoreError;
 use crate::types::descriptor::PlaneDescriptor;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum OpId {
     Source = 0x0000,

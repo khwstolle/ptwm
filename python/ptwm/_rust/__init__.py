@@ -215,7 +215,7 @@ def compress_model(
     empty intersection on a plane raises ``InvalidContainer``.
     ``container_layout``: ``"compact"`` (default) writes ``\x89PTWC``
     (readable by v1.2 and later), ``"legacy"`` writes ``\x89PTWM`` (readable
-    by every release).
+    by v1.1 and later).
     A :class:`ptwm.ContainerLayout` is accepted too. Other values raise
     :class:`ptwm.Error` before anything is compressed (the binding itself
     raises ``ValueError``).

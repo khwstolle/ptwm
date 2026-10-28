@@ -51,7 +51,7 @@ def compress_ptwm_blob(
     auto-derived from each tensor's dtype via the STANDARD production table.
     ``method_hint``: 1=HUFFMAN, 2=ZSTD, 3=MICROSCALE, 4=RANS, 5=IDENTITY.
     ``container_layout``: ``"compact"`` (default; ``\x89PTWC``, v1.2 and
-    later) or ``"legacy"`` (``\x89PTWM``, readable by every release), as a string or
+    later) or ``"legacy"`` (``\x89PTWM``, readable by v1.1 and later), as a string or
     :class:`ptwm.ContainerLayout`. Other values raise :class:`ValueError`
     before anything is compressed.
     """

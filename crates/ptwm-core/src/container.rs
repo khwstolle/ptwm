@@ -309,7 +309,7 @@ fn compact_registry_bytes(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ContainerLayout {
     /// `\x89PTWM`: fixed-width header, full Extension Table, hash-sorted
-    /// index. Readable by every release.
+    /// index. Readable by v1.1 and later.
     Legacy,
     /// `\x89PTWC`: varint fields, built-ins stored by id, names in the index
     /// ([`crate::ptwc`]). Readable by v1.2 and later.

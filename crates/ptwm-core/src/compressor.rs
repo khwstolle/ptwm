@@ -92,7 +92,7 @@ pub struct InputTensor<'a> {
 /// Compressor options. `Default` gives no hint, no hash or CRC, dispatcher
 /// codec selection, whole planes and the compact container layout
 /// (`\x89PTWC`, readable by v1.2 and later). Set `container_layout` to
-/// [`ContainerLayout::Legacy`] for output that every release reads.
+/// [`ContainerLayout::Legacy`] for output that v1.1 and later read.
 #[derive(Default)]
 pub struct CompressorOptions {
     /// Header hint to readers about the dominant codec.

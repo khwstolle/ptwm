@@ -66,9 +66,16 @@ def test_chain_blob_info_maps_old_builtin_ids() -> None:
     assert chain_blob_info(old) == chain_blob_info(blob)
 
 
-def test_compress_model_accepts_chain_blobs_of_other_releases() -> None:
+@pytest.mark.parametrize(
+    ("layout", "magic"), [("legacy", b"\x89PTWM"), ("compact", b"\x89PTWC")]
+)
+def test_compress_model_accepts_chain_blobs_of_other_releases(
+    layout: str, magic: bytes
+) -> None:
     """A chain blob cached by another release compresses to the same
-    container as the current blob."""
+    container as the current blob. The legacy layout writes full canonical
+    ids and labels into the Extension Table, so it is the case that needs the
+    ids normalized; the compact layout stores built-ins by wire id."""
     import torch
 
     shape = [8, 16]
@@ -82,9 +89,11 @@ def test_compress_model_accepts_chain_blobs_of_other_releases() -> None:
             chains_per_tensor=[[chain]],
             emit_payload_hash=True,
             emit_plane_crc=True,
+            container_layout=layout,
         )
 
     current = compress(blob)
+    assert current.startswith(magic)
     assert compress(old) == current
     assert _rust.decode_tensor(current, "w") == raw
 

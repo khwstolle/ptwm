@@ -318,7 +318,7 @@ fn py_dtype_element_size(dtype_code: u8) -> PyResult<u32> {
 /// (1=HUFFMAN, 2=ZSTD, 3=MICROSCALE, 4=RANS, 5=IDENTITY).
 ///
 /// `container_layout` is ``"compact"`` (default, ``\x89PTWC``, readable by
-/// v1.2 and later) or ``"legacy"`` (``\x89PTWM``, readable by every release).
+/// v1.2 and later) or ``"legacy"`` (``\x89PTWM``, readable by v1.1 and later).
 ///
 /// Returns the entire container as a ``bytes`` object.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]

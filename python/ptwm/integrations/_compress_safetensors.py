@@ -216,7 +216,7 @@ def compress_safetensors_file(
     container_layout:
         Layout of every shard container: ``"compact"`` (default;
         ``\x89PTWC``, v1.2 and later) or ``"legacy"`` (``\x89PTWM``, readable
-        by every release).
+        by v1.1 and later).
         Forwarded to ``write_ptwm_shard``; a string or
         :class:`ptwm.ContainerLayout`. Other values raise ``ValueError``
         before any tensor is read.

@@ -113,3 +113,150 @@ def test_store_formats_take_the_layout(tmp_path: Path, layout: str | None) -> No
     store = LmdbWeightStore.open(out)
     blob = store._get(b"t/a.weight")
     assert container_kind(blob) == KIND[layout or "compact"]
+
+
+def _assert_tensors_match(src: Path, out: Path) -> None:
+    from ptwm.integrations import SafeOpen  # noqa: PLC0415
+    from safetensors.torch import load_file  # noqa: PLC0415
+
+    want = load_file(str(src))
+    got = SafeOpen(str(out), "pt")
+    for name, tensor in want.items():
+        assert torch.equal(got.get_tensor(name), tensor)
+
+
+@pytest.mark.parametrize("layout", [None, "compact", "legacy"])
+def test_delta_compression_round_trips(tmp_path: Path, layout: str | None) -> None:
+    """``--delta`` reads the reference file; it used to pass the reference
+    path string to the compressor and fail with ``TypeError``."""
+    from ptwm import DecompressionConfig  # noqa: PLC0415
+
+    rng = np.random.default_rng(1)
+    ref = rng.standard_normal(2048).astype(np.float32)
+    cur = ref + rng.standard_normal(2048).astype(np.float32) * 1e-3
+    src = tmp_path / "weights.bin"
+    src.write_bytes(cur.tobytes())
+    ref_path = tmp_path / "base.bin"
+    ref_path.write_bytes(ref.tobytes())
+
+    argv = [str(src), "--delta", str(ref_path), "--force", "--dtype", "float32"]
+    argv += ["--verification"]
+    if layout is not None:
+        argv += ["--container-layout", layout]
+    handle_compress(_parse(argv))
+
+    out = tmp_path / "weights_delta_base.bin.ptwm"
+    blob = out.read_bytes()
+    assert container_kind(blob) == KIND[layout or "compact"]
+    dec = Decompressor(DecompressionConfig(delta_second_data=ref_path.read_bytes()))
+    assert dec.decompress(blob) == cur.tobytes()
+
+
+@pytest.mark.parametrize("layout", [None, "legacy"])
+def test_webdataset_store_takes_the_layout(tmp_path: Path, layout: str | None) -> None:
+    from ptwm.stores import WebDatasetWeightStore  # noqa: PLC0415
+
+    src = _safetensors_file(tmp_path)
+    out = tmp_path / "m.wds"
+    argv = [str(src), "--format", "webdataset", "--out", str(out)]
+    if layout is not None:
+        argv += ["--container-layout", layout]
+    handle_compress(_parse(argv))
+    from ptwm.stores._common import manifest_container_layout  # noqa: PLC0415
+
+    with WebDatasetWeightStore.open(out) as store:
+        assert manifest_container_layout(store._registry_json) == (layout or "compact")
+        want = torch.randn(64, 32, generator=torch.Generator().manual_seed(0))
+        assert torch.equal(store.get_tensor("a.weight"), want.to(torch.bfloat16))
+
+
+@pytest.mark.parametrize("layout", [None, "legacy"])
+def test_mode_b_writes_the_out_file(tmp_path: Path, layout: str | None) -> None:
+    """``--mode b --out F`` writes F itself and leaves no staging directory."""
+    from safetensors import safe_open  # noqa: PLC0415
+
+    src = _safetensors_file(tmp_path)
+    out = tmp_path / "b.ptwm.safetensors"
+    argv = [str(src), "--mode", "b", "--out", str(out), "--force"]
+    if layout is not None:
+        argv += ["--container-layout", layout]
+    handle_compress(_parse(argv))
+
+    assert out.is_file()
+    assert not (tmp_path / "b.ptwm__staging").exists()
+    with safe_open(str(out), "pt") as f:
+        payload = f.get_tensor("__ptwm_payload__").numpy().tobytes()
+    assert container_kind(payload) == KIND[layout or "compact"]
+    _assert_tensors_match(src, out)
+
+
+@pytest.mark.parametrize("layout", [None, "legacy"])
+def test_mode_a_writes_the_out_directory(tmp_path: Path, layout: str | None) -> None:
+    src = _safetensors_file(tmp_path)
+    out = tmp_path / "a_out"
+    argv = [str(src), "--mode", "a", "--out", str(out), "--force"]
+    if layout is not None:
+        argv += ["--container-layout", layout]
+    handle_compress(_parse(argv))
+    shard = out / "model.ptwm"
+    assert container_kind(shard.read_bytes()) == KIND[layout or "compact"]
+    _assert_tensors_match(src, shard)
+
+
+@pytest.mark.parametrize("layout", [None, "legacy"])
+def test_directory_file_compression_takes_the_layout(
+    tmp_path: Path, layout: str | None
+) -> None:
+    src = _safetensors_file(tmp_path)
+    argv = [str(tmp_path), "--file_compression", "--force"]
+    if layout is not None:
+        argv += ["--container-layout", layout]
+    handle_compress(_parse(argv))
+    blob = (tmp_path / (src.name + ".ptwm")).read_bytes()
+    assert container_kind(blob) == KIND[layout or "compact"]
+    assert Decompressor().decompress(blob) == src.read_bytes()
+
+
+@pytest.mark.parametrize("layout", [None, "legacy"])
+def test_directory_per_tensor_shell_takes_the_layout(
+    tmp_path: Path, layout: str | None
+) -> None:
+    src = _safetensors_file(tmp_path)
+    argv = [str(tmp_path), "--force"]
+    if layout is not None:
+        argv += ["--container-layout", layout]
+    handle_compress(_parse(argv))
+    out = tmp_path / "model.ptwm.safetensors"
+
+    from ptwm.integrations._safetensors import (  # noqa: PLC0415
+        decompress_safetensors_tensor,
+    )
+    from safetensors import safe_open  # noqa: PLC0415
+    from safetensors.torch import load_file  # noqa: PLC0415
+
+    want = load_file(str(src))
+    with safe_open(str(out), "pt") as f:
+        assert set(f.keys()) == set(want)
+        for name, tensor in want.items():
+            got = decompress_safetensors_tensor(f.get_tensor(name))
+            raw = tensor.contiguous().view(torch.uint8).numpy().tobytes()
+            if isinstance(got, torch.Tensor):
+                got = got.contiguous().view(torch.uint8).numpy().tobytes()
+            assert bytes(got) == raw
+
+
+def test_directory_compression_with_several_processes(tmp_path: Path) -> None:
+    """``--max_processes 2`` runs the workers in spawned children, so a
+    parent that already ran the Rust and torch thread pools does not hang."""
+    torch.randn(256, 256) @ torch.randn(256, 256)
+    srcs = []
+    for i in range(3):
+        sub = _safetensors_file(tmp_path)
+        srcs.append(sub.rename(tmp_path / f"m{i}.safetensors"))
+    argv = [str(tmp_path), "--file_compression", "--force", "--max_processes", "2"]
+    argv += ["--container-layout", "legacy"]
+    handle_compress(_parse(argv))
+    for src in srcs:
+        blob = (tmp_path / (src.name + ".ptwm")).read_bytes()
+        assert container_kind(blob) == "ptwm"
+        assert Decompressor().decompress(blob) == src.read_bytes()

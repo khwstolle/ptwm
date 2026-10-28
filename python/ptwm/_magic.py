@@ -2,7 +2,7 @@ r"""Magic numbers of the PTWM file formats.
 
 Four formats share the ``\x89PTW`` prefix:
 
-- ``\x89PTWM\r\n\x1a\n``: legacy multi-tensor container (every release reads it).
+- ``\x89PTWM\r\n\x1a\n``: legacy multi-tensor container (v1.1 and later read it).
 - ``\x89PTWX\r\n\x1a\n``: legacy container with embedded WASM extensions.
 - ``\x89PTWC\r\n\x1a\n``: compact multi-tensor container (v1.2 and later).
 - ``\x89PTWS``: compact single-tensor frame written by

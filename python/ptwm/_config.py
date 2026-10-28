@@ -84,8 +84,10 @@ class ContainerLayout(Enum):
     ``COMPACT`` (magic ``\x89PTWC``, the default for new writes) stores
     built-in extensions by id, integers as varints and tensor names only in
     the index; it needs v1.2 or later to read. ``LEGACY`` (magic
-    ``\x89PTWM``) is the fixed-width layout that every release reads; its
-    output is byte-identical to the v1.1 writer.
+    ``\x89PTWM``) is the fixed-width layout that v1.1 and later read. Its
+    output is byte-identical to the current pre-PTWC writer, whose Extension
+    Table holds only the referenced codecs; the v1.1.0 writer interned all 16
+    built-in codecs, so its bytes differ.
 
     Strings coerce case-insensitively: ``ContainerLayout("compact")`` and
     ``ContainerLayout("LEGACY")`` work, and the bindings take the lower-case

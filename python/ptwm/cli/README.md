@@ -84,4 +84,4 @@ Both `compress` and `decompress` support these flags:
 containers use the compact layout (magic `\x89PTWC`) by default; ptwm
 v1.2 and later read it, including the random-access, store and inspect
 tools. `--container-layout legacy` writes `\x89PTWM` containers that
-earlier releases also read.
+v1.1 and later read.

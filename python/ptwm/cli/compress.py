@@ -1,3 +1,5 @@
+import multiprocessing
+import shutil
 import sys
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -25,7 +27,7 @@ _CODEC_NAME_MAP: dict[str, CodecId] = {
 _CONTAINER_LAYOUT_HELP = (
     "Layout of written .ptwm containers: 'compact' (default; magic "
     "\\x89PTWC, readable by ptwm v1.2 and later) or 'legacy' (magic "
-    "\\x89PTWM, readable by every release)."
+    "\\x89PTWM, readable by v1.1 and later)."
 )
 
 
@@ -318,7 +320,7 @@ def compress_file_delta(
 
     compressor = Compressor(
         CompressionConfig(
-            bytearray_dtype="float32" if dtype else "bfloat16",
+            bytearray_dtype=dtype,
             framing=Framing.CONTAINER,
             container_layout=container_layout,
             is_streaming=is_streaming,
@@ -334,21 +336,20 @@ def compress_file_delta(
 
     with full_path.open("rb") as f:
         file_data = f.read()
-    compressed_data = compressor.compress(file_data, delta_second_data=delta_file)
+    reference = delta_path.read_bytes()
+    compressed_data = compressor.compress(file_data, delta_second_data=reference)
 
     if verification:
         # `device` is not forwarded here either; see the note in
         # `compress_file`.
         decompressor = Decompressor(
             DecompressionConfig(
-                delta_second_data=delta_path.read_bytes(),
+                delta_second_data=reference,
                 threads=threads,
             )
         )
-        with full_path.open("rb") as f:
-            file_data2 = f.read()
         decompressed_data = decompressor.decompress(compressed_data)
-        if decompressed_data != file_data2:
+        if decompressed_data != file_data:
             msg = "Decompressed file should be equal to original file."
             raise RuntimeError(msg)
 
@@ -624,28 +625,43 @@ def compress_path(
         )
 
     failures: list[tuple[str, BaseException]] = []
-    with ProcessPoolExecutor(max_workers=max_processes) as executor:
-        future_to_file = {
-            executor.submit(compression_func, file, *comp_args): file
-            for file in file_list[:max_processes]
-        }
-        remaining_files = deque(file_list[max_processes:])
-        while future_to_file:
-            for future in as_completed(future_to_file):
-                file = future_to_file.pop(future)
-                try:
-                    future.result()
-                except Exception as exc:  # noqa: BLE001
-                    failures.append((file, exc))
-                    print(
-                        f"{RED}error compressing {file}: {exc!r}{RESET}",
-                        file=sys.stderr,
-                    )
-                if remaining_files:
-                    next_file = remaining_files.popleft()
-                    future_to_file[
-                        executor.submit(compression_func, next_file, *comp_args)
-                    ] = next_file
+
+    def record(file: str, exc: BaseException) -> None:
+        failures.append((file, exc))
+        print(f"{RED}error compressing {file}: {exc!r}{RESET}", file=sys.stderr)
+
+    if max_processes <= 1:
+        # One worker: compress in this process. A forked pool child can
+        # deadlock on locks that the parent's Rust or torch threads held at
+        # fork time.
+        for file in file_list:
+            try:
+                compression_func(file, *comp_args)
+            except Exception as exc:  # noqa: BLE001
+                record(file, exc)
+    else:
+        # Several workers run in "spawn" children for the same reason.
+        with ProcessPoolExecutor(
+            max_workers=max_processes,
+            mp_context=multiprocessing.get_context("spawn"),
+        ) as executor:
+            future_to_file = {
+                executor.submit(compression_func, file, *comp_args): file
+                for file in file_list[:max_processes]
+            }
+            remaining_files = deque(file_list[max_processes:])
+            while future_to_file:
+                for future in as_completed(list(future_to_file)):
+                    file = future_to_file.pop(future)
+                    try:
+                        future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        record(file, exc)
+                    if remaining_files:
+                        next_file = remaining_files.popleft()
+                        future_to_file[
+                            executor.submit(compression_func, next_file, *comp_args)
+                        ] = next_file
     if failures:
         print(
             f"{RED}{len(failures)} of {len(file_list)} file(s) failed to compress{RESET}",
@@ -950,7 +966,10 @@ def add_compress_parser(subparsers):
         help=(
             "Output path for .safetensors inputs. With --mode a, the output "
             "is a directory (default <input>.ptwm/). With --mode b, the "
-            "output is a single .safetensors-shaped file."
+            "output is a single .safetensors-shaped file (default "
+            "<input stem>.ptwm.safetensors); output that needs several "
+            "shards goes to a directory named after it without the "
+            "'.safetensors' suffix."
         ),
     )
     parser.add_argument(
@@ -1109,8 +1128,9 @@ def _compress_safetensors_integration(args, mode: str) -> int:  # noqa: ANN001
         out_path = (
             Path(args.out) if args.out else input_path.with_suffix(".ptwm.safetensors")
         )
+        # The shards are written to a staging directory first and moved
+        # into place afterwards (see `_finish_mode_b`).
         out_dir = out_path.parent / (out_path.stem + "__staging")
-        out_dir.mkdir(parents=True, exist_ok=True)
         is_existing_non_empty = out_path.exists()
 
     if not args.force and is_existing_non_empty:
@@ -1119,6 +1139,11 @@ def _compress_safetensors_integration(args, mode: str) -> int:  # noqa: ANN001
         )
         if user_input not in ("yes", "y"):
             return 0
+
+    if mode == "b":
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        out_dir.mkdir(parents=True)
 
     input_bytes = input_path.stat().st_size
     if explore_options is not None:
@@ -1140,9 +1165,37 @@ def _compress_safetensors_integration(args, mode: str) -> int:  # noqa: ANN001
     )
 
     output_bytes = sum(p.stat().st_size for p in out_dir.rglob("*") if p.is_file())
+    if mode == "b":
+        final = _finish_mode_b(out_dir, out_path)
+        if final != out_path:
+            print(  # noqa: T201
+                f"The output needs more than one shard; wrote {final}/"
+            )
     if explore_options is not None:
         _print_explore_summary(audit, input_bytes, output_bytes)
     return 0
+
+
+def _finish_mode_b(staging: Path, out_path: Path) -> Path:
+    """Move mode-b shards from ``staging`` to their final place.
+
+    A single shard becomes the file ``out_path``; its index is dropped, since
+    a single ``.safetensors`` file needs none. Several shards and their index
+    move to the directory ``out_path`` without its last suffix (for example
+    ``model.ptwm.safetensors`` -> ``model.ptwm/``). Returns the final path.
+    """
+    shards = sorted(staging.glob("*.safetensors"))
+    if len(shards) == 1:
+        if out_path.is_dir():
+            shutil.rmtree(out_path)
+        shards[0].replace(out_path)
+        shutil.rmtree(staging)
+        return out_path
+    final_dir = out_path.with_suffix("")
+    if final_dir.exists():
+        shutil.rmtree(final_dir)
+    staging.rename(final_dir)
+    return final_dir
 
 
 def _resolve_compress_mode(args) -> str | None:  # noqa: ANN001

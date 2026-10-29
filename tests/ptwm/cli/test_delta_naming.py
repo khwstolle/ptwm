@@ -101,6 +101,31 @@ def test_legacy_name_without_matching_reference_name(tmp_path: Path) -> None:
     assert src.read_bytes() == data
 
 
+@pytest.mark.parametrize(
+    "name", [n for n in NAMES if not n.endswith(".bin")] + ["a.delta.b.pt"]
+)
+def test_new_name_without_matching_reference_name(name: str) -> None:
+    """A ``.delta.`` file restores its input name when the reference was
+    renamed since compression. The fallback used to split at ``_delta_``
+    or keep the whole ``.delta.<ref>`` part."""
+    compressed = delta_compressed_name(name, REF)
+    assert delta_restored_name(compressed, "renamed.bin") == name
+
+
+def test_new_name_with_delta_in_input_and_renamed_reference(tmp_path: Path) -> None:
+    """``my_delta_x.pt`` restored to ``my.bin`` (and with ``--force``
+    overwrote that file) when the reference was renamed."""
+    src, ref, data = _pair(tmp_path, "my_delta_x.pt")
+    _compress(src, ref, "--force")
+    renamed = ref.rename(tmp_path / "renamed.bin")
+    other = tmp_path / "my.bin"
+    other.write_bytes(b"keep me")
+    src.unlink()
+    _decompress(tmp_path / "my_delta_x.pt.delta.base.bin.ptwm", renamed, "--force")
+    assert src.read_bytes() == data
+    assert other.read_bytes() == b"keep me"
+
+
 def test_decompress_asks_before_overwriting_the_restored_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

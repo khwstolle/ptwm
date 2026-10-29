@@ -33,8 +33,10 @@ def delta_restored_name(compressed_name: str, reference_name: str) -> str:
 
     Inverse of :func:`delta_compressed_name`. A name that does not end in
     either delta form for ``reference_name`` (for example, the reference
-    was renamed) falls back to the pre-v1.2 rule: the part before the
-    first ``_delta_`` plus ``.bin``, else the name without ``.ptwm``.
+    was renamed) is split at its separator instead: the last ``.delta.``,
+    unless a ``_delta_`` follows it. A ``_delta_`` name keeps the pre-v1.2
+    rule, the part before the first ``_delta_`` plus ``.bin``. A name with
+    neither separator loses only its ``.ptwm`` suffix.
     """
     tail = f"{_DELTA_SEP}{reference_name}.ptwm"
     if compressed_name.endswith(tail) and len(compressed_name) > len(tail):
@@ -42,6 +44,9 @@ def delta_restored_name(compressed_name: str, reference_name: str) -> str:
     legacy_tail = f"{_DELTA_LEGACY_SEP}{reference_name}.ptwm"
     if compressed_name.endswith(legacy_tail):
         return compressed_name.removesuffix(legacy_tail) + ".bin"
+    sep = compressed_name.rfind(_DELTA_SEP)
+    if sep > 0 and _DELTA_LEGACY_SEP not in compressed_name[sep:]:
+        return compressed_name[:sep]
     if _DELTA_LEGACY_SEP in compressed_name:
         return compressed_name.split(_DELTA_LEGACY_SEP, 1)[0] + ".bin"
     return compressed_name.removesuffix(".ptwm")

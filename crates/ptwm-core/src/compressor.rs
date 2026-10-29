@@ -500,10 +500,12 @@ fn placeholder_trial(forced: CodecId) -> TrialResult {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pass1_select_chain(
     candidates: &[Chain],
     raw_bytes: &[u8],
     source_descriptor: &PlaneDescriptor,
+    layout_source: PlaneLayoutSource,
     forced_codec: Option<CodecId>,
     allow_codec_ids: Option<&[CodecId]>,
     // When true, skip the whole-plane selection encode and emit placeholder
@@ -555,12 +557,17 @@ fn pass1_select_chain(
         // decoder derives it from the chain's Source node, which uses the
         // chain-internal code space (fp32 is 1 in one and 0x0003 in the
         // other). Take the width and packing from the chain so encode-time
-        // and decode-time descriptors agree. The layout stays as given: the
-        // record's shape decides it, and changing it would change the
-        // legacy writer's output.
+        // and decode-time descriptors agree. The layout follows
+        // `layout_source`: containers store each plane's layout, so the
+        // record's shape decides it there (changing it would change the
+        // legacy writer's output); the compact frame stores none, so it
+        // takes the chain's.
         let mut forward_source = source_descriptor.clone();
         forward_source.element_width = chain_src.element_width;
         forward_source.is_nibble_packed = chain_src.is_nibble_packed;
+        if layout_source == PlaneLayoutSource::Chain {
+            forward_source.layout = chain_src.layout;
+        }
         let ctx = ForwardContext {
             source_bytes: raw_bytes,
             source_descriptor: forward_source,
@@ -719,12 +726,26 @@ pub(crate) struct ModelPlan {
     pub(crate) prelude_entries: Vec<PreludeEntry>,
 }
 
+/// Where the encoder takes each plane's row layout from. Row-aware codecs
+/// (`Order1ScaleAC`) decode with the layout their reader sees, so the
+/// encoder must use that same layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlaneLayoutSource {
+    /// The record's shape. Containers store each plane's layout, and their
+    /// readers decode with the stored one.
+    Record,
+    /// The chain's Source shape. The compact single-tensor frame stores no
+    /// layout; its reader derives every plane layout from the chain.
+    Chain,
+}
+
 /// Passes 0–3 of [`compress_model`]: validate the candidate chains, select a
 /// chain per tensor, fit shared state, and pick the final codec per plane.
 /// Writes nothing; the caller serializes the plan.
 pub(crate) fn plan_model(
     inputs: &[InputTensor<'_>],
     opts: &CompressorOptions,
+    layout_source: PlaneLayoutSource,
 ) -> Result<ModelPlan, PtwmCoreError> {
     // ---- Pass 0: structural validation of every candidate chain. ----------
     // Reject malformed chains at the API boundary so downstream stages can
@@ -790,6 +811,7 @@ pub(crate) fn plan_model(
                 &inp.candidate_chains,
                 inp.raw_bytes,
                 &source_descriptor,
+                layout_source,
                 opts.forced_codec,
                 opts.allow_codec_ids.as_deref(),
                 skip_trial_encode,
@@ -957,7 +979,7 @@ pub fn compress_model<W: Write + Seek>(
         mut pass1,
         chosen_per_tensor,
         prelude_entries,
-    } = plan_model(inputs, &opts)?;
+    } = plan_model(inputs, &opts, PlaneLayoutSource::Record)?;
     let mut prof_t = std::time::Instant::now();
     macro_rules! prof {
         ($t:expr, $label:expr) => {
@@ -1555,6 +1577,7 @@ mod tests {
             std::slice::from_ref(&chain),
             &raw,
             &source_descriptor_for(4, raw.len() as u64, None),
+            PlaneLayoutSource::Record,
             None,
             None,
             false,
@@ -1991,5 +2014,163 @@ mod source_descriptor_agreement_tests {
         assert_paths_agree(0x0006, &[10, 10], 100);
         assert_paths_agree(0x0002, &[10, 10], 200);
         assert_paths_agree(0x0003, &[10, 10], 400);
+    }
+
+    /// Source(`params`) → BytePassthrough → one Value terminal.
+    fn passthrough_chain(source_params: Vec<u8>) -> Chain {
+        use crate::chain::graph::{ChainEdge, ChainNode, TerminalRef};
+        use crate::transforms::op::OpId;
+        let role = Role::Value {
+            format: crate::types::role::ValueFormat::IntN { bits: 8 },
+        };
+        Chain {
+            nodes: vec![
+                ChainNode {
+                    op: OpId::Source,
+                    params: source_params,
+                },
+                ChainNode {
+                    op: OpId::BytePassthrough,
+                    params: Vec::new(),
+                },
+            ],
+            edges: vec![ChainEdge {
+                src_node: 0,
+                src_output_idx: 0,
+                dst_node: 1,
+                dst_input_idx: 0,
+                role_override: Some(role.clone()),
+                vendor_bytes: Vec::new(),
+            }],
+            terminals: vec![TerminalRef {
+                node_idx: 1,
+                output_idx: 0,
+                role,
+            }],
+        }
+    }
+
+    fn source_params(shape: &[u64], chain_dtype: u16) -> Vec<u8> {
+        let mut p = vec![shape.len() as u8];
+        for &d in shape {
+            p.extend_from_slice(&(d as u32).to_le_bytes());
+        }
+        p.extend_from_slice(&chain_dtype.to_le_bytes());
+        p
+    }
+
+    /// Differential guard: for every dtype the Python API accepts, the
+    /// terminal descriptors the encoder trial-encodes must equal the ones
+    /// the decoder uses: the chain-derived ones for the compact frame, and
+    /// the chain-derived ones with the stored record layout for containers. The record carries the public
+    /// dtype code and the tensor shape; the chain's Source carries the
+    /// chain-internal dtype code and a shape in its own elements. Chains
+    /// cover the three Source forms the Python writers build: the dtype's
+    /// own Source, a byte passthrough over a rescaled last dimension (dtypes
+    /// without production chains), and a 1-D byte Source for byte input
+    /// (no record shape).
+    #[test]
+    fn encode_and_decode_terminal_descriptors_agree_for_every_api_dtype() {
+        // (public code, storage bytes per element)
+        let dtypes: [(u16, u64); 18] = [
+            (6, 2),  // bfloat16
+            (4, 2),  // float16
+            (5, 2),  // half
+            (1, 4),  // float32
+            (2, 4),  // float
+            (3, 8),  // float64
+            (29, 1), // float8_e4m3fn
+            (30, 1), // float8_e5m2
+            (31, 1), // float4_e2m1fn_x2 (packed)
+            (17, 1), // int8
+            (18, 2), // int16
+            (20, 4), // int32
+            (22, 8), // int64
+            (13, 1), // uint8
+            (15, 4), // uint32
+            (24, 1), // bool
+            (19, 2), // short
+            (23, 8), // long
+        ];
+        let shapes: [&[u64]; 4] = [&[], &[6], &[3, 8], &[2, 3, 4]];
+        let opts = CompressorOptions::default();
+        for (code, storage) in dtypes {
+            for shape in shapes {
+                let n: u64 = shape.iter().product();
+                let raw: Vec<u8> = (0..n * storage).map(|i| (i * 37 % 251) as u8).collect();
+                let mut cases: Vec<(Option<Vec<u64>>, Chain)> = Vec::new();
+                if let Some(params) = crate::transforms::source::bound_source_params(shape, code) {
+                    cases.push((Some(shape.to_vec()), passthrough_chain(params)));
+                }
+                let mut byte_shape = shape.to_vec();
+                match byte_shape.last_mut() {
+                    Some(last) => *last *= storage,
+                    None => byte_shape.push(storage),
+                }
+                cases.push((
+                    Some(shape.to_vec()),
+                    passthrough_chain(source_params(&byte_shape, 0x0006)),
+                ));
+                cases.push((
+                    None,
+                    passthrough_chain(source_params(&[n * storage], 0x0006)),
+                ));
+                for (record_shape, chain) in cases {
+                    let input = InputTensor {
+                        name: "t".into(),
+                        candidate_chains: vec![chain.clone()],
+                        dtype_code: code,
+                        input_format: 1,
+                        raw_bytes: &raw,
+                        shape: record_shape.clone(),
+                        dtype_name: None,
+                        delta_reference_blake3: None,
+                    };
+                    let decoded =
+                        crate::chain::runtime::propagate_terminal_descriptors(&chain).unwrap();
+                    let ctx = format!(
+                        "dtype {code}, record shape {record_shape:?}, chain Source {:?}",
+                        chain.nodes[0].params
+                    );
+                    // Compact frame: the reader derives every descriptor
+                    // from the chain, layout included.
+                    let frame = plan_model(
+                        std::slice::from_ref(&input),
+                        &opts,
+                        PlaneLayoutSource::Chain,
+                    )
+                    .unwrap();
+                    let encoded: Vec<&PlaneDescriptor> = frame.pass1[0]
+                        .terminals
+                        .iter()
+                        .map(|(p, _)| &p.descriptor)
+                        .collect();
+                    assert_eq!(encoded, decoded.iter().collect::<Vec<_>>(), "{ctx}");
+                    // Container: the reader derives the descriptor from the
+                    // chain and takes the layout from the plane record,
+                    // which the writer fills from the record shape.
+                    let container = plan_model(
+                        std::slice::from_ref(&input),
+                        &opts,
+                        PlaneLayoutSource::Record,
+                    )
+                    .unwrap();
+                    let record_layout =
+                        source_descriptor_for(code, raw.len() as u64, record_shape.as_deref())
+                            .layout;
+                    for (((plane, _), chosen), want) in container.pass1[0]
+                        .terminals
+                        .iter()
+                        .zip(&container.chosen_per_tensor[0])
+                        .zip(&decoded)
+                    {
+                        let mut want = want.clone();
+                        want.layout = record_layout;
+                        assert_eq!(plane.descriptor, want, "{ctx}");
+                        assert_eq!(chosen.layout, legacy_plane_layout(record_layout), "{ctx}");
+                    }
+                }
+            }
+        }
     }
 }

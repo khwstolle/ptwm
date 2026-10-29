@@ -7,23 +7,15 @@
 //! open a temporary handle per call.
 //!
 //! A buffer is borrowed without a copy only when its memory cannot change
-//! while the handle exists: a C-contiguous export of ``bytes``, or of an
-//! ``mmap`` opened with ``ACCESS_READ``, directly or through any chain of
-//! ``memoryview`` objects. The handle holds the buffer export, which keeps
-//! the object alive and its memory pinned. Every other buffer is copied
-//! once, including read-only views of mutable objects (for example
-//! ``memoryview(bytearray).toreadonly()`` or a numpy array with
-//! ``writeable=False`` over a writable base): a read-only export only says
-//! that the export cannot be written through, not that the owner cannot
-//! write the memory, and the reader runs with the GIL released.
-//!
-//! A read-only ``mmap`` maps a file with ``MAP_SHARED``. Another process (or
-//! a second, writable mapping of the same file) can still change the file;
-//! the caller must not modify a file while a handle borrows it.
+//! while the handle exists; every other buffer is copied once. The rule is
+//! in [`crate::buffer`]. The handle holds the buffer export, which keeps the
+//! object alive and its memory pinned.
 
 use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyMemoryView};
+use pyo3::types::PyBytes;
+
+use crate::buffer::ReadBuffer;
 
 use ptwm_core::PtwmCoreError;
 use ptwm_core::container::{ContainerLayout, ContainerReader};
@@ -37,16 +29,6 @@ pub type TensorInfo = (Vec<u64>, String, u16, u8);
 /// `(tensor_name, plane_index, role, codec_id, state_source, payload_len)`.
 pub type PlaneSummary = (String, u32, u8, u16, u8, u64);
 
-/// The memory a handle's reader points into.
-enum Backing {
-    /// A C-contiguous export of immutable memory (see
-    /// [`immutable_backing`]). Holding it keeps the exporting object alive
-    /// and its memory pinned.
-    Borrowed(#[allow(dead_code)] PyBuffer<u8>),
-    /// A private copy of a buffer that could change under the reader.
-    Owned(#[allow(dead_code)] Box<[u8]>),
-}
-
 /// An opened `.ptwm` container (either layout).
 ///
 /// ``ContainerHandle(buffer, skip_missing=False)`` opens the container once;
@@ -58,81 +40,25 @@ pub struct ContainerHandle {
     // Field order matters: `reader` borrows from `_backing` and must drop
     // first. Struct fields drop in declaration order.
     reader: ContainerReader<'static>,
-    _backing: Backing,
+    _backing: ReadBuffer,
 }
 
 fn runtime_err(e: PtwmCoreError) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
 }
 
-/// Whether the memory behind `obj`'s buffer cannot change for as long as
-/// an export of it is held.
-///
-/// True for an exact ``bytes`` object and for an exact ``mmap.mmap`` whose
-/// own export is read-only (``ACCESS_READ``), reached directly or through
-/// ``memoryview.obj`` links. Everything else (``bytearray``, writable
-/// ``mmap``, numpy arrays, subclasses that could override the buffer
-/// protocol, memoryviews without an owner object) is treated as mutable.
-fn immutable_backing(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
-    let py = obj.py();
-    let mut cur = obj.clone();
-    // `memoryview.obj` of a memoryview over a memoryview names the base
-    // object, so the loop ends after one step in practice; the bound guards
-    // against an unexpected cycle.
-    for _ in 0..16 {
-        if cur.is_exact_instance_of::<PyMemoryView>() {
-            let base = cur.getattr("obj")?;
-            if base.is_none() {
-                return Ok(false);
-            }
-            cur = base;
-            continue;
-        }
-        if cur.is_exact_instance_of::<PyBytes>() {
-            return Ok(true);
-        }
-        let mmap_type = py.import("mmap")?.getattr("mmap")?;
-        if cur.get_type().is(&mmap_type) {
-            return Ok(PyBuffer::<u8>::get(&cur)?.readonly());
-        }
-        return Ok(false);
-    }
-    Ok(false)
-}
-
 impl ContainerHandle {
     /// Open the buffer `obj` exports. The buffer is borrowed when its memory
-    /// cannot change (see [`immutable_backing`]) and is C-contiguous;
-    /// otherwise it is copied once.
+    /// cannot change and it is C-contiguous; otherwise it is copied once
+    /// (see [`ReadBuffer::new`]).
     pub fn open(py: Python<'_>, obj: &Bound<'_, PyAny>, skip_missing: bool) -> PyResult<Self> {
-        let buffer = PyBuffer::<u8>::get(obj)?;
-        let borrow = buffer.is_c_contiguous() && immutable_backing(obj)?;
-        let (bytes, backing): (&[u8], Backing) = if borrow {
-            let len = buffer.len_bytes();
-            let bytes: &[u8] = if len == 0 {
-                &[]
-            } else {
-                // SAFETY: the buffer is C-contiguous and `len` bytes long.
-                // The export stays alive in `Backing::Borrowed` for as long
-                // as the reader, which keeps the owner alive and (for
-                // `mmap`) prevents it from being closed or resized. The
-                // owner is `bytes` or a read-only `mmap`, so no Python code
-                // can write the memory while the reader holds slices into
-                // it, even with the GIL released.
-                unsafe { std::slice::from_raw_parts(buffer.buf_ptr() as *const u8, len) }
-            };
-            (bytes, Backing::Borrowed(buffer))
-        } else {
-            let owned: Box<[u8]> = buffer.to_vec(py)?.into_boxed_slice();
-            // SAFETY: the boxed slice's heap memory does not move when the
-            // box moves into `Backing::Owned`, and it lives as long as the
-            // reader.
-            let bytes = unsafe { std::slice::from_raw_parts(owned.as_ptr(), owned.len()) };
-            (bytes, Backing::Owned(owned))
-        };
-        // SAFETY: `bytes` points into `backing`, which the handle owns and
-        // drops after the reader (see the field order of `ContainerHandle`).
-        let bytes: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(bytes) };
+        let backing = ReadBuffer::new(obj)?;
+        // SAFETY: `bytes` points into the export or the heap copy owned by
+        // `backing`; neither moves when `backing` moves into the handle. The
+        // handle drops the reader before `backing` (see the field order of
+        // `ContainerHandle`).
+        let bytes: &'static [u8] =
+            unsafe { std::mem::transmute::<&[u8], &'static [u8]>(backing.as_slice()) };
         let reader = py
             .allow_threads(|| {
                 if skip_missing {
@@ -246,7 +172,7 @@ impl ContainerHandle {
     /// Whether the buffer is borrowed (``True``) or was copied (``False``).
     #[getter]
     fn zero_copy(&self) -> bool {
-        matches!(self._backing, Backing::Borrowed(_))
+        self._backing.is_borrowed()
     }
 
     /// Every tensor name in write (body) order.

@@ -448,6 +448,65 @@ pub fn chain_terminal_descriptors(chain: &Chain) -> Result<Vec<PlaneDescriptor>,
 // Inverse executor
 // ---------------------------------------------------------------------------
 
+/// Forward input descriptors of every node, indexed by node, computed
+/// symbolically from the Source params as [`propagate_terminal_descriptors`]
+/// does.
+///
+/// The walk does not fail: a node gets `None` when the Source or an
+/// upstream node has no descriptor, when the node is a cross-tensor delta
+/// op (its descriptors need dependency planes), or when its
+/// `propagate_descriptors` rejects the inputs. An op that receives `None`
+/// in [`Op::inverse_with_input_descs`] falls back to its plain inverse, so
+/// the walk never makes a decodable chain fail.
+///
+/// [`Op::inverse_with_input_descs`]: crate::transforms::op::Op::inverse_with_input_descs
+fn symbolic_node_inputs(chain: &Chain, topo: &[usize]) -> Vec<Option<Vec<PlaneDescriptor>>> {
+    let n = chain.nodes.len();
+    let mut ins: Vec<Option<Vec<PlaneDescriptor>>> = vec![None; n];
+    let mut outs: Vec<Option<Vec<PlaneDescriptor>>> = vec![None; n];
+    let Ok(source) = chain_source_descriptor(chain) else {
+        return ins;
+    };
+    for &node_idx in topo {
+        if node_idx == 0 {
+            outs[0] = Some(vec![source.clone()]);
+            continue;
+        }
+        let node = &chain.nodes[node_idx];
+        if is_delta_op(node.op) {
+            continue;
+        }
+        let mut input_edges: Vec<_> = chain
+            .edges
+            .iter()
+            .filter(|e| e.dst_node as usize == node_idx)
+            .collect();
+        input_edges.sort_by_key(|e| e.dst_input_idx);
+        let inputs: Option<Vec<PlaneDescriptor>> = input_edges
+            .iter()
+            .map(|edge| {
+                let mut desc = outs
+                    .get(edge.src_node as usize)?
+                    .as_ref()?
+                    .get(edge.src_output_idx as usize)?
+                    .clone();
+                if let Some(ref role) = edge.role_override {
+                    desc.role = role.clone();
+                }
+                Some(desc)
+            })
+            .collect();
+        let Some(inputs) = inputs else {
+            continue;
+        };
+        outs[node_idx] = op_from_id(node.op, &node.params)
+            .and_then(|op| op.propagate_descriptors(&inputs))
+            .ok();
+        ins[node_idx] = Some(inputs);
+    }
+    ins
+}
+
 /// Context supplied by the caller for an inverse (decode) pass.
 pub struct InverseContext<'a> {
     /// Decoded terminal planes, in the same order as `chain.terminals`.
@@ -499,6 +558,10 @@ pub fn inverse_chain(chain: &Chain, ctx: &InverseContext) -> Result<Plane, PtwmC
             fused_consumers_inv.insert(node_idx as u8, fused);
         }
     }
+
+    // Forward input descriptors per node, for ops whose outputs do not fix
+    // the input size (`IndexBitwidthPack` pads its last byte).
+    let input_descs = symbolic_node_inputs(chain, &topo);
 
     // Working state: (node_idx, output_idx) → Plane
     let mut state: HashMap<(u8, u8), Plane> = HashMap::new();
@@ -620,7 +683,8 @@ pub fn inverse_chain(chain: &Chain, ctx: &InverseContext) -> Result<Plane, PtwmC
         }
 
         let op = op_from_id(node.op, &node.params)?;
-        let reconstructed_inputs = op.inverse(&op_outputs)?;
+        let reconstructed_inputs =
+            op.inverse_with_input_descs(&op_outputs, input_descs[node_idx].as_deref())?;
 
         // Store reconstructed inputs at the source (producer) slots.
         let mut input_edges: Vec<_> = chain
@@ -937,6 +1001,79 @@ mod tests {
             is_nibble_packed: false,
             vendor_bytes: vec![],
         }
+    }
+
+    /// `Source(n bytes) → IndexBitwidthPack{bits} → Terminal`.
+    fn index_pack_chain(n_indices: u32, bits: u8) -> Chain {
+        Chain {
+            nodes: vec![
+                ChainNode {
+                    op: OpId::Source,
+                    params: source_params_for(n_indices, 0x0005), // int8 → 1 byte/elem
+                },
+                ChainNode {
+                    op: OpId::IndexBitwidthPack,
+                    params: vec![bits],
+                },
+            ],
+            edges: vec![ChainEdge {
+                src_node: 0,
+                src_output_idx: 0,
+                dst_node: 1,
+                dst_input_idx: 0,
+                role_override: None,
+                vendor_bytes: vec![],
+            }],
+            terminals: vec![TerminalRef {
+                node_idx: 1,
+                output_idx: 0,
+                role: Role::Index,
+            }],
+        }
+    }
+
+    #[test]
+    fn forward_inverse_roundtrip_index_pack_exact_count() {
+        // Counts 1..=40 cover every residue of `n * bits % 8`, including the
+        // padded cases the inverse used to over-count.
+        let mut padded = 0usize;
+        for bits in 1u8..=8 {
+            let modulus = 1u16 << bits;
+            for n in 1u32..=40 {
+                if n as u64 * bits as u64 % 8 != 0 {
+                    padded += 1;
+                }
+                let chain = index_pack_chain(n, bits);
+                let source_bytes: Vec<u8> = (0..n)
+                    .map(|i| ((i as u16 * 7 + 3) % modulus) as u8)
+                    .collect();
+                let ctx = ForwardContext {
+                    source_bytes: &source_bytes,
+                    source_descriptor: raw_descriptor(n as u64),
+                    deps: &[],
+                };
+                let fwd = forward_chain(&chain, &ctx).unwrap();
+                let terminal_planes: Vec<Plane> =
+                    fwd.terminal_planes.into_iter().map(|(p, _)| p).collect();
+                assert_eq!(
+                    terminal_planes[0].bytes.len() as u64,
+                    (n as u64 * bits as u64).div_ceil(8),
+                    "bits={bits} n={n}: packed length"
+                );
+                let inv_ctx = InverseContext {
+                    terminal_planes: &terminal_planes,
+                    deps: &[],
+                };
+                let recovered = inverse_chain(&chain, &inv_ctx).unwrap();
+                assert_eq!(
+                    recovered.bytes.as_ref(),
+                    source_bytes.as_slice(),
+                    "bits={bits} n={n}: round-trip mismatch"
+                );
+                assert_eq!(recovered.descriptor.length_bytes, n as u64);
+            }
+        }
+        assert!(padded > 0);
     }
 
     #[test]

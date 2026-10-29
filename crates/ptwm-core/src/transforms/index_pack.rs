@@ -145,7 +145,18 @@ impl Op for IndexBitwidthPack {
         }])
     }
 
+    /// Without the input descriptor, the index count is
+    /// `floor(packed_bits / bits)`. That is too large when the last byte
+    /// holds padding; [`Op::inverse_with_input_descs`] gives the exact count.
     fn inverse(&self, outputs: &[Plane]) -> Result<Vec<Plane>, PtwmCoreError> {
+        self.inverse_with_input_descs(outputs, None)
+    }
+
+    fn inverse_with_input_descs(
+        &self,
+        outputs: &[Plane],
+        input_descs: Option<&[PlaneDescriptor]>,
+    ) -> Result<Vec<Plane>, PtwmCoreError> {
         self.validate()?;
         if outputs.len() != 1 {
             return Err(PtwmCoreError::InvalidContainer(format!(
@@ -154,14 +165,27 @@ impl Op for IndexBitwidthPack {
             )));
         }
         let packed = &outputs[0];
-        // Derive the number of original indices: total bits / bits_per_index.
-        // Since packing may have padded to a byte boundary, the caller must
-        // ensure the packed plane's length is consistent. We trust the
-        // descriptor's length_bytes for the packed data and recompute n_indices
-        // as floor(packed_bits / bits).  Any padding bits in the last byte are
-        // zero and ignored.
-        let packed_bits = packed.bytes.len() as u64 * 8;
-        let n_indices = packed_bits / self.bits as u64;
+        let packed_bytes = packed.bytes.len() as u64;
+        let n_indices = match input_descs {
+            Some([input]) => {
+                let n = input.length_bytes;
+                if checked_packed_len(n, self.bits) != Some(packed_bytes) {
+                    return Err(PtwmCoreError::InvalidContainer(format!(
+                        "IndexBitwidthPack.inverse: {packed_bytes} packed bytes do not hold \
+                         {n} indices of {} bits",
+                        self.bits
+                    )));
+                }
+                n
+            }
+            Some(descs) => {
+                return Err(PtwmCoreError::InvalidContainer(format!(
+                    "IndexBitwidthPack.inverse: expected 1 input descriptor, got {}",
+                    descs.len()
+                )));
+            }
+            None => packed_bytes * 8 / self.bits as u64,
+        };
         let mut out_bytes = vec![0u8; n_indices as usize];
         unpack_bits(&packed.bytes, &mut out_bytes, self.bits);
 
@@ -246,6 +270,35 @@ mod tests {
                 "bits={bits}: round-trip mismatch"
             );
         }
+    }
+
+    #[test]
+    fn inverse_with_input_descs_returns_exact_count() {
+        // 3 indices × 3 bits = 9 bits → 2 bytes. Without the input
+        // descriptor the count is floor(16 / 3) = 5.
+        let op = IndexBitwidthPack { bits: 3 };
+        let input = make_plane(vec![5, 2, 7]);
+        let input_desc = input.descriptor.clone();
+        let packed = op.forward(&[input]).unwrap();
+        assert_eq!(packed[0].bytes.len(), 2);
+        assert_eq!(op.inverse(&packed).unwrap()[0].bytes.len(), 5);
+        let exact = op
+            .inverse_with_input_descs(&packed, Some(std::slice::from_ref(&input_desc)))
+            .unwrap();
+        assert_eq!(exact[0].bytes.as_ref(), [5, 2, 7]);
+    }
+
+    #[test]
+    fn inverse_with_input_descs_rejects_inconsistent_length() {
+        // 2 packed bytes cannot hold 6 indices of 3 bits (18 bits).
+        let op = IndexBitwidthPack { bits: 3 };
+        let packed = make_plane(vec![0, 0]);
+        let mut desc = packed.descriptor.clone();
+        desc.length_bytes = 6;
+        assert!(
+            op.inverse_with_input_descs(&[packed], Some(std::slice::from_ref(&desc)))
+                .is_err()
+        );
     }
 
     #[test]

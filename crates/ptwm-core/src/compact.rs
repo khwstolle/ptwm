@@ -1230,12 +1230,20 @@ mod tests {
             dtype_name: Some("uint8".into()),
             delta_reference_blake3: None,
         };
-        let o = CompressorOptions {
-            forced_codec: Some(CodecId::Order1ScaleAC),
-            ..opts(false, true)
-        };
-        let blob = compress_compact(&input, &o).unwrap().unwrap();
-        assert_eq!(blob[FLAGS_AT] & FLAG_STORED, 0, "frame must be coded");
-        assert_eq!(decode_compact(&blob).unwrap().raw, raw);
+        // Without any integrity field a layout mismatch decodes to wrong
+        // bytes silently, so the first case checks the decoded bytes
+        // themselves. With plane CRCs the same mismatch fails the CRC check.
+        for (hash, crc) in [(false, false), (false, true)] {
+            let o = CompressorOptions {
+                forced_codec: Some(CodecId::Order1ScaleAC),
+                ..opts(hash, crc)
+            };
+            let blob = compress_compact(&input, &o).unwrap().unwrap();
+            assert_eq!(blob[FLAGS_AT] & FLAG_STORED, 0, "frame must be coded");
+            let decoded = decode_compact(&blob)
+                .unwrap_or_else(|e| panic!("hash={hash} crc={crc}: {e}"))
+                .raw;
+            assert!(decoded == raw, "hash={hash} crc={crc}: wrong bytes");
+        }
     }
 }

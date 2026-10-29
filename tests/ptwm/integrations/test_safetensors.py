@@ -65,3 +65,45 @@ def test_decompress_safetensors_tensor_success() -> None:
     assert isinstance(decompressed, torch.Tensor)
     assert decompressed.dtype == torch.float32
     assert torch.equal(decompressed, original_tensor)
+
+
+def test_safetensors_without_metadata_round_trips(tmp_path) -> None:
+    """A source file saved without metadata still records its compressed tensors.
+
+    The ``ptwm_compressed_vectors`` entry was written only into an existing
+    metadata dict, so readers returned each compressed tensor as raw uint8.
+    """
+    from ptwm.cli.compress import compress_safetensors_file
+    from ptwm.cli.decompress import decompress_safetensors_file
+    from ptwm.integrations._safetensors import SafeOpen
+    from ptwm.utils._safetensors import METADATA_KEY
+
+    g = torch.Generator().manual_seed(0)
+    tensors = {
+        "big": torch.randn(256, 256, generator=g).to(torch.bfloat16),
+        "small": torch.randn(64, 32, generator=g).to(torch.bfloat16),
+    }
+    src = tmp_path / "m.safetensors"
+    save_file(tensors, str(src))
+    with safe_open(str(src), framework="pt", device="cpu") as f:
+        assert f.metadata() is None
+
+    compress_safetensors_file(str(src), force=True)
+    compressed = tmp_path / "m.ptwm.safetensors"
+    with safe_open(str(compressed), framework="pt", device="cpu") as f:
+        meta = f.metadata()
+        assert meta is not None
+        assert METADATA_KEY in meta
+
+    with SafeOpen(str(compressed), "pt") as f:
+        for name, want in tensors.items():
+            got = f.get_tensor(name)
+            assert got.dtype == want.dtype
+            assert torch.equal(got, want)
+
+    src.unlink()
+    decompress_safetensors_file(str(compressed), force=True)
+    with safe_open(str(src), framework="pt", device="cpu") as f:
+        assert f.metadata() is None
+        for name, want in tensors.items():
+            assert torch.equal(f.get_tensor(name), want)

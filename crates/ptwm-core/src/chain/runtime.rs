@@ -270,65 +270,178 @@ pub fn forward_chain(chain: &Chain, ctx: &ForwardContext) -> Result<ForwardResul
 // Descriptor reconstruction (per-terminal, derived from chain structure)
 // ---------------------------------------------------------------------------
 
-/// Recover the [`PlaneDescriptor`] of every chain terminal in
-/// `chain.terminals` order, without the original tensor bytes.
+/// Descriptor of the plane the chain's `Source` node emits.
 ///
-/// The reconstruction runs [`forward_chain`] over a **placeholder source
-/// buffer** of zero bytes (length matching the `Source` op's declared
-/// shape × dtype). Forward execution honours fusion, role overrides, and
-/// every op's actual descriptor flow, so the descriptors returned here
-/// match exactly what an end-to-end forward pass on the real tensor
-/// would produce.
-///
-/// The decoder calls this to feed faithful `Plane` values into
-/// [`inverse_chain`].
-///
-/// Cross-tensor delta ops are out of scope here: the placeholder forward
-/// would need real dep planes. Chains containing `XorDelta` /
-/// `FloatDelta` cannot reconstruct terminal descriptors via this helper
-/// alone — the compressor driver owns that orchestration.
-pub fn chain_terminal_descriptors(chain: &Chain) -> Result<Vec<PlaneDescriptor>, PtwmCoreError> {
-    if chain.nodes.is_empty() {
+/// Checks that the chain is non-empty and that node 0 is `Source`. The
+/// length comes from the Source params (shape × dtype) with checked
+/// arithmetic, so a corrupt shape returns an error instead of wrapping.
+pub fn chain_source_descriptor(chain: &Chain) -> Result<PlaneDescriptor, PtwmCoreError> {
+    let first = chain.nodes.first().ok_or_else(|| {
+        PtwmCoreError::InvalidContainer("chain descriptors: chain has no nodes".into())
+    })?;
+    if first.op != OpId::Source {
         return Err(PtwmCoreError::InvalidContainer(
-            "chain_terminal_descriptors: chain has no nodes".into(),
+            "chain descriptors: node[0] must be Source".into(),
         ));
     }
-    if chain.nodes[0].op != OpId::Source {
-        return Err(PtwmCoreError::InvalidContainer(
-            "chain_terminal_descriptors: node[0] must be Source".into(),
-        ));
-    }
-
-    // Re-instantiate the Source op to call its `propagate_descriptors` on
-    // no inputs, producing the canonical raw-tensor descriptor (with
-    // element_width / layout / length_bytes derived from shape +
-    // dtype_code).
-    let source_op = op_from_id(OpId::Source, &chain.nodes[0].params)?;
-    let source_descs = source_op.propagate_descriptors(&[])?;
-    if source_descs.len() != 1 {
+    let mut descs = op_from_id(OpId::Source, &first.params)?.propagate_descriptors(&[])?;
+    if descs.len() != 1 {
         return Err(PtwmCoreError::InvalidContainer(format!(
-            "chain_terminal_descriptors: Source op produced {} descriptors (expected 1)",
-            source_descs.len()
+            "chain descriptors: Source op produced {} descriptors (expected 1)",
+            descs.len()
         )));
     }
-    let source_descriptor = source_descs.into_iter().next().ok_or_else(|| {
-        PtwmCoreError::InvalidContainer(
-            "chain_terminal_descriptors: Source op produced no descriptors".into(),
-        )
-    })?;
-    let placeholder_bytes = vec![0u8; source_descriptor.length_bytes as usize];
+    Ok(descs.remove(0))
+}
 
-    let ctx = ForwardContext {
-        source_bytes: &placeholder_bytes,
-        source_descriptor,
-        deps: &[],
-    };
-    let result = forward_chain(chain, &ctx)?;
-    Ok(result
-        .terminal_planes
-        .into_iter()
-        .map(|(plane, _role)| plane.descriptor)
-        .collect())
+/// Largest plane, at any node of a chain, that a decoder accepts for a
+/// tensor of `orig_size` raw bytes.
+///
+/// The factor 16 is the product of two cases that existing files can
+/// combine:
+///
+/// - A Source that overstates the raw size by up to 8×. Only files written
+///   by the Python byte-input path before the P4 fix do this, and their
+///   chains are 1-D byte passthroughs or byte splits, whose planes are no
+///   larger than the Source.
+/// - Ops that expand a plane. MxFp4 deinterleave at most doubles it. The
+///   spherical and alpha-stable scale planes can reach 4× their input (one
+///   8-byte scale per row of a single 16-bit element), but their builders
+///   accept only 2-D shapes, which the Python path always sizes exactly.
+///
+/// So no chain a writer emits multiplies the two, and 16× leaves 2× of
+/// headroom over the largest case (8× overstated Source, or a 4× scale
+/// plane). The constant 4096 covers block padding such as the
+/// BurrowsWheeler index (4 bytes per 256 KiB block). Decoders use this one
+/// helper so the bound cannot drift between layouts.
+pub fn max_plane_len(orig_size: u64) -> u64 {
+    orig_size.saturating_mul(16).saturating_add(4096)
+}
+
+/// Recover the [`PlaneDescriptor`] of every chain terminal in
+/// `chain.terminals` order, without the tensor bytes and without allocating
+/// any plane buffer.
+///
+/// Same as [`propagate_terminal_descriptors_bounded`] with no bound.
+pub fn propagate_terminal_descriptors(
+    chain: &Chain,
+) -> Result<Vec<PlaneDescriptor>, PtwmCoreError> {
+    propagate_terminal_descriptors_bounded(chain, u64::MAX)
+}
+
+/// Recover terminal descriptors symbolically and reject any node output
+/// longer than `max_plane_len` bytes.
+///
+/// The walk calls `propagate_descriptors` on every node in topological
+/// order. It mirrors [`forward_chain`]:
+///
+/// - inputs are gathered from the incoming edges sorted by `dst_input_idx`,
+///   and an edge's `role_override` replaces the input's role;
+/// - fused pairs (see [`try_fuse_at`]) need no special case: fusion applies
+///   only to edges without a role override, and every fused kernel emits the
+///   same descriptors as the unfused producer and consumer;
+/// - each terminal's descriptor takes the terminal's role, as
+///   `forward_chain` re-tags terminal planes.
+///
+/// No op's output size, layout or role depends on plane contents, so the
+/// result equals the descriptors `forward_chain` produces on a tensor of
+/// the Source's declared size. The one data-dependent field is the estimate
+/// `EntropyEstimate` writes into `vendor_bytes`: this walk reports zeros
+/// (its `propagate_descriptors` value). The earlier decoder computed it
+/// from placeholder planes, which was not the encode-time value either, and
+/// no codec or decoder reads it.
+///
+/// Cross-tensor delta ops (`XorDelta`, `FloatDelta`) need dependency planes
+/// and return an error here.
+///
+/// The Source descriptor is checked against the bound first, so a Source
+/// that declares gigabytes fails before any other node is visited.
+pub fn propagate_terminal_descriptors_bounded(
+    chain: &Chain,
+    max_plane_len: u64,
+) -> Result<Vec<PlaneDescriptor>, PtwmCoreError> {
+    let source = chain_source_descriptor(chain)?;
+    if source.length_bytes > max_plane_len {
+        return Err(PtwmCoreError::InvalidContainer(format!(
+            "chain descriptors: Source declares {} bytes, bound is {max_plane_len}",
+            source.length_bytes
+        )));
+    }
+    let topo = topo_sort(chain)?;
+    let mut outs: Vec<Option<Vec<PlaneDescriptor>>> = vec![None; chain.nodes.len()];
+    for &node_idx in &topo {
+        if node_idx == 0 {
+            outs[0] = Some(vec![source.clone()]);
+            continue;
+        }
+        let node = &chain.nodes[node_idx];
+        if is_delta_op(node.op) {
+            return Err(PtwmCoreError::InvalidContainer(format!(
+                "chain descriptors: node[{node_idx}] ({:?}) is a cross-tensor delta op \
+                 and needs dependency planes",
+                node.op
+            )));
+        }
+        let mut input_edges: Vec<_> = chain
+            .edges
+            .iter()
+            .filter(|e| e.dst_node as usize == node_idx)
+            .collect();
+        input_edges.sort_by_key(|e| e.dst_input_idx);
+        let mut inputs = Vec::with_capacity(input_edges.len());
+        for edge in input_edges {
+            let mut desc = outs
+                .get(edge.src_node as usize)
+                .and_then(|o| o.as_ref())
+                .and_then(|o| o.get(edge.src_output_idx as usize))
+                .cloned()
+                .ok_or_else(|| {
+                    PtwmCoreError::InvalidContainer(format!(
+                        "chain descriptors: missing plane for node={}, output={}",
+                        edge.src_node, edge.src_output_idx
+                    ))
+                })?;
+            if let Some(ref role) = edge.role_override {
+                desc.role = role.clone();
+            }
+            inputs.push(desc);
+        }
+        let produced = op_from_id(node.op, &node.params)?.propagate_descriptors(&inputs)?;
+        if let Some(d) = produced.iter().find(|d| d.length_bytes > max_plane_len) {
+            return Err(PtwmCoreError::InvalidContainer(format!(
+                "chain descriptors: node[{node_idx}] ({:?}) declares a {}-byte plane, \
+                 bound is {max_plane_len}",
+                node.op, d.length_bytes
+            )));
+        }
+        outs[node_idx] = Some(produced);
+    }
+    chain
+        .terminals
+        .iter()
+        .map(|term| {
+            let mut desc = outs
+                .get(term.node_idx as usize)
+                .and_then(|o| o.as_ref())
+                .and_then(|o| o.get(term.output_idx as usize))
+                .cloned()
+                .ok_or_else(|| {
+                    PtwmCoreError::InvalidContainer(format!(
+                        "chain descriptors: terminal references missing plane \
+                         (node={}, output={})",
+                        term.node_idx, term.output_idx
+                    ))
+                })?;
+            desc.role = term.role.clone();
+            Ok(desc)
+        })
+        .collect()
+}
+
+/// Recover terminal descriptors. Kept for callers of the earlier API; it is
+/// [`propagate_terminal_descriptors`].
+pub fn chain_terminal_descriptors(chain: &Chain) -> Result<Vec<PlaneDescriptor>, PtwmCoreError> {
+    propagate_terminal_descriptors(chain)
 }
 
 // ---------------------------------------------------------------------------
@@ -1361,5 +1474,392 @@ mod tests {
             "plane descriptor role must be re-tagged from Raw to Scale, got {:?}",
             plane.descriptor.role,
         );
+    }
+
+    // ── Symbolic descriptor propagation (P5) ────────────────────────────────
+
+    /// The earlier decoder path: run `forward_chain` over a zero buffer of
+    /// the Source's declared size and read the terminal descriptors back.
+    /// Kept here as the reference the symbolic walk must match.
+    fn forward_descriptors(chain: &Chain) -> Result<Vec<PlaneDescriptor>, PtwmCoreError> {
+        let source_descriptor = chain_source_descriptor(chain)?;
+        let placeholder = vec![0u8; source_descriptor.length_bytes as usize];
+        let ctx = ForwardContext {
+            source_bytes: &placeholder,
+            source_descriptor,
+            deps: &[],
+        };
+        Ok(forward_chain(chain, &ctx)?
+            .terminal_planes
+            .into_iter()
+            .map(|(plane, _)| plane.descriptor)
+            .collect())
+    }
+
+    /// Compare the symbolic walk with the forward reference on one chain.
+    /// Returns true when both ran and agreed; false when the forward pass
+    /// rejects the chain (it checks some lengths `propagate_descriptors`
+    /// does not, so the symbolic walk may accept those).
+    fn assert_symbolic_matches_forward(label: &str, chain: &Chain) -> bool {
+        let Ok(expected) = forward_descriptors(chain) else {
+            return false;
+        };
+        let mut got = propagate_terminal_descriptors(chain)
+            .unwrap_or_else(|e| panic!("{label}: forward succeeded but symbolic failed: {e}"));
+        let mut expected = expected;
+        // EntropyEstimate writes an estimate of the bytes it sees into
+        // `vendor_bytes`. The forward reference computes it from placeholder
+        // planes (zeros at the Source, arbitrary after ops such as
+        // AlphaStableNormalize), the symbolic walk always reports zeros.
+        // Neither is the encode-time value and no decoder reads it, so it
+        // is left out of the comparison.
+        if chain.nodes.iter().any(|n| n.op == OpId::EntropyEstimate) {
+            for d in got.iter_mut().chain(expected.iter_mut()) {
+                d.vendor_bytes.clear();
+            }
+        }
+        assert_eq!(
+            got, expected,
+            "{label}: symbolic descriptors differ from forward"
+        );
+        true
+    }
+
+    #[test]
+    fn symbolic_descriptors_match_forward_on_production_chains() {
+        // Written by tests/ptwm/preprocessing/test_production_chain_fixture.py
+        // from every Python chain builder and the explorer's first candidates.
+        let data: &[u8] = include_bytes!("../../tests/fixtures/production_chains.bin");
+        let mut pos = 0usize;
+        let (mut total, mut valid, mut compared) = (0usize, 0usize, 0usize);
+        let mut fused = 0usize;
+        while pos < data.len() {
+            let name_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            let label = std::str::from_utf8(&data[pos..pos + name_len]).unwrap();
+            pos += name_len;
+            let blob_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let blob = &data[pos..pos + blob_len];
+            pos += blob_len;
+            total += 1;
+            let (chain, _) = crate::chain::wire::read_chain_blob(blob)
+                .unwrap_or_else(|e| panic!("{label}: fixture blob does not parse: {e}"));
+            // Some explorer chains do not fit every fixture shape (a 0-d
+            // fp16 tensor cannot be split into 4 bytes); the decoder
+            // rejects those through `validate_chain` before descriptors.
+            if crate::chain::validate::validate_chain(&chain, 0).is_err() {
+                assert!(label.starts_with("explore"), "{label}: invalid chain");
+                continue;
+            }
+            valid += 1;
+            if (1..chain.nodes.len()).any(|i| try_fuse_at(&chain, i as u8).is_some()) {
+                fused += 1;
+            }
+            if assert_symbolic_matches_forward(label, &chain) {
+                compared += 1;
+            }
+        }
+        assert!(total > 500, "fixture holds only {total} chains");
+        // Forward rejects a few builder/shape pairs (e.g. microscale repack
+        // on lengths that are not whole blocks); nearly all must compare.
+        assert!(
+            compared * 10 >= valid * 9,
+            "only {compared} of {valid} valid chains ran forward ({total} in fixture)"
+        );
+        assert!(fused > 50, "only {fused} chains exercise fusion");
+    }
+
+    /// Small deterministic PRNG (xorshift64*), so the test needs no crate.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn pick<T: Clone>(&mut self, items: &[T]) -> T {
+            items[self.below(items.len() as u64) as usize].clone()
+        }
+    }
+
+    fn random_role(rng: &mut Rng) -> Role {
+        use crate::types::role::{NibbleKind, ScaleFormat, ValueFormat};
+        rng.pick(&[
+            Role::Raw,
+            Role::ExponentByte,
+            Role::Index,
+            Role::MantissaByte { index: 0, of: 2 },
+            Role::Nibble {
+                kind: NibbleKind::Exponent,
+            },
+            Role::Value {
+                format: ValueFormat::IntN { bits: 8 },
+            },
+            Role::Scale {
+                format: ScaleFormat::E8M0,
+            },
+            Role::GlobalScale {
+                format: ScaleFormat::F32,
+            },
+        ])
+    }
+
+    /// A random op and its params, or a Concat of two open outputs.
+    fn random_node(rng: &mut Rng) -> (OpId, Vec<u8>) {
+        match rng.below(19) {
+            0 => (OpId::BitReorderIeee16, vec![]),
+            1 => (OpId::BitReorderIeee32, vec![]),
+            2 => (OpId::BitReorderFp8E4M3, vec![]),
+            3 => (OpId::BitReorderFp8E5M2, vec![]),
+            4 => (OpId::ByteSplit, vec![rng.pick(&[2u8, 4, 8])]),
+            5 => (OpId::NibbleSplit, vec![]),
+            6 => (OpId::BytePassthrough, vec![]),
+            7 => (OpId::MxFp4Deinterleave, vec![32]),
+            8 => (OpId::BlockMicroscalingRepack, vec![32]),
+            9 => (OpId::IntDelta, vec![]),
+            10 => (OpId::PredictorXor, vec![]),
+            11 => (OpId::IndexBitwidthPack, vec![1 + rng.below(8) as u8]),
+            12 => (OpId::EntropyEstimate, vec![]),
+            13 => (OpId::MantissaZeroStrip, vec![rng.below(5) as u8]),
+            14 => (OpId::BurrowsWheeler, vec![]),
+            15 => (OpId::MoveToFront, vec![]),
+            16 => {
+                let mut p = Vec::new();
+                if rng.below(2) == 0 {
+                    Layout::Flat.write(&mut p);
+                } else {
+                    Layout::Rows {
+                        row_len: 1 + rng.below(16) as u32,
+                    }
+                    .write(&mut p);
+                }
+                (OpId::Reshape, p)
+            }
+            17 => (
+                OpId::SphericalNormalize,
+                vec![rng.below(2) as u8, 0, rng.below(3) as u8],
+            ),
+            _ => (OpId::AlphaStableNormalize, vec![0, rng.below(3) as u8]),
+        }
+    }
+
+    /// Build a random well-formed chain: each step consumes one or two open
+    /// outputs; whatever stays open becomes a terminal. Op choices whose
+    /// descriptors do not propagate are dropped.
+    fn random_chain(rng: &mut Rng) -> Chain {
+        let dtype = rng.pick(&[
+            0x0002u16, 0x000F, 0x0003, 0x0004, 0x0005, 0x0006, 0x0009, 0x0010, 0x0011, 0x001F,
+        ]);
+        let shape: Vec<u32> = (0..1 + rng.below(2))
+            .map(|_| rng.below(48) as u32 + u32::from(rng.below(8) != 0))
+            .collect();
+        let mut src = vec![shape.len() as u8];
+        for d in &shape {
+            src.extend_from_slice(&d.to_le_bytes());
+        }
+        src.extend_from_slice(&dtype.to_le_bytes());
+        let mut chain = Chain {
+            nodes: vec![ChainNode {
+                op: OpId::Source,
+                params: src,
+            }],
+            edges: vec![],
+            terminals: vec![],
+        };
+        let Ok(source) = chain_source_descriptor(&chain) else {
+            return chain;
+        };
+        // Open outputs: (node, output, descriptor as seen by a consumer).
+        let mut open: Vec<(u8, u8, PlaneDescriptor)> = vec![(0, 0, source)];
+        for _ in 0..1 + rng.below(5) {
+            if open.is_empty() {
+                break;
+            }
+            let concat = open.len() >= 2 && rng.below(6) == 0;
+            let n_in = if concat { 2 } else { 1 };
+            let mut picked = Vec::new();
+            for _ in 0..n_in {
+                let i = rng.below(open.len() as u64) as usize;
+                picked.push(open.swap_remove(i));
+            }
+            let overrides: Vec<Option<Role>> = picked
+                .iter()
+                .map(|_| (rng.below(4) == 0).then(|| random_role(rng)))
+                .collect();
+            let inputs: Vec<PlaneDescriptor> = picked
+                .iter()
+                .zip(&overrides)
+                .map(|((_, _, d), o)| {
+                    let mut d = d.clone();
+                    if let Some(r) = o {
+                        d.role = r.clone();
+                    }
+                    d
+                })
+                .collect();
+            let (op, params) = if concat {
+                let mut p = vec![2u8];
+                for d in &inputs {
+                    p.extend_from_slice(&(d.length_bytes as u32).to_le_bytes());
+                }
+                (OpId::Concat, p)
+            } else {
+                random_node(rng)
+            };
+            let produced = op_from_id(op, &params).and_then(|o| o.propagate_descriptors(&inputs));
+            let Ok(produced) = produced else {
+                open.extend(picked);
+                continue;
+            };
+            let idx = chain.nodes.len() as u8;
+            chain.nodes.push(ChainNode { op, params });
+            for (slot, ((src_node, src_out, _), role_override)) in
+                picked.into_iter().zip(overrides).enumerate()
+            {
+                chain.edges.push(ChainEdge {
+                    src_node,
+                    src_output_idx: src_out,
+                    dst_node: idx,
+                    dst_input_idx: slot as u8,
+                    role_override,
+                    vendor_bytes: vec![],
+                });
+            }
+            for (o, d) in produced.into_iter().enumerate() {
+                open.push((idx, o as u8, d));
+            }
+        }
+        for (node_idx, output_idx, _) in open {
+            chain.terminals.push(TerminalRef {
+                node_idx,
+                output_idx,
+                role: random_role(rng),
+            });
+        }
+        chain
+    }
+
+    #[test]
+    fn symbolic_descriptors_match_forward_on_random_chains() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let (mut valid, mut compared, mut multi_node) = (0usize, 0usize, 0usize);
+        for i in 0..3000 {
+            let chain = random_chain(&mut rng);
+            if crate::chain::validate::validate_chain(&chain, 0).is_err() {
+                continue;
+            }
+            valid += 1;
+            if assert_symbolic_matches_forward(&format!("random chain {i}: {chain:?}"), &chain) {
+                compared += 1;
+                if chain.nodes.len() > 2 {
+                    multi_node += 1;
+                }
+            }
+        }
+        assert!(valid > 1000, "only {valid} random chains were valid");
+        assert!(compared > 800, "only {compared} random chains ran forward");
+        assert!(
+            multi_node > 300,
+            "only {multi_node} compared chains have 2+ ops"
+        );
+    }
+
+    #[test]
+    fn symbolic_applies_terminal_role() {
+        use crate::types::role::ScaleFormat;
+        let mut chain = passthrough_terminal_chain();
+        chain.terminals[0].role = Role::Scale {
+            format: ScaleFormat::E8M0,
+        };
+        let descs = propagate_terminal_descriptors(&chain).unwrap();
+        assert_eq!(
+            descs[0].role,
+            Role::Scale {
+                format: ScaleFormat::E8M0
+            }
+        );
+        assert_eq!(descs, forward_descriptors(&chain).unwrap());
+    }
+
+    #[test]
+    fn bounded_walk_rejects_huge_source_without_allocating() {
+        // [u32::MAX, 64] fp64 declares about 2.2 TB. The bound from a 16-byte
+        // tensor rejects it before any node runs; a forward pass would have
+        // tried to allocate the whole buffer.
+        let mut params = vec![2u8];
+        params.extend_from_slice(&u32::MAX.to_le_bytes());
+        params.extend_from_slice(&64u32.to_le_bytes());
+        params.extend_from_slice(&0x0004u16.to_le_bytes());
+        let mut chain = passthrough_terminal_chain();
+        chain.nodes[0].params = params;
+        let t0 = std::time::Instant::now();
+        let err = propagate_terminal_descriptors_bounded(&chain, max_plane_len(16))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Source declares"), "{err}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bounded_walk_rejects_oversized_intermediate_plane() {
+        // Source [256, 1] fp16 (512 bytes) → SphericalNormalize(mode 0,
+        // fp16): the fp32 radius of 256 one-value rows is 1024 bytes, larger
+        // than the source. A bound of 512 passes node 0 and stops at node 1.
+        let mut params = vec![2u8];
+        params.extend_from_slice(&256u32.to_le_bytes());
+        params.extend_from_slice(&1u32.to_le_bytes());
+        params.extend_from_slice(&0x0002u16.to_le_bytes());
+        let mut chain = passthrough_terminal_chain();
+        chain.nodes[0].params = params;
+        chain.nodes[1] = ChainNode {
+            op: OpId::SphericalNormalize,
+            params: vec![0, 0, 2],
+        };
+        chain.terminals = (0..3)
+            .map(|o| TerminalRef {
+                node_idx: 1,
+                output_idx: o,
+                role: Role::Raw,
+            })
+            .collect();
+        let descs = propagate_terminal_descriptors(&chain).unwrap();
+        let largest = descs.iter().map(|d| d.length_bytes).max().unwrap();
+        assert!(largest > 512, "planes {descs:?}");
+        let err = propagate_terminal_descriptors_bounded(&chain, 512)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("node[1]"), "{err}");
+        assert!(propagate_terminal_descriptors_bounded(&chain, largest).is_ok());
+    }
+
+    #[test]
+    fn symbolic_walk_rejects_delta_ops() {
+        let mut chain = passthrough_terminal_chain();
+        chain.nodes[1] = ChainNode {
+            op: OpId::XorDelta,
+            params: vec![0],
+        };
+        let err = propagate_terminal_descriptors(&chain)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("delta"), "{err}");
+    }
+
+    #[test]
+    fn symbolic_walk_reports_missing_planes_instead_of_panicking() {
+        let mut chain = passthrough_terminal_chain();
+        chain.edges[0].src_output_idx = 5;
+        assert!(propagate_terminal_descriptors(&chain).is_err());
+        let mut chain = passthrough_terminal_chain();
+        chain.terminals[0].output_idx = 3;
+        assert!(propagate_terminal_descriptors(&chain).is_err());
+        let mut chain = passthrough_terminal_chain();
+        chain.terminals[0].node_idx = 9;
+        assert!(propagate_terminal_descriptors(&chain).is_err());
     }
 }

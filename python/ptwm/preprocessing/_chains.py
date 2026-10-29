@@ -16,16 +16,20 @@ This module provides:
   ``list[ChainBuilder]`` table
 * :func:`chains_for` — thin wrapper over :data:`PRODUCTION_CHAINS`.
 
-Chain builders are callables ``(shape: list[int]) -> Chain``. The compressor
-driver calls them per-tensor so each chain instance carries the tensor's
-concrete shape in its Source node params, which the decoder's placeholder-
-forward descriptor recovery path requires.
+Chain builders are callables ``(shape: list[int]) -> Chain``. The shape
+counts elements of the builder's *Source dtype*, and the shape's element
+count times that dtype's storage size must equal the raw byte count of the
+tensor: the decoder rebuilds every plane descriptor from the Source node
+alone, and the Rust writer skips any candidate chain whose Source declares
+another size. Call builders through :func:`build_chain_blobs`, which derives
+that shape from the tensor shape and byte count.
 """
 
 from __future__ import annotations
 
+import math
 import struct
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
 
@@ -94,6 +98,33 @@ _CHAIN_DTYPE: dict[int, int] = {
     30: 0x0011,  # Float8E5M2
     31: 0x001F,  # Float4E2M1FNx2 (packed fp4: nibble width, 1 byte/elem)
 }
+
+
+# Storage bytes per element of a chain-internal dtype. Mirrors
+# ``storage_bytes_per_element`` in crates/ptwm-core/src/transforms/source.rs:
+# 16-bit, 32-bit and 64-bit codes; everything else, packed FP4 (0x001F, one
+# byte holds two values) included, is one byte.
+_CHAIN_STORAGE_BYTES: dict[int, int] = {
+    0x0002: 2,
+    0x000F: 2,
+    0x0007: 2,
+    0x0008: 2,
+    0x0003: 4,
+    0x0009: 4,
+    0x000A: 4,
+    0x0004: 8,
+    0x000B: 8,
+    0x000C: 8,
+}
+
+_MAX_SOURCE_DIM = 0xFFFF_FFFF
+# Largest number of row counts _byte_passthrough_shape tries.
+_PASSTHROUGH_ROW_SEARCH = 1 << 16
+
+
+def chain_storage_bytes(internal_dtype: int) -> int:
+    """Storage bytes of one element of chain-internal dtype ``internal_dtype``."""
+    return _CHAIN_STORAGE_BYTES.get(internal_dtype, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -731,7 +762,9 @@ def _make_spherical_normalize_chain(
         # meaningful (rows, embedding-dim) factorization to normalize.
         # Returning None drops this candidate so the op never runs on 1D
         # (bias/norm) or higher-rank tensors, bounding trial-encode cost.
-        if len(shape) != 2:
+        # An empty dimension leaves no row to normalize, and the op rejects
+        # it, so the candidate is dropped as well.
+        if len(shape) != 2 or 0 in shape:
             return None
         return Chain(
             nodes=[
@@ -787,7 +820,9 @@ def _make_alpha_stable_normalize_chain(
         # meaningful (rows, embedding-dim) factorization to normalize.
         # Returning None drops this candidate so the op never runs on 1D
         # (bias/norm) or higher-rank tensors, bounding trial-encode cost.
-        if len(shape) != 2:
+        # An empty dimension leaves no row to normalize, and the op rejects
+        # it, so the candidate is dropped as well.
+        if len(shape) != 2 or 0 in shape:
             return None
         return Chain(
             nodes=[
@@ -963,6 +998,127 @@ CHAIN_FP16_HUFF_LLM_RAW: ChainBuilder = _make_huff_llm_raw_chain(_DT.FLOAT16.cod
 
 
 # ---------------------------------------------------------------------------
+# Source shape derivation
+# ---------------------------------------------------------------------------
+
+
+def _source_dtype(chain: Chain) -> int:
+    """Chain-internal dtype code of the chain's Source node (its last 2 bytes)."""
+    params = chain.nodes[0].params
+    return struct.unpack("<H", params[-2:])[0]
+
+
+def source_shape_for(
+    shape: Sequence[int] | None, nbytes: int, storage: int
+) -> list[int] | None:
+    """Shape, in elements of ``storage`` bytes each, that covers ``nbytes``.
+
+    - ``shape is None`` (flat byte input): ``[nbytes // storage]``.
+    - The shape already covers ``nbytes``: the shape, unchanged.
+    - Otherwise the last dimension is rescaled so that the rank stays the
+      same and the leading dimensions still count rows; a scalar becomes
+      ``[nbytes // storage]``.
+
+    Returns ``None`` when no such shape exists (the byte count does not
+    divide into whole elements or rows) or a dimension exceeds ``u32``.
+    """
+    dims = None if shape is None else [int(d) for d in shape]
+    if dims is not None and math.prod(dims) * storage == nbytes:
+        out = dims
+    elif not dims:
+        if nbytes % storage:
+            return None
+        out = [nbytes // storage]
+    else:
+        rows = math.prod(dims[:-1])
+        if rows == 0 or nbytes % rows or (nbytes // rows) % storage:
+            return None
+        out = [*dims[:-1], nbytes // rows // storage]
+    if any(d > _MAX_SOURCE_DIM for d in out):
+        return None
+    return out
+
+
+def _byte_passthrough_shape(nbytes: int) -> list[int]:
+    """Source shape, in bytes, for a passthrough over ``nbytes`` raw bytes.
+
+    ``[nbytes]`` when it fits in ``u32``; otherwise ``[rows, cols]`` with
+    ``rows * cols == nbytes`` and both dimensions in ``u32``, using the
+    smallest such ``rows``. The search tries at most
+    ``_PASSTHROUGH_ROW_SEARCH`` values of ``rows``; real tensor byte counts
+    have small factors. Raises :class:`ValueError` when no split is found
+    (for example ``nbytes`` is a prime above ``u32``).
+    """
+    if nbytes <= _MAX_SOURCE_DIM:
+        return [nbytes]
+    first = -(-nbytes // _MAX_SOURCE_DIM)
+    for rows in range(first, min(first + _PASSTHROUGH_ROW_SEARCH, _MAX_SOURCE_DIM + 1)):
+        if nbytes % rows == 0:
+            return [rows, nbytes // rows]
+    msg = (
+        f"cannot express {nbytes} bytes as a chain Source shape: no split into "
+        "two dimensions of at most 2**32 - 1"
+    )
+    raise ValueError(msg)
+
+
+def build_chain_blobs(
+    builders: Sequence[ChainBuilder],
+    *,
+    shape: Sequence[int] | None,
+    nbytes: int,
+) -> list[bytes]:
+    """Build every candidate chain for a tensor and serialise it.
+
+    ``shape`` is the tensor shape in elements of the tensor's own dtype, or
+    ``None`` for flat byte input; ``nbytes`` is the raw byte count. Each
+    builder's Source shape is derived from these so that it counts elements
+    of the builder's own Source dtype and covers exactly ``nbytes`` (see
+    :func:`source_shape_for`). A builder is skipped when it declines the
+    shape (returns ``None``) or when no Source shape fits the byte count,
+    for example 4094 bytes for an fp32 chain.
+
+    When no builder remains, the result is the byte passthrough chain over
+    all ``nbytes``. Its Source is 1-D when ``nbytes`` fits in one ``u32``
+    dimension and 2-D otherwise; a byte count with no such 2-D split
+    raises :class:`ValueError`.
+
+    Each builder is first called once with a probe shape to learn its Source
+    dtype. The probe clamps every dimension to ``u32`` so that it can always
+    be serialised: for byte input of 4 GiB or more, ``[nbytes]`` does not
+    fit, while the real Source shape of a multi-byte dtype often does.
+    """
+    if shape is None:
+        probe_shape = [min(nbytes, _MAX_SOURCE_DIM)]
+    else:
+        probe_shape = [min(int(d), _MAX_SOURCE_DIM) for d in shape]
+    blobs: list[bytes] = []
+    for builder in builders:
+        chain = builder(probe_shape)
+        if chain is None:
+            continue
+        storage = chain_storage_bytes(_source_dtype(chain))
+        src_shape = source_shape_for(shape, nbytes, storage)
+        if src_shape is None:
+            continue
+        if src_shape != probe_shape:
+            chain = builder(src_shape)
+            if chain is None:
+                continue
+        blobs.append(chain.to_bytes())
+    if not blobs:
+        src_shape = source_shape_for(shape, nbytes, 1)
+        if src_shape is None:
+            src_shape = _byte_passthrough_shape(nbytes)
+        chain = CHAIN_BYTE_PASSTHROUGH_VALUE(src_shape)
+        if chain is None:  # pragma: no cover - the passthrough never declines
+            msg = "byte passthrough chain declined its shape"
+            raise RuntimeError(msg)
+        blobs.append(chain.to_bytes())
+    return blobs
+
+
+# ---------------------------------------------------------------------------
 # Production chains table
 # ---------------------------------------------------------------------------
 
@@ -984,11 +1140,18 @@ PRODUCTION_CHAINS: dict[tuple[int, ClassifierRole], list[ChainBuilder]] = {
     # PredictorXor variants compete with the plain split chain via
     # trial-encode; the dispatcher only commits to a variant when it
     # beats the baseline on byte count.
+    #
+    # CHAIN_BF16_MICROSCALE_REPACK is not a candidate. Until the encoder
+    # took the element width from the chain's Source, the chain failed on
+    # every bf16 tensor (the public bf16 code mapped to byte elements and
+    # BlockMicroscalingRepack needs 16-bit ones), so files never used it.
+    # Now that it works it often wins trial-encode, which would change the
+    # legacy writer's output; that output stays byte-identical. Callers can
+    # still pass the builder explicitly.
     (_DT.BFLOAT16.code, ClassifierRole.STANDARD): [
         CHAIN_BF16_SPLIT,
         CHAIN_BF16_SPLIT_INTDELTA,
         CHAIN_BF16_SPLIT_PREDICTOR_XOR,
-        CHAIN_BF16_MICROSCALE_REPACK,
         CHAIN_BF16_SPLIT_MZS_K1,
         CHAIN_BF16_SPLIT_MZS_K2,
         CHAIN_BF16_SPLIT_MZS_K3,
@@ -1073,5 +1236,8 @@ __all__ = [
     "ClassifierRole",
     "PRODUCTION_CHAINS",
     "TerminalRef",
+    "build_chain_blobs",
+    "chain_storage_bytes",
     "chains_for",
+    "source_shape_for",
 ]

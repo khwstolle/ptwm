@@ -170,6 +170,49 @@ pub trait PlaneCodec: Send + Sync {
         layout: &PlaneLayout,
         decoded_len: usize,
     ) -> Result<Vec<u8>, PtwmCoreError>;
+
+    /// [`Self::decode`] that produces at most `max_len` bytes.
+    ///
+    /// Readers pass a `max_len` derived from the tensor's `orig_size`, so a
+    /// payload that decodes to more is corrupt. Codecs whose output can be
+    /// far larger than their payload (Zstd, and the coders that read the
+    /// decoded length from a payload prefix) override this method and fail
+    /// before they allocate or decode past `max_len`. The default decodes
+    /// and then checks the length; it fits codecs whose output is bounded
+    /// by a small multiple of the payload length or by `decoded_len`.
+    fn decode_bounded(
+        &self,
+        state_format_version: u8,
+        state_bytes: &[u8],
+        payload: &[u8],
+        layout: &PlaneLayout,
+        decoded_len: usize,
+        max_len: usize,
+    ) -> Result<Vec<u8>, PtwmCoreError> {
+        let out = self.decode(
+            state_format_version,
+            state_bytes,
+            payload,
+            layout,
+            decoded_len,
+        )?;
+        check_decoded_len(self.id(), out.len(), max_len)?;
+        Ok(out)
+    }
+}
+
+/// Error unless a plane of `len` decoded bytes fits in `max_len`.
+pub(crate) fn check_decoded_len(
+    id: CodecId,
+    len: usize,
+    max_len: usize,
+) -> Result<(), PtwmCoreError> {
+    if len > max_len {
+        return Err(PtwmCoreError::InvalidContainer(format!(
+            "{id:?} plane decodes to {len} bytes, bound is {max_len}"
+        )));
+    }
+    Ok(())
 }
 
 /// Look up a codec by id. Returns `None` for unregistered ids; the

@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
+from .._config import ContainerLayout, container_layout_name
 from .._rust import shannon
 from ..classify import (
     AuditLog,
@@ -26,6 +27,7 @@ from ..preprocessing._cache import (
 from ..preprocessing._chains import (
     CHAIN_BYTE_PASSTHROUGH_VALUE,
     ClassifierRole,
+    build_chain_blobs,
     chains_for,
 )
 from ..preprocessing._explorer import ExploreOptions, explore_chains
@@ -108,7 +110,7 @@ def _chain_bytes_for(
     shape: tuple[int, ...],
     explore_options: ExploreOptions | None = None,
     *,
-    raw: bytes = b"",
+    raw: bytes,
     builder_cache: dict[tuple[int, TensorRole, int], list] | None = None,
     warned_passthrough: set[tuple[int, TensorRole]] | None = None,
     use_user_cache: bool = True,
@@ -171,9 +173,10 @@ def _chain_bytes_for(
         if builder_cache is not None:
             builder_cache[cache_key] = builders
 
-    # Builders may decline a shape by returning None (e.g. spherical-normalize
-    # only accepts 2D tensors); skip those.
-    return [c.to_bytes() for b in builders if (c := b(list(shape))) is not None]
+    # Each chain's Source covers exactly len(raw) bytes in units of its own
+    # Source dtype; builders that decline the shape (e.g. spherical-normalize
+    # only accepts 2D tensors) or cannot cover the bytes are skipped.
+    return build_chain_blobs(builders, shape=list(shape), nbytes=len(raw))
 
 
 def compress_safetensors_file(
@@ -188,8 +191,9 @@ def compress_safetensors_file(
     use_user_cache: bool = True,
     fast: bool = False,
     fast_chunk: int = 512 * 1024,
+    container_layout: ContainerLayout | str = "compact",
 ) -> AuditLog:
-    """Compress a safetensors file into a sharded ``.ptwm`` directory.
+    r"""Compress a safetensors file into a sharded ``.ptwm`` directory.
 
     Parameters
     ----------
@@ -209,12 +213,20 @@ def compress_safetensors_file(
     method_hint:
         Method hint forwarded to ``write_ptwm_shard``
         (1=HUFFMAN, 2=ZSTD, 3=MICROSCALE, 4=RANS, 5=IDENTITY).
+    container_layout:
+        Layout of every shard container: ``"compact"`` (default;
+        ``\x89PTWC``, v1.2 and later) or ``"legacy"`` (``\x89PTWM``, readable
+        by v1.1 and later).
+        Forwarded to ``write_ptwm_shard``; a string or
+        :class:`ptwm.ContainerLayout`. Other values raise ``ValueError``
+        before any tensor is read.
 
     Returns
     -------
     AuditLog
         Per-tensor classification audit log.
     """
+    container_layout = container_layout_name(container_layout)
     src = Path(src_path)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -337,6 +349,7 @@ def compress_safetensors_file(
             chains_per_tensor=shard_chains,
             method_hint=eff_method,
             streaming_chunk=eff_stream,
+            container_layout=container_layout,
         )
         _persist_discovered(_new_templates, use_user_cache)
         return audit
@@ -371,6 +384,7 @@ def compress_safetensors_file(
                 chains_per_tensor=shard_chains,
                 method_hint=eff_method,
                 streaming_chunk=eff_stream,
+                container_layout=container_layout,
             )
         else:
             if _write_mode_b_shell is None:
@@ -386,6 +400,7 @@ def compress_safetensors_file(
                 chains_per_tensor=shard_chains,
                 method_hint=eff_method,
                 streaming_chunk=eff_stream,
+                container_layout=container_layout,
             )
             ptwm_bytes = tmp_ptwm.read_bytes()
             tmp_ptwm.unlink()

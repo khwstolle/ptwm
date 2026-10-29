@@ -213,6 +213,17 @@ class DType(Enum):
 
     @classmethod
     def _from_dtype_uncached(cls, dtype: Any) -> "DType":
+        if isinstance(dtype, np.dtype):
+            # Compare numpy dtypes as dtypes. ``np.dtype.__eq__`` coerces the
+            # other operand, so ``np.dtype("float64") == None`` and
+            # ``np.dtype("int64") == int`` are both true, and the generic test
+            # below would return NONE and INT32 for them.
+            for member in cls:
+                if member.numpy_dtype is not None and dtype == np.dtype(
+                    member.numpy_dtype
+                ):
+                    return member
+            return cls._from_name(dtype)
         for member in cls:
             if dtype in (
                 member.torch_dtype,
@@ -221,8 +232,13 @@ class DType(Enum):
                 member.dtype_str,
             ):
                 return member
-        # Fallback: numpy 2.x / ml_dtypes BF16/FP8/FP4 expose .name matching
-        # the canonical dtype_str (e.g. np.dtype('bfloat16').name == "bfloat16").
+        return cls._from_name(dtype)
+
+    @classmethod
+    def _from_name(cls, dtype: Any) -> "DType":
+        """Match ``dtype.name`` against the canonical names, else NONE."""
+        # numpy 2.x / ml_dtypes BF16/FP8/FP4 expose .name matching the
+        # canonical dtype_str (e.g. np.dtype('bfloat16').name == "bfloat16").
         name = getattr(dtype, "name", None)
         if isinstance(name, str):
             name_lower = name.lower()

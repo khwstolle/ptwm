@@ -3,6 +3,7 @@
 //! in the default dispatch menu — selected only when named in `codec_menu`.
 
 use crate::codec::{CodecId, Encoded, PlaneCodec};
+use crate::codecs::length_prefix;
 use crate::entropy::neural_predictor::{decode_plane, encode_plane};
 use crate::error::PtwmCoreError;
 use crate::layout::PlaneLayout;
@@ -73,6 +74,25 @@ impl PlaneCodec for NeuralPredictor {
         _decoded_len: usize,
     ) -> Result<Vec<u8>, PtwmCoreError> {
         decode_plane(payload)
+    }
+
+    fn decode_bounded(
+        &self,
+        state_format_version: u8,
+        state_bytes: &[u8],
+        payload: &[u8],
+        layout: &PlaneLayout,
+        decoded_len: usize,
+        max_len: usize,
+    ) -> Result<Vec<u8>, PtwmCoreError> {
+        length_prefix::check_within(payload, max_len, "neural_predictor")?;
+        self.decode(
+            state_format_version,
+            state_bytes,
+            payload,
+            layout,
+            decoded_len,
+        )
     }
 }
 

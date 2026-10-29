@@ -74,6 +74,9 @@ pub enum Attestation {
     PgpSignature(Vec<u8>), // raw signature bytes
 }
 
+/// Entries [`ExtensionTable::read`] reserves before it parses any.
+const PREALLOC_ENTRIES: usize = 64;
+
 impl ExtensionTable {
     pub fn empty() -> Self {
         Self {
@@ -96,7 +99,10 @@ impl ExtensionTable {
                 "extension table count too large: {count} (max {MAX_TABLE_ENTRIES})"
             )));
         }
-        let mut entries = Vec::with_capacity(count as usize);
+        // `r` does not expose the bytes that remain, so reserve at most
+        // `PREALLOC_ENTRIES` up front; the vector grows only as entries
+        // parse, so a forged count cannot allocate more than the input holds.
+        let mut entries = Vec::with_capacity((count as usize).min(PREALLOC_ENTRIES));
         for _ in 0..count {
             entries.push(ExtensionTableEntry::read(r)?);
         }
@@ -114,6 +120,19 @@ impl ExtensionTable {
         Self::read(&mut c)
     }
 
+    /// Parse a table from the start of `bytes` and return it with the number
+    /// of bytes it occupies. The count comes from the parse position, not
+    /// from re-serializing: a table whose fields have more than one valid
+    /// encoding (for example, non-canonical capability CBOR) re-serializes
+    /// to a different length.
+    pub fn from_bytes_prefix(bytes: &[u8]) -> Result<(Self, usize), ExtensionError> {
+        let mut c = Cursor::new(bytes);
+        let table = Self::read(&mut c)?;
+        // The cursor reads from a slice, so its position never exceeds
+        // `bytes.len()`.
+        Ok((table, c.position() as usize))
+    }
+
     /// blake3 hash committed in the header to detect tampering / corruption.
     pub fn hash(bytes: &[u8]) -> [u8; 32] {
         let mut out = [0u8; 32];
@@ -123,6 +142,28 @@ impl ExtensionTable {
 }
 
 impl ExtensionTableEntry {
+    /// This entry in the legacy table layout (the bytes one entry takes in
+    /// [`ExtensionTable::to_bytes`]).
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ExtensionError> {
+        let mut buf = Vec::new();
+        self.write(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Parse one entry in the legacy table layout that fills `bytes`
+    /// exactly.
+    pub fn from_bytes_exact(bytes: &[u8]) -> Result<Self, ExtensionError> {
+        let mut c = Cursor::new(bytes);
+        let entry = Self::read(&mut c)?;
+        if c.position() as usize != bytes.len() {
+            return Err(ExtensionError::TableParse(format!(
+                "{} trailing bytes after the entry",
+                bytes.len() - c.position() as usize
+            )));
+        }
+        Ok(entry)
+    }
+
     fn write<W: Write>(&self, w: &mut W) -> Result<(), ExtensionError> {
         w.write_all(self.canonical_id.as_bytes())
             .map_err(io_err("write canonical_id"))?;
@@ -186,9 +227,18 @@ impl ExtensionTableEntry {
                 "capability blob too large: {cap_len} bytes (max {MAX_CAPABILITIES_LEN})"
             )));
         }
-        let mut cap_bytes = vec![0u8; cap_len as usize];
-        r.read_exact(&mut cap_bytes)
+        // Read through `take` so the buffer grows with the bytes the input
+        // holds, not with the declared length.
+        let mut cap_bytes = Vec::new();
+        r.by_ref()
+            .take(u64::from(cap_len))
+            .read_to_end(&mut cap_bytes)
             .map_err(io_err("read capabilities"))?;
+        if cap_bytes.len() != cap_len as usize {
+            return Err(io_err("read capabilities")(std::io::Error::from(
+                std::io::ErrorKind::UnexpectedEof,
+            )));
+        }
         let capabilities = CapabilityMap::from_cbor(&cap_bytes)?;
 
         let mut at_kind = [0u8; 1];
@@ -423,5 +473,38 @@ mod tests {
             matches!(res, Err(ExtensionError::TableParse(_))),
             "oversized cap_len should be rejected, got: {res:?}"
         );
+    }
+
+    /// A capabilities length under the limit but past the end of the input
+    /// fails as a truncated read; the reader does not reserve the declared
+    /// length up front.
+    #[test]
+    fn truncated_capabilities_are_rejected() {
+        let mut table_buf = 1u32.to_le_bytes().to_vec();
+        table_buf.extend_from_slice(&[0xAA; 32]); // canonical_id
+        table_buf.extend_from_slice(&0u16.to_le_bytes()); // human_label_len
+        table_buf.extend_from_slice(&1u16.to_le_bytes()); // kind = Transform
+        table_buf.extend_from_slice(&1u16.to_le_bytes()); // abi_version
+        table_buf.push(1); // lifecycle = Thread
+        table_buf.push(FLAVOR_WASM); // flavor_hints
+        table_buf.extend_from_slice(&MAX_CAPABILITIES_LEN.to_le_bytes());
+        table_buf.extend_from_slice(&[0xA0; 7]); // 7 of the declared bytes
+        match ExtensionTable::from_bytes(&table_buf) {
+            Err(ExtensionError::TableParse(msg)) => {
+                assert!(msg.contains("read capabilities"), "{msg}");
+            }
+            other => panic!("expected a truncated read, got {other:?}"),
+        }
+    }
+
+    /// A count of `MAX_TABLE_ENTRIES` with no entries behind it fails on the
+    /// first entry.
+    #[test]
+    fn table_count_without_entries_is_rejected() {
+        let table_buf = MAX_TABLE_ENTRIES.to_le_bytes().to_vec();
+        assert!(matches!(
+            ExtensionTable::from_bytes(&table_buf),
+            Err(ExtensionError::TableParse(_))
+        ));
     }
 }

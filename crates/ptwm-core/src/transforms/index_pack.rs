@@ -48,6 +48,12 @@ fn packed_len(n_indices: u64, bits: u8) -> u64 {
     (n_indices * bits as u64).div_ceil(8)
 }
 
+/// [`packed_len`] for a length read from a chain: `None` instead of an
+/// overflow when `n_indices * bits` does not fit in `u64`.
+fn checked_packed_len(n_indices: u64, bits: u8) -> Option<u64> {
+    n_indices.checked_mul(bits as u64).map(|b| b.div_ceil(8))
+}
+
 /// `IndexBitwidthPack` packs a stream of u8 indices (each ∈ `0..2^bits`) into
 /// a tight bit stream, MSB-first within each output byte. Used downstream of
 /// codebook ops to recover the bit budget the codebook earned.
@@ -93,7 +99,12 @@ impl Op for IndexBitwidthPack {
                 "IndexBitwidthPack: input must not be nibble-packed".into(),
             ));
         }
-        let out_len = packed_len(input.length_bytes, self.bits);
+        let out_len = checked_packed_len(input.length_bytes, self.bits).ok_or_else(|| {
+            PtwmCoreError::InvalidContainer(format!(
+                "IndexBitwidthPack.propagate_descriptors: {} indices of {} bits overflow u64",
+                input.length_bytes, self.bits
+            ))
+        })?;
         Ok(vec![PlaneDescriptor {
             role: Role::Index,
             element_width: ElementWidth::Byte,
@@ -263,5 +274,22 @@ mod tests {
             assert_eq!(n, 1);
             assert_eq!(decoded.bits, bits);
         }
+    }
+
+    #[test]
+    fn propagate_descriptors_overflow_is_an_error() {
+        // `length_bytes * bits` overflows u64 for a corrupt chain.
+        let op = IndexBitwidthPack { bits: 8 };
+        let d = PlaneDescriptor {
+            role: Role::Raw,
+            element_width: ElementWidth::Byte,
+            length_bytes: u64::MAX,
+            layout: Layout::Flat,
+            derives_from_tensor: None,
+            residual_of: None,
+            is_nibble_packed: false,
+            vendor_bytes: vec![],
+        };
+        assert!(op.propagate_descriptors(&[d]).is_err());
     }
 }

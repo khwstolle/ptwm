@@ -15,7 +15,7 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 
-from ptwm import CompressionConfig, Compressor, Format
+from ptwm import CompressionConfig, Compressor, Format, Framing
 
 
 @dataclass
@@ -70,9 +70,9 @@ def bench_replay(
     out_file = out_dir / f"replay-{r['variant']}-trial{r['trial']}.ptwm"
 
     synthetic_input = b"\x00" * int(r["input_bytes"])
-    blob = Compressor(CompressionConfig(input_format=Format.BYTE)).compress(
-        synthetic_input
-    )
+    blob = Compressor(
+        CompressionConfig(input_format=Format.BYTE, framing=Framing.CONTAINER)
+    ).compress(synthetic_input)
     out_file.write_bytes(blob)
 
     return ReplayResult(

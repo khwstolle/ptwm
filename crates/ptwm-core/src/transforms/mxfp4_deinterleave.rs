@@ -66,7 +66,13 @@ impl Op for MxFp4Deinterleave {
             )));
         }
         let block_count = inp.length_bytes / BLOCK_BYTES;
-        let value_len = block_count * BLOCK_VALUES; // 32 nibble-byte slots per block
+        // 32 nibble-byte slots per block. Checked: a corrupt chain can
+        // declare a length near `u64::MAX`.
+        let value_len = block_count.checked_mul(BLOCK_VALUES).ok_or_else(|| {
+            PtwmCoreError::InvalidContainer(format!(
+                "MxFp4Deinterleave.propagate_descriptors: {block_count} blocks overflow u64"
+            ))
+        })?;
         let scale_len = block_count; // 1 scale byte per block
 
         // Determine row layout for each plane based on input layout.
@@ -344,5 +350,22 @@ mod tests {
         let mut buf = Vec::new();
         op.write_params(&mut buf);
         assert_eq!(buf, vec![32u8]);
+    }
+
+    #[test]
+    fn propagate_descriptors_overflow_is_an_error() {
+        // 17-byte blocks expand to 32 value slots: overflows u64 near the top.
+        let op = MxFp4Deinterleave::new(32).unwrap();
+        let d = PlaneDescriptor {
+            role: Role::Raw,
+            element_width: ElementWidth::Byte,
+            length_bytes: u64::MAX / 17 * 17,
+            layout: Layout::Flat,
+            derives_from_tensor: None,
+            residual_of: None,
+            is_nibble_packed: false,
+            vendor_bytes: vec![],
+        };
+        assert!(op.propagate_descriptors(&[d]).is_err());
     }
 }

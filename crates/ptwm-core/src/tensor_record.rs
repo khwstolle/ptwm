@@ -8,8 +8,8 @@
 use crate::chain::Chain;
 use crate::chain::wire::{read_chain, write_chain};
 use crate::error::PtwmCoreError;
-use crate::extension::ExtensionTableBuilder;
 use crate::extension::table::ExtensionTable;
+use crate::extension::{ExtensionTableBuilder, LEGACY_BUILTIN_VERSION, normalize_builtin_ids};
 use crate::plane_record::{PlaneRecord, parse_plane_record, write_plane_record};
 
 pub const TENSOR_FLAG_DEPENDENCIES: u8 = 0x01;
@@ -79,7 +79,48 @@ fn name_padding(name_len: usize) -> usize {
     if rem == 0 { 0 } else { 4 - rem }
 }
 
+/// Convert a length or count to its wire integer type, or fail with
+/// `InvalidContainer` when it does not fit.
+pub(crate) fn checked_len<T: TryFrom<usize>>(n: usize, what: &str) -> Result<T, PtwmCoreError> {
+    T::try_from(n).map_err(|_| {
+        PtwmCoreError::InvalidContainer(format!(
+            "{what} {n} exceeds the wire limit of {} bytes",
+            std::mem::size_of::<T>()
+        ))
+    })
+}
+
+/// Append the serialized record to `out`. Built-in entries of an inline
+/// chain's Extension Table carry the ids and labels of
+/// [`LEGACY_BUILTIN_VERSION`].
+///
+/// On error, `out` is truncated back to its length before the call, so a
+/// failed write never leaves a partial record behind.
 pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), PtwmCoreError> {
+    write_tensor_record_with_builtin_version(rec, out, LEGACY_BUILTIN_VERSION)
+}
+
+/// [`write_tensor_record`] with the inline chain's Extension Table written
+/// with the built-in ids and labels of `builtin_version`. The transcoder
+/// uses it to reproduce records written by other releases.
+pub fn write_tensor_record_with_builtin_version(
+    rec: &TensorRecord,
+    out: &mut Vec<u8>,
+    builtin_version: &str,
+) -> Result<(), PtwmCoreError> {
+    let start = out.len();
+    let result = write_tensor_record_unchecked(rec, out, builtin_version);
+    if result.is_err() {
+        out.truncate(start);
+    }
+    result
+}
+
+fn write_tensor_record_unchecked(
+    rec: &TensorRecord,
+    out: &mut Vec<u8>,
+    builtin_version: &str,
+) -> Result<(), PtwmCoreError> {
     // Validate inline_chain vs chain_ref consistency.
     let has_inline = rec.chain_ref & CHAIN_REF_INLINE_BIT != 0;
     if has_inline && rec.inline_chain.is_none() {
@@ -105,9 +146,21 @@ pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), 
         flags |= TENSOR_FLAG_PAYLOAD_HASH;
     }
 
-    let num_terminals = rec.terminals.len() as u8;
+    // Check the record-level length fields before writing anything. Errors
+    // from the inline chain and the terminal records can still fire after
+    // the header is written; `write_tensor_record` truncates `out` for those.
+    let num_terminals: u8 = checked_len(rec.terminals.len(), "terminal count")?;
     let name_bytes = rec.name.as_bytes();
-    let name_len = name_bytes.len() as u16;
+    let name_len: u16 = checked_len(name_bytes.len(), "tensor name length")?;
+    let dep_count: u16 = checked_len(rec.dependencies.len(), "dependency count")?;
+    for dep in &rec.dependencies {
+        checked_len::<u16>(dep.ref_bytes.len(), "dependency ref length")?;
+    }
+    let meta_len: Option<u32> = rec
+        .tensor_metadata
+        .as_ref()
+        .map(|m| checked_len(m.len(), "tensor metadata length"))
+        .transpose()?;
 
     // Fixed header: chain_ref(u16) + dtype_code(u16) + input_format(u8) +
     //               num_terminals(u8) + flags(u8) + reserved(u8) +
@@ -144,7 +197,7 @@ pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), 
     //   inline_et_entries: [ExtensionTableEntry; count]
     //   chain_bytes:      (num_nodes, ..., nodes_section, edges_section, terminals_section)
     if let Some(chain) = &rec.inline_chain {
-        let mut builder = ExtensionTableBuilder::new();
+        let mut builder = ExtensionTableBuilder::with_builtin_version(builtin_version)?;
         let mut chain_bytes = Vec::new();
         write_chain(chain, &mut builder, &mut chain_bytes)?;
         let inline_table = ExtensionTable {
@@ -159,7 +212,6 @@ pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), 
 
     // dependencies  (present iff TENSOR_FLAG_DEPENDENCIES)
     if !rec.dependencies.is_empty() {
-        let dep_count = rec.dependencies.len() as u16;
         out.extend_from_slice(&dep_count.to_le_bytes());
         for dep in &rec.dependencies {
             let ref_flags: u8 = if dep.expected_hash.is_some() {
@@ -169,6 +221,7 @@ pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), 
             };
             out.push(dep.ref_kind as u8);
             out.push(ref_flags);
+            // Length checked above.
             out.extend_from_slice(&(dep.ref_bytes.len() as u16).to_le_bytes());
             out.extend_from_slice(&dep.ref_bytes);
             if let Some(hash) = dep.expected_hash {
@@ -178,8 +231,8 @@ pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), 
     }
 
     // tensor_metadata  (present iff TENSOR_FLAG_METADATA)
-    if let Some(meta) = &rec.tensor_metadata {
-        out.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+    if let (Some(meta), Some(meta_len)) = (&rec.tensor_metadata, meta_len) {
+        out.extend_from_slice(&meta_len.to_le_bytes());
         out.extend_from_slice(meta);
     }
 
@@ -191,7 +244,38 @@ pub fn write_tensor_record(rec: &TensorRecord, out: &mut Vec<u8>) -> Result<(), 
     Ok(())
 }
 
+/// Read only the tensor name from serialized record bytes, without parsing
+/// or copying the rest of the record.
+pub fn peek_tensor_record_name(buf: &[u8]) -> Result<&str, PtwmCoreError> {
+    const NAME_LEN_POS: usize = 16;
+    const NAME_POS: usize = 18;
+    if buf.len() < NAME_POS {
+        return Err(PtwmCoreError::InvalidContainer(
+            "tensor record header truncated".into(),
+        ));
+    }
+    let name_len = u16::from_le_bytes(buf[NAME_LEN_POS..NAME_POS].try_into().unwrap()) as usize;
+    let name = buf.get(NAME_POS..NAME_POS + name_len).ok_or_else(|| {
+        PtwmCoreError::InvalidContainer("tensor record truncated reading name".into())
+    })?;
+    std::str::from_utf8(name)
+        .map_err(|_| PtwmCoreError::InvalidContainer("tensor name is not valid UTF-8".into()))
+}
+
 pub fn parse_tensor_record(buf: &[u8]) -> Result<(TensorRecord, usize), PtwmCoreError> {
+    parse_tensor_record_with_builtin_version(buf).map(|(rec, consumed, _)| (rec, consumed))
+}
+
+/// [`parse_tensor_record`] that also returns the built-in version of the
+/// inline chain's Extension Table (see
+/// [`crate::extension::normalize_builtin_ids`]), or `None` when the record
+/// has no inline chain or its table holds no built-in entry.
+///
+/// Inline tables written by another release are mapped to the current
+/// built-in ids before the chain is resolved.
+pub fn parse_tensor_record_with_builtin_version(
+    buf: &[u8],
+) -> Result<(TensorRecord, usize, Option<String>), PtwmCoreError> {
     if buf.len() < 18 {
         return Err(PtwmCoreError::InvalidContainer(
             "tensor record header truncated".into(),
@@ -257,6 +341,7 @@ pub fn parse_tensor_record(buf: &[u8]) -> Result<(TensorRecord, usize), PtwmCore
     //
     // Wire layout: a local extension table precedes the chain
     // bytes. Read it first, then pass it to `read_chain`.
+    let mut inline_version = None;
     let inline_chain = if chain_ref & CHAIN_REF_INLINE_BIT != 0 {
         // Read the inline extension table (count: u32 + entries) directly
         // from the buffer slice via a Cursor. The cursor's position tells
@@ -265,10 +350,11 @@ pub fn parse_tensor_record(buf: &[u8]) -> Result<(TensorRecord, usize), PtwmCore
         // tables — count is already bounded by MAX_TABLE_ENTRIES, but
         // the re-serialize was redundant work either way).
         let mut cursor = std::io::Cursor::new(&buf[pos..]);
-        let inline_table = ExtensionTable::read(&mut cursor).map_err(|e| {
+        let mut inline_table = ExtensionTable::read(&mut cursor).map_err(|e| {
             PtwmCoreError::InvalidContainer(format!("inline chain extension table: {e}"))
         })?;
         pos += cursor.position() as usize;
+        inline_version = normalize_builtin_ids(&mut inline_table);
         let (chain, consumed) = read_chain(&buf[pos..], &inline_table).map_err(|e| {
             PtwmCoreError::InvalidContainer(format!("inline chain parse error: {e}"))
         })?;
@@ -283,7 +369,9 @@ pub fn parse_tensor_record(buf: &[u8]) -> Result<(TensorRecord, usize), PtwmCore
         need(buf, pos, 2, "dep_count")?;
         let dep_count = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
-        let mut deps = Vec::with_capacity(dep_count);
+        // Every dependency takes at least 4 bytes, so the reservation is
+        // bounded by the bytes that remain, not by the forged count.
+        let mut deps = Vec::with_capacity(dep_count.min((buf.len() - pos) / 4));
         for _ in 0..dep_count {
             need(buf, pos, 4, "dependency header")?;
             let ref_kind_raw = buf[pos];
@@ -354,6 +442,7 @@ pub fn parse_tensor_record(buf: &[u8]) -> Result<(TensorRecord, usize), PtwmCore
             terminals,
         },
         pos,
+        inline_version,
     ))
 }
 
@@ -487,6 +576,78 @@ mod tests {
         assert_eq!(parsed.terminals.len(), 2);
     }
 
+    /// The inline chain table of a legacy record carries the ids and labels
+    /// of `1.1.0`, which a v1.1 reader recognises, whatever the crate
+    /// version of the writer.
+    #[test]
+    fn inline_chain_builtins_use_legacy_version() {
+        assert_eq!(LEGACY_BUILTIN_VERSION, "1.1.0");
+        let rec = TensorRecord {
+            chain_ref: 0x8001,
+            dtype_code: 0x0010,
+            input_format: 0,
+            flags: 0,
+            orig_size: 2048,
+            name: "w".to_string(),
+            payload_hash: None,
+            inline_chain: Some(minimal_chain()),
+            dependencies: Vec::new(),
+            tensor_metadata: None,
+            terminals: vec![identity_plane(), identity_plane()],
+        };
+        let mut out = Vec::new();
+        write_tensor_record(&rec, &mut out).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        let labels: Vec<&str> = text
+            .match_indices("io.ptwm.builtin.")
+            .map(|(i, _)| &text[i..])
+            .collect();
+        assert!(!labels.is_empty());
+        for label in labels {
+            let rest = &label["io.ptwm.builtin.".len()..];
+            let (_, ver) = rest.split_once('@').unwrap();
+            assert!(ver.starts_with("1.1.0"), "{label:?}");
+        }
+        let (_, _, version) = parse_tensor_record_with_builtin_version(&out).unwrap();
+        assert_eq!(version.as_deref(), Some("1.1.0"));
+    }
+
+    /// A forged dependency count with no dependencies behind it fails as a
+    /// truncated record.
+    #[test]
+    fn forged_dependency_count_is_rejected() {
+        let rec = TensorRecord {
+            chain_ref: 0x0002,
+            dtype_code: 0x0002,
+            input_format: 0,
+            flags: 0,
+            orig_size: 4096,
+            name: "w".to_string(),
+            payload_hash: None,
+            inline_chain: None,
+            dependencies: vec![Dependency {
+                ref_kind: RefKind::LocalTensor,
+                expected_hash: None,
+                ref_bytes: b"x".to_vec(),
+            }],
+            tensor_metadata: None,
+            terminals: vec![identity_plane()],
+        };
+        let mut out = Vec::new();
+        write_tensor_record(&rec, &mut out).unwrap();
+        // The dependency section starts with its u16 count, followed by the
+        // dependency's kind byte and flags byte.
+        let dep = [1u8, 0, RefKind::LocalTensor as u8, 0, 1, 0, b'x'];
+        let at = out
+            .windows(dep.len())
+            .position(|w| w == dep)
+            .expect("dependency bytes");
+        out[at..at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        out.truncate(at + 2);
+        let err = parse_tensor_record(&out).unwrap_err().to_string();
+        assert!(err.contains("truncated"), "{err}");
+    }
+
     #[test]
     fn record_with_deps_and_hash_roundtrip() {
         let mut expected_hash = [0u8; 32];
@@ -585,5 +746,96 @@ mod tests {
         };
         let mut out = Vec::new();
         assert!(write_tensor_record(&rec, &mut out).is_err());
+    }
+
+    fn base_record() -> TensorRecord {
+        TensorRecord {
+            chain_ref: 0x0001,
+            dtype_code: 0x0001,
+            input_format: 1,
+            flags: 0,
+            orig_size: 0,
+            name: "w".to_string(),
+            payload_hash: None,
+            inline_chain: None,
+            dependencies: Vec::new(),
+            tensor_metadata: None,
+            terminals: vec![identity_plane()],
+        }
+    }
+
+    fn assert_write_fails_cleanly(rec: &TensorRecord, needle: &str) {
+        let mut out = Vec::new();
+        let err = write_tensor_record(rec, &mut out).unwrap_err();
+        assert!(err.to_string().contains(needle), "{err}");
+        assert!(out.is_empty(), "writer emitted bytes before failing");
+
+        // Bytes already in the buffer survive a failed write unchanged.
+        let mut out = b"prefix".to_vec();
+        write_tensor_record(rec, &mut out).unwrap_err();
+        assert_eq!(out, b"prefix");
+    }
+
+    /// A terminal-level error fires after the header, name and hash are
+    /// written; the partial record must not stay in `out`.
+    #[test]
+    fn terminal_error_after_header_leaves_out_unchanged() {
+        let mut rec = base_record();
+        rec.payload_hash = Some(0x1234);
+        rec.dependencies = vec![Dependency {
+            ref_kind: RefKind::LocalTensor,
+            expected_hash: None,
+            ref_bytes: b"dep".to_vec(),
+        }];
+        rec.terminals[0].state_source = StateSource::External;
+        rec.terminals[0].external_state = Some(crate::plane_record::ExternalStateRef {
+            ref_kind: 0x02,
+            expected_hash: None,
+            ref_bytes: vec![b'x'; u16::MAX as usize + 1],
+            state_format_version: 0,
+        });
+        assert_write_fails_cleanly(&rec, "external state ref length");
+    }
+
+    #[test]
+    fn write_rejects_more_than_255_terminals() {
+        let mut rec = base_record();
+        rec.terminals = vec![identity_plane(); 256];
+        assert_write_fails_cleanly(&rec, "terminal count");
+        rec.terminals.pop();
+        let mut out = Vec::new();
+        write_tensor_record(&rec, &mut out).unwrap();
+        let (parsed, _) = parse_tensor_record(&out).unwrap();
+        assert_eq!(parsed.terminals.len(), 255);
+    }
+
+    #[test]
+    fn write_rejects_name_longer_than_u16() {
+        let mut rec = base_record();
+        rec.name = "n".repeat(u16::MAX as usize + 1);
+        assert_write_fails_cleanly(&rec, "tensor name length");
+    }
+
+    #[test]
+    fn write_rejects_too_many_dependencies() {
+        let mut rec = base_record();
+        let dep = Dependency {
+            ref_kind: RefKind::LocalTensor,
+            expected_hash: None,
+            ref_bytes: b"x".to_vec(),
+        };
+        rec.dependencies = vec![dep; u16::MAX as usize + 1];
+        assert_write_fails_cleanly(&rec, "dependency count");
+    }
+
+    #[test]
+    fn write_rejects_dependency_ref_longer_than_u16() {
+        let mut rec = base_record();
+        rec.dependencies = vec![Dependency {
+            ref_kind: RefKind::LocalTensor,
+            expected_hash: None,
+            ref_bytes: vec![b'x'; u16::MAX as usize + 1],
+        }];
+        assert_write_fails_cleanly(&rec, "dependency ref length");
     }
 }

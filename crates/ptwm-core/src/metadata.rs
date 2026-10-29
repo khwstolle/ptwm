@@ -78,6 +78,10 @@ impl<'a> Reader<'a> {
         Self { buf, pos: 0 }
     }
 
+    fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
     fn read_head(&mut self, expected_major: u8) -> Result<u64, PtwmCoreError> {
         if self.pos >= self.buf.len() {
             return Err(PtwmCoreError::InvalidContainer(
@@ -121,16 +125,18 @@ impl<'a> Reader<'a> {
     }
 
     fn read_tstr(&mut self) -> Result<String, PtwmCoreError> {
-        let len = self.read_head(MAJOR_TSTR)? as usize;
-        if self.pos + len > self.buf.len() {
-            return Err(PtwmCoreError::InvalidContainer(
-                "cbor metadata tstr truncated".into(),
-            ));
-        }
-        let s = std::str::from_utf8(&self.buf[self.pos..self.pos + len])
+        let len = self.read_head(MAJOR_TSTR)?;
+        let end = usize::try_from(len)
+            .ok()
+            .and_then(|len| self.pos.checked_add(len))
+            .filter(|&end| end <= self.buf.len())
+            .ok_or_else(|| {
+                PtwmCoreError::InvalidContainer("cbor metadata tstr truncated".into())
+            })?;
+        let s = std::str::from_utf8(&self.buf[self.pos..end])
             .map_err(|_| PtwmCoreError::InvalidContainer("cbor metadata: tstr not utf8".into()))?
             .to_string();
-        self.pos += len;
+        self.pos = end;
         Ok(s)
     }
 }
@@ -154,8 +160,10 @@ pub fn decode_shape_metadata(buf: &[u8]) -> Result<(Vec<u64>, String), PtwmCoreE
         let key = r.read_tstr()?;
         match key.as_str() {
             "shape" => {
-                let n = r.read_head(MAJOR_ARRAY)? as usize;
-                let mut dims = Vec::with_capacity(n);
+                let n = r.read_head(MAJOR_ARRAY)?;
+                // Each element takes at least one byte, so cap the reservation
+                // by the bytes left instead of trusting the declared count.
+                let mut dims = Vec::with_capacity(n.min(r.remaining() as u64) as usize);
                 for _ in 0..n {
                     dims.push(r.read_head(MAJOR_UINT)?);
                 }
@@ -252,5 +260,29 @@ mod tests {
             b'p', b'e', 0x64, b'f', b'p', b'1', b'6',
         ];
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn rejects_tstr_length_that_overflows() {
+        // map(2), then a text-string head declaring u64::MAX bytes. The
+        // bounds check must not wrap around.
+        let mut buf = Vec::new();
+        write_uint(&mut buf, MAJOR_MAP, 2);
+        write_uint(&mut buf, MAJOR_TSTR, u64::MAX);
+        buf.extend_from_slice(b"shape");
+        assert!(decode_shape_metadata(&buf).is_err());
+    }
+
+    #[test]
+    fn huge_shape_count_fails_without_reserving() {
+        // {"shape": array(2^60) ...}: the declared count far exceeds the
+        // buffer, so decoding fails on truncation and does not try to
+        // reserve 2^60 elements first.
+        let mut buf = Vec::new();
+        write_uint(&mut buf, MAJOR_MAP, 2);
+        write_tstr(&mut buf, "shape");
+        write_uint(&mut buf, MAJOR_ARRAY, 1 << 60);
+        write_uint(&mut buf, MAJOR_UINT, 1);
+        assert!(decode_shape_metadata(&buf).is_err());
     }
 }

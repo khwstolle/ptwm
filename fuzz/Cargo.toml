@@ -95,3 +95,27 @@ name = "raw_binary_schema"
 path = "fuzz_targets/raw_binary_schema.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "compact_decode"
+path = "fuzz_targets/compact_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "chain_wire_compact"
+path = "fuzz_targets/chain_wire_compact.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "parse_wire_compact"
+path = "fuzz_targets/parse_wire_compact.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "extension_table_compact"
+path = "fuzz_targets/extension_table_compact.rs"
+test = false
+doc = false

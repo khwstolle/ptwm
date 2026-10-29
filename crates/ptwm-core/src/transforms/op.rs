@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::error::PtwmCoreError;
 use crate::types::descriptor::PlaneDescriptor;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum OpId {
     Source = 0x0000,
@@ -36,8 +36,42 @@ pub enum OpId {
 }
 
 impl OpId {
+    /// Every op, in wire-id order.
+    pub const ALL: [OpId; 24] = [
+        OpId::Source,
+        OpId::Terminal,
+        OpId::BitReorderIeee16,
+        OpId::BitReorderIeee32,
+        OpId::BitReorderFp8E4M3,
+        OpId::BitReorderFp8E5M2,
+        OpId::ByteSplit,
+        OpId::NibbleSplit,
+        OpId::BytePassthrough,
+        OpId::MxFp4Deinterleave,
+        OpId::BlockMicroscalingRepack,
+        OpId::XorDelta,
+        OpId::FloatDelta,
+        OpId::IntDelta,
+        OpId::PredictorXor,
+        OpId::IndexBitwidthPack,
+        OpId::EntropyEstimate,
+        OpId::Concat,
+        OpId::Reshape,
+        OpId::MantissaZeroStrip,
+        OpId::BurrowsWheeler,
+        OpId::MoveToFront,
+        OpId::SphericalNormalize,
+        OpId::AlphaStableNormalize,
+    ];
+
+    /// Canonical id of the op's built-in contribution at the crate version.
     pub fn canonical_id(self) -> crate::extension::CanonicalId {
-        let name = match self {
+        crate::extension::builtin_canonical_id(self.builtin_name())
+    }
+
+    /// Name of the op's built-in contribution (`io.ptwm.builtin.<name>`).
+    pub fn builtin_name(self) -> &'static str {
+        match self {
             OpId::Source => "source",
             OpId::Terminal => "terminal",
             OpId::BitReorderIeee16 => "bit_reorder_ieee16",
@@ -62,8 +96,7 @@ impl OpId {
             OpId::MoveToFront => "move_to_front",
             OpId::SphericalNormalize => "spherical_normalize",
             OpId::AlphaStableNormalize => "alpha_stable_normalize",
-        };
-        crate::extension::builtin_canonical_id(name)
+        }
     }
 
     pub fn as_u16(self) -> u16 {

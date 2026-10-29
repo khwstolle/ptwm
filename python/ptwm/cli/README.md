@@ -79,3 +79,9 @@ Both `compress` and `decompress` support these flags:
 - `--verification`: verify the compressed output decompresses to the
   exact input.
 - `--hf_cache`: preserve Hugging Face cache symlink layout.
+
+`compress` also takes `--container-layout {compact,legacy}`. New `.ptwm`
+containers use the compact layout (magic `\x89PTWC`) by default; ptwm
+v1.2 and later read it, including the random-access, store and inspect
+tools. `--container-layout legacy` writes `\x89PTWM` containers that
+v1.1 and later read.

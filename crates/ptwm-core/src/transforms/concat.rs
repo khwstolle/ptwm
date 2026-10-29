@@ -54,7 +54,9 @@ impl Op for Concat {
                     i, input.length_bytes, i, expected_len
                 )));
             }
-            total_bytes += input.length_bytes;
+            total_bytes = total_bytes.checked_add(input.length_bytes).ok_or_else(|| {
+                PtwmCoreError::InvalidContainer("Concat: total length overflows u64".into())
+            })?;
         }
 
         Ok(vec![PlaneDescriptor {

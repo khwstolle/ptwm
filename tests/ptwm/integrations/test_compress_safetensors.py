@@ -456,3 +456,34 @@ def test_audit_log_cbor_roundtrip_with_discovered_chains(tmp_path):
 
     assert recovered.entries() == audit.entries()
     assert recovered.discovered_chains() == audit.discovered_chains()
+
+
+@pytest.mark.parametrize("layout", ["legacy", "compact"])
+@pytest.mark.parametrize("max_shard_size", [None, 4096])
+def test_container_layout_is_forwarded_to_every_shard(tmp_path, layout, max_shard_size):
+    from ptwm._magic import MAGIC_LEN, MAGIC_PTWC, MAGIC_PTWM
+
+    src = _save_nvfp4_safetensors(tmp_path)
+    out_dir = tmp_path / "out"
+    kwargs = {} if max_shard_size is None else {"max_shard_size": max_shard_size}
+    compress_safetensors_file(src, out_dir, mode="a", container_layout=layout, **kwargs)
+    shards = sorted(out_dir.glob("*.ptwm"))
+    assert shards
+    if max_shard_size is not None:
+        assert len(shards) > 1
+    expected = MAGIC_PTWC if layout == "compact" else MAGIC_PTWM
+    for shard in shards:
+        assert shard.read_bytes()[:MAGIC_LEN] == expected
+    state = read_sharded_ptwm(out_dir)
+    ref = _build_synthetic_nvfp4()
+    assert set(state) == set(ref)
+    for name, arr in ref.items():
+        assert bytes(state[name]) == arr.tobytes()
+
+
+def test_unknown_container_layout_is_rejected_before_writing(tmp_path):
+    src = _save_nvfp4_safetensors(tmp_path)
+    out_dir = tmp_path / "out"
+    with pytest.raises(ValueError, match="container_layout"):
+        compress_safetensors_file(src, out_dir, container_layout="ptwc")
+    assert not out_dir.exists()

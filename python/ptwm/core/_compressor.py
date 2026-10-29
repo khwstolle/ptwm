@@ -4,12 +4,12 @@ import numpy as np
 import torch
 
 from .. import _rust
-from .._config import CompressionConfig, Format, Method
-from .._exceptions import CompressionMethodNotSupportedError
+from .._config import CompressionConfig, Format, Framing, Method
+from .._exceptions import CompressionMethodNotSupportedError, InvalidDTypeError
 from ..delta import encode as delta_encode
 from ..preprocessing._chains import (
-    CHAIN_BYTE_PASSTHROUGH_VALUE,
     ClassifierRole,
+    build_chain_blobs,
     chains_for,
 )
 from ..utils import DType
@@ -24,15 +24,6 @@ _METHOD_HINTS: dict[int, int] = {
     Method.RANS.value: 4,
     Method.IDENTITY.value: 5,
 }
-
-# Dtypes that are packed into uint8 on the Rust side (single byte per element).
-_UINT8_VIEW_DTYPE_CODES = frozenset(
-    {
-        DType.FLOAT8_E4M3FN.code,
-        DType.FLOAT8_E5M2.code,
-        DType.FLOAT4_E2M1FN_X2.code,
-    }
-)
 
 
 def _to_raw_bytes(
@@ -115,42 +106,6 @@ class Compressor:
             msg = "delta compression required but delta_second_data is None"
             raise ValueError(msg)
 
-        delta_ref_blake3: bytes | None = None
-        if delta_second_data is not None:
-            ref_bytes = _to_raw_bytes(delta_second_data)
-            delta_ref_blake3 = _rust.blake3_hash(ref_bytes)
-            data = delta_encode(_to_raw_bytes(data), reference=ref_bytes)
-
-        return self._compress_torch_numpy_byte(data, delta_ref_blake3=delta_ref_blake3)
-
-    def _compress_torch_numpy_byte(
-        self,
-        data: bytes | bytearray | np.ndarray | torch.Tensor,
-        *,
-        delta_ref_blake3: bytes | None = None,
-    ) -> bytes:
-        if self.config.input_format == Format.BYTE:
-            dtype_enum = DType.from_dtype(self.config.bytearray_dtype).code
-            shape: tuple[int, ...] | None = None
-        else:
-            dtype_enum = DType.from_dtype(data.dtype).code
-            shape = tuple(data.shape)
-
-        # BF16 in TORCH: numpy cannot hold bfloat16, so reinterpret as uint16
-        # before going through numpy/memoryview.
-        if (
-            dtype_enum == DType.BFLOAT16.code
-            and self.config.input_format == Format.TORCH
-        ):
-            data = data.view(torch.uint16)
-        # FP8 / packed FP4 on TORCH / NUMPY input: reinterpret as uint8 to
-        # hand a flat byte buffer to the Rust compressor.
-        elif (
-            dtype_enum in _UINT8_VIEW_DTYPE_CODES
-            and self.config.input_format != Format.BYTE
-        ):
-            data = data.view(torch.uint8)
-
         if self.config.input_format not in (
             Format.TORCH,
             Format.NUMPY,
@@ -158,12 +113,33 @@ class Compressor:
         ):
             msg = f"Unsupported input_format: {self.config.input_format}"
             raise ValueError(msg)
+
+        # Read dtype and shape from the input before any delta encoding:
+        # the delta residual is a flat byte buffer, but the record still
+        # describes the original tensor.
+        if self.config.input_format == Format.BYTE:
+            dtype_code = DType.from_dtype(self.config.bytearray_dtype).code
+            shape: tuple[int, ...] | None = None
+        else:
+            dtype_code = DType.from_dtype(data.dtype).code
+            if dtype_code == DType.NONE.code:
+                # Code 0 has no dtype mapping, so the frame could not be
+                # decoded back to a tensor or array.
+                msg = f"unsupported dtype {data.dtype} for {self.config.input_format}"
+                raise InvalidDTypeError(msg)
+            shape = tuple(data.shape)
         ba_bytes = _to_raw_bytes(data)
+
+        delta_ref_blake3: bytes | None = None
+        if delta_second_data is not None:
+            ref_bytes = _to_raw_bytes(delta_second_data)
+            delta_ref_blake3 = _rust.blake3_hash(ref_bytes)
+            ba_bytes = delta_encode(ba_bytes, reference=ref_bytes)
 
         return self._compress_bin(
             ba=ba_bytes,
             shape=shape,
-            dtype_code=dtype_enum,
+            dtype_code=dtype_code,
             delta_ref_blake3=delta_ref_blake3,
         )
 
@@ -174,7 +150,10 @@ class Compressor:
         dtype_code: int,
         delta_ref_blake3: bytes | None = None,
     ) -> bytes:
-        """Encode a single-tensor ``.ptwm`` via ``compress_model``."""
+        """Encode one tensor as a compact frame or a single-tensor container.
+
+        ``config.framing`` selects the layout; see :class:`ptwm.Framing`.
+        """
         method_hint = _METHOD_HINTS.get(self.config.method.value)
         if method_hint is None:
             msg = f"Unsupported compression method: {self.config.method}"
@@ -191,19 +170,44 @@ class Compressor:
         )
 
         tensor_shape = list(shape) if shape is not None else None
-        builders = list(chains_for(int(dtype_code), ClassifierRole.STANDARD))
-        if not builders:
-            builders = [CHAIN_BYTE_PASSTHROUGH_VALUE]
-        chain_shape = tensor_shape if tensor_shape is not None else [len(ba)]
-        # Builders may decline a shape by returning None (e.g. the
-        # spherical-normalize chain only accepts 2D tensors); skip those.
-        chains = [[c.to_bytes() for b in builders if (c := b(chain_shape)) is not None]]
+        # Each chain's Source shape counts elements of that chain's own
+        # Source dtype and covers exactly len(ba) bytes; byte input has no
+        # shape, so the element count comes from the byte count.
+        chains = [
+            build_chain_blobs(
+                chains_for(int(dtype_code), ClassifierRole.STANDARD),
+                shape=tensor_shape,
+                nbytes=len(ba),
+            )
+        ]
 
         codec_menu_ids: list[int] | None
         if self.config.codec_menu is None:
             codec_menu_ids = None
         else:
             codec_menu_ids = [int(c) for c in self.config.codec_menu]
+
+        emit_payload_hash = self.config.emit_payload_hash
+        emit_plane_crc = self.config.emit_plane_crc
+
+        # The compact frame has no chunk table, so streaming always writes a
+        # full container.
+        if self.config.framing == Framing.COMPACT and streaming_chunk is None:
+            blob = _rust.compress_compact(
+                int(dtype_code),
+                int(self.config.input_format.value),
+                ba,
+                tensor_shape,
+                dtype_name_str,
+                delta_ref_blake3,
+                chains[0],
+                emit_payload_hash,
+                emit_plane_crc,
+                method_hint,
+                codec_menu_ids,
+            )
+            if blob is not None:
+                return blob
 
         return _rust.compress_model(
             [
@@ -218,9 +222,10 @@ class Compressor:
                 )
             ],
             chains,
-            True,  # emit_payload_hash
-            True,  # emit_plane_crc
+            emit_payload_hash,
+            emit_plane_crc,
             method_hint,
             streaming_chunk,
             codec_menu_ids,
+            container_layout=self.config.container_layout.value,
         )

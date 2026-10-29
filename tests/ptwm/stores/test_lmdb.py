@@ -7,13 +7,19 @@ import json
 import pytest
 import torch
 from ptwm import _rust
+from ptwm._magic import container_kind
 from ptwm.stores import LmdbWeightStore, detect_format, write_lmdb
 from ptwm.stores._lmdb import KEY_FMT, KEY_IDX, KEY_REG, LMDB_FORMAT
 
 
-def test_blob_layout_keys(tmp_path, store_tensors):
+@pytest.mark.parametrize(
+    ("container_layout", "kind"),
+    [(None, "ptwc"), ("compact", "ptwc"), ("legacy", "ptwm")],
+)
+def test_blob_layout_keys(tmp_path, store_tensors, container_layout, kind):
     path = tmp_path / "m.lmdb"
-    write_lmdb(path, store_tensors, layout="blob")
+    kw = {} if container_layout is None else {"container_layout": container_layout}
+    write_lmdb(path, store_tensors, layout="blob", **kw)
     assert detect_format(path) == "lmdb"
     store = LmdbWeightStore.open(path)
     assert store.layout == "blob"
@@ -21,11 +27,21 @@ def test_blob_layout_keys(tmp_path, store_tensors):
     fmt = json.loads(store._get(KEY_FMT))
     assert fmt["ptwm_format"] == LMDB_FORMAT
     assert fmt["layout"] == "blob"
+    if kind == "ptwm":
+        # A legacy store's record is the one older releases write.
+        assert fmt == {
+            "layout": "blob",
+            "manifest_version": 1,
+            "ptwm_format": LMDB_FORMAT,
+        }
+    else:
+        # The default container layout is compact, and the store records it.
+        assert fmt["container_layout"] == "compact"
     assert store._get(KEY_REG) is None  # blob layout has no shared registry key
     # Every tensor is a self-contained single-tensor container.
     for name, *_ in store_tensors:
         blob = store._get(b"t/" + name.encode())
-        assert blob[:5] == b"\x89PTWM"
+        assert container_kind(blob) == kind
 
 
 def test_exploded_layout_keys(tmp_path, store_tensors):

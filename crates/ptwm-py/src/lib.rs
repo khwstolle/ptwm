@@ -13,12 +13,14 @@ use ptwm_core::chain::wire::read_chain_blob;
 use ptwm_core::compressor::{
     CompressorOptions, InputTensor, compress_model as core_compress_model,
 };
-use ptwm_core::container::ContainerReader;
 use ptwm_core::{PtwmCoreError, codec_tagged, delta, entropy};
+
+use handle::ContainerHandle;
 
 mod delta_scheme;
 mod device_buffer;
 mod ext;
+mod handle;
 mod hardware;
 mod host_flavor;
 mod inspect;
@@ -45,6 +47,8 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_blake3_hash, m)?)?;
     m.add_function(wrap_pyfunction!(py_dtype_element_size, m)?)?;
     m.add_function(wrap_pyfunction!(compress_model, m)?)?;
+    m.add_function(wrap_pyfunction!(compress_compact, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_compact, m)?)?;
     m.add_function(wrap_pyfunction!(decode_tensor, m)?)?;
     m.add_function(wrap_pyfunction!(decode_model, m)?)?;
     m.add_function(wrap_pyfunction!(decode_tensor_shape, m)?)?;
@@ -58,11 +62,13 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_builtin_canonical_id, m)?)?;
     m.add_function(wrap_pyfunction!(py_write_chain_blob, m)?)?;
     m.add_function(wrap_pyfunction!(py_chain_blob_info, m)?)?;
+    m.add_function(wrap_pyfunction!(py_chain_source_byte_len, m)?)?;
     trust::register(m)?;
     policy::register(m)?;
     host_flavor::register(m)?;
     ext::register(m)?;
     inspect::register(m)?;
+    handle::register(m)?;
     delta_scheme::register(m)?;
     hardware::register(m)?;
     plane_codec_cuda::register(m)?;
@@ -311,10 +317,13 @@ fn py_dtype_element_size(dtype_code: u8) -> PyResult<u32> {
 /// `method_hint` selects the dominant codec for the container header
 /// (1=HUFFMAN, 2=ZSTD, 3=MICROSCALE, 4=RANS, 5=IDENTITY).
 ///
+/// `container_layout` is ``"compact"`` (default, ``\x89PTWC``, readable by
+/// v1.2 and later) or ``"legacy"`` (``\x89PTWM``, readable by v1.1 and later).
+///
 /// Returns the entire container as a ``bytes`` object.
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 #[pyfunction]
-#[pyo3(signature = (records, chains_per_tensor, emit_payload_hash, emit_plane_crc, method_hint=3, streaming_chunk=None, codec_menu=None))]
+#[pyo3(signature = (records, chains_per_tensor, emit_payload_hash, emit_plane_crc, method_hint=3, streaming_chunk=None, codec_menu=None, *, container_layout="compact"))]
 fn compress_model<'py>(
     py: Python<'py>,
     records: Vec<(
@@ -335,7 +344,15 @@ fn compress_model<'py>(
     // trial-encode menu is filtered to codecs in this set on every plane;
     // empty intersection on a plane raises `InvalidContainer`.
     codec_menu: Option<Vec<u16>>,
+    // Container layout: "legacy" (\x89PTWM) or "compact" (\x89PTWC).
+    container_layout: &str,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
+    let container_layout = ptwm_core::container::ContainerLayout::parse(container_layout)
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown container_layout {container_layout:?} (expected \"legacy\" or \"compact\")"
+            ))
+        })?;
     if chains_per_tensor.len() != records.len() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "chains_per_tensor length {} != records length {}",
@@ -435,6 +452,7 @@ fn compress_model<'py>(
             forced_codec,
             allow_codec_ids,
             chunk_size: streaming_chunk,
+            container_layout,
         };
 
         let cursor = std::io::Cursor::new(&mut out);
@@ -446,41 +464,152 @@ fn compress_model<'py>(
     Ok(pyo3::types::PyBytes::new(py, &out))
 }
 
-/// Decode a single tensor from a container blob.
+/// Compress one tensor into a compact single-tensor frame.
 ///
-/// `blob` is the full container ``bytes`` returned by :func:`compress_model`.
-/// `name` is the tensor name string. Returns the raw decompressed ``bytes``
-/// via the chain-based decode path.
+/// Arguments mirror one element of :func:`compress_model` (the tensor name is
+/// not stored). Returns ``None`` when the tensor cannot use the compact frame
+/// (chunked encoding, or a plane that selects shared state); the caller then
+/// writes a full container with :func:`compress_model`.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (dtype_code, input_format, raw_bytes, shape, dtype_name, delta_reference_blake3, chains, emit_payload_hash, emit_plane_crc, method_hint=3, codec_menu=None))]
+fn compress_compact<'py>(
+    py: Python<'py>,
+    dtype_code: u16,
+    input_format: u8,
+    raw_bytes: PyBuffer<u8>,
+    shape: Option<Vec<u64>>,
+    dtype_name: Option<String>,
+    delta_reference_blake3: Option<Vec<u8>>,
+    chains: Vec<Vec<u8>>,
+    emit_payload_hash: bool,
+    emit_plane_crc: bool,
+    method_hint: u16,
+    codec_menu: Option<Vec<u16>>,
+) -> PyResult<Option<Bound<'py, pyo3::types::PyBytes>>> {
+    let delta_reference_blake3 = match delta_reference_blake3 {
+        Some(h) => Some(<[u8; 32]>::try_from(h.as_slice()).map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "delta_reference_blake3 must be 32 bytes, got {}",
+                h.len()
+            ))
+        })?),
+        None => None,
+    };
+    if chains.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "chains: at least one candidate chain required",
+        ));
+    }
+    let mut candidate_chains = Vec::with_capacity(chains.len());
+    for (chain_idx, blob) in chains.iter().enumerate() {
+        let (chain, _) = read_chain_blob(blob).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("chains[{chain_idx}]: {e}"))
+        })?;
+        candidate_chains.push(chain);
+    }
+    let raw = contiguous_slice(&raw_bytes, "raw_bytes")?;
+    let forced_codec = match method_hint {
+        2 => Some(ptwm_core::codec::CodecId::Zstd),
+        4 => Some(ptwm_core::codec::CodecId::Rans),
+        5 => Some(ptwm_core::codec::CodecId::Identity),
+        _ => None,
+    };
+    let allow_codec_ids: Option<Vec<ptwm_core::codec::CodecId>> = codec_menu.map(|ids| {
+        ids.into_iter()
+            .filter_map(ptwm_core::codec::CodecId::from_u16)
+            .collect()
+    });
+    let out = py
+        .allow_threads(|| {
+            let input = InputTensor {
+                name: "_".to_string(),
+                candidate_chains,
+                dtype_code,
+                input_format,
+                raw_bytes: raw,
+                shape,
+                dtype_name,
+                delta_reference_blake3,
+            };
+            let opts = CompressorOptions {
+                method_hint,
+                emit_payload_hash,
+                emit_plane_crc,
+                forced_codec,
+                allow_codec_ids,
+                chunk_size: None,
+                ..Default::default()
+            };
+            ptwm_core::compact::compress_compact(&input, &opts)
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    Ok(out.map(|b| pyo3::types::PyBytes::new(py, &b)))
+}
+
+/// Decode a compact single-tensor frame.
+///
+/// Returns ``(raw_bytes, shape, dtype_name, dtype_code, input_format,
+/// delta_reference_blake3, payload_len)``; ``shape``, ``dtype_name`` and
+/// ``delta_reference_blake3`` are ``None`` when the frame does not carry them.
+/// ``payload_len`` counts codec payload plus inline codec state (the raw size
+/// for a stored frame).
+#[allow(clippy::type_complexity)]
+#[pyfunction]
+fn decode_compact<'py>(
+    py: Python<'py>,
+    blob: &[u8],
+) -> PyResult<(
+    Bound<'py, pyo3::types::PyBytes>,
+    Option<Vec<u64>>,
+    Option<String>,
+    u16,
+    u8,
+    Option<Bound<'py, pyo3::types::PyBytes>>,
+    u64,
+)> {
+    let t = py
+        .allow_threads(|| ptwm_core::compact::decode_compact(blob))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    Ok((
+        pyo3::types::PyBytes::new(py, &t.raw),
+        t.shape,
+        t.dtype_name,
+        t.dtype_code,
+        t.input_format,
+        t.delta_reference_blake3
+            .map(|h| pyo3::types::PyBytes::new(py, &h)),
+        t.payload_len,
+    ))
+}
+
+// The functions below open a temporary `ContainerHandle` per call (see
+// `handle.rs`): `blob` is any buffer, borrowed when its memory cannot
+// change (see `ContainerHandle::open`) and copied otherwise. Open one `ContainerHandle` instead for several queries.
+
+/// Decode a single tensor from a container blob (either layout).
+///
+/// `blob` is the full container (any buffer; ``bytes`` is borrowed without a
+/// copy, other buffers may be copied). `name` is the tensor name string. Returns the raw decompressed
+/// ``bytes`` via the chain-based decode path.
 ///
 /// `skip_missing` — when ``True`` open the container even if non-builtin
 /// extensions referenced in its Extension Table are not installed (mirrors
 /// ``ContainerReader::open_partial``). Tensors that actually need those
 /// missing extensions will still fail at decode time.
 ///
-/// Raises ``RuntimeError`` when the container is malformed or the tensor
-/// name is missing.  Raises ``ValueError`` when non-builtin extensions are
-/// missing and ``skip_missing`` is ``False`` (the default).
+/// Raises ``RuntimeError`` when the container is malformed, the tensor name
+/// is missing, or non-builtin extensions are missing and ``skip_missing`` is
+/// ``False`` (the default).
 #[pyfunction]
 #[pyo3(signature = (blob, name, skip_missing = false))]
 fn decode_tensor<'py>(
     py: Python<'py>,
-    blob: &Bound<'_, pyo3::types::PyBytes>,
+    blob: &Bound<'_, PyAny>,
     name: &str,
     skip_missing: bool,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let data: Vec<u8> = blob.as_bytes().to_vec();
-    let name_owned = name.to_string();
-    let out = py
-        .allow_threads(|| -> Result<Vec<u8>, PtwmCoreError> {
-            let reader = if skip_missing {
-                ContainerReader::open_partial(&data)?
-            } else {
-                ContainerReader::open(&data)?
-            };
-            reader.decode_tensor(&name_owned)
-        })
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-    Ok(pyo3::types::PyBytes::new(py, &out))
+    ContainerHandle::open(py, blob, skip_missing)?.decode_bytes(py, name)
 }
 
 /// Decode every tensor in `blob` at once, in parallel across the rayon pool
@@ -492,30 +621,13 @@ fn decode_tensor<'py>(
 #[pyo3(signature = (blob, skip_missing = false))]
 fn decode_model<'py>(
     py: Python<'py>,
-    blob: &Bound<'_, pyo3::types::PyBytes>,
+    blob: &Bound<'_, PyAny>,
     skip_missing: bool,
 ) -> PyResult<Vec<(String, Bound<'py, pyo3::types::PyBytes>)>> {
-    // Borrow the blob's bytes directly — no full-model copy. `blob` outlives
-    // this call, and the bytes are plain immutable memory, so reading them with
-    // the GIL released is sound.
-    let data = blob.as_bytes();
-    let decoded = py
-        .allow_threads(|| -> Result<Vec<(String, Vec<u8>)>, PtwmCoreError> {
-            let reader = if skip_missing {
-                ContainerReader::open_partial(data)?
-            } else {
-                ContainerReader::open(data)?
-            };
-            reader.decode_model()
-        })
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-    decoded
-        .into_iter()
-        .map(|(name, bytes)| Ok((name, pyo3::types::PyBytes::new(py, &bytes))))
-        .collect()
+    ContainerHandle::open(py, blob, skip_missing)?.decode_all(py)
 }
 
-/// Return `(shape, dtype_name, dtype_code, input_format)` for a v3 tensor.
+/// Return `(shape, dtype_name, dtype_code, input_format)` for a tensor.
 ///
 /// Returns `None` when the tensor has no CBOR shape metadata embedded.
 /// `skip_missing` has the same semantics as for :func:`decode_tensor`.
@@ -523,162 +635,67 @@ fn decode_model<'py>(
 #[pyo3(signature = (blob, name, skip_missing = false))]
 fn decode_tensor_info(
     py: Python<'_>,
-    blob: &Bound<'_, pyo3::types::PyBytes>,
+    blob: &Bound<'_, PyAny>,
     name: &str,
     skip_missing: bool,
-) -> PyResult<Option<(Vec<u64>, String, u16, u8)>> {
-    use ptwm_core::metadata::decode_shape_metadata;
-    use ptwm_core::tensor_record::parse_tensor_record;
-
-    let data: Vec<u8> = blob.as_bytes().to_vec();
-    let name_owned = name.to_string();
-    let info = py
-        .allow_threads(
-            || -> Result<Option<(Vec<u64>, String, u16, u8)>, PtwmCoreError> {
-                let reader = if skip_missing {
-                    ContainerReader::open_partial(&data)?
-                } else {
-                    ContainerReader::open(&data)?
-                };
-                let record_bytes =
-                    reader.get_tensor_record_bytes(&name_owned).ok_or_else(|| {
-                        PtwmCoreError::InvalidContainer(format!("tensor '{name_owned}' not found"))
-                    })?;
-                let (rec, _) = parse_tensor_record(record_bytes)?;
-                match rec.tensor_metadata {
-                    Some(meta) => {
-                        let (shape, dtype_name) = decode_shape_metadata(&meta)?;
-                        Ok(Some((shape, dtype_name, rec.dtype_code, rec.input_format)))
-                    }
-                    None => Ok(None),
-                }
-            },
-        )
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-    Ok(info)
+) -> PyResult<Option<handle::TensorInfo>> {
+    ContainerHandle::open(py, blob, skip_missing)?.tensor_info(py, name)
 }
 
-/// Return the BLAKE3 hash of the delta reference recorded for a v3 tensor,
+/// Return the BLAKE3 hash of the delta reference recorded for a tensor,
 /// or `None` if the tensor carries no delta dependency.
 /// `skip_missing` has the same semantics as for :func:`decode_tensor`.
 #[pyfunction]
 #[pyo3(signature = (blob, name, skip_missing = false))]
 fn decode_tensor_delta_hash<'py>(
     py: Python<'py>,
-    blob: &Bound<'_, pyo3::types::PyBytes>,
+    blob: &Bound<'_, PyAny>,
     name: &str,
     skip_missing: bool,
 ) -> PyResult<Option<Bound<'py, pyo3::types::PyBytes>>> {
-    use ptwm_core::tensor_record::{RefKind, parse_tensor_record};
-
-    let data: Vec<u8> = blob.as_bytes().to_vec();
-    let name_owned = name.to_string();
-    let hash_opt = py
-        .allow_threads(|| -> Result<Option<[u8; 32]>, PtwmCoreError> {
-            let reader = if skip_missing {
-                ContainerReader::open_partial(&data)?
-            } else {
-                ContainerReader::open(&data)?
-            };
-            let record_bytes = reader.get_tensor_record_bytes(&name_owned).ok_or_else(|| {
-                PtwmCoreError::InvalidContainer(format!("tensor '{name_owned}' not found"))
-            })?;
-            let (rec, _) = parse_tensor_record(record_bytes)?;
-            for dep in &rec.dependencies {
-                if matches!(dep.ref_kind, RefKind::ExternalSafetensors)
-                    && let Some(h) = dep.expected_hash
-                {
-                    return Ok(Some(h));
-                }
-            }
-            Ok(None)
-        })
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-    Ok(hash_opt.map(|h| pyo3::types::PyBytes::new(py, &h)))
+    ContainerHandle::open(py, blob, skip_missing)?.tensor_delta_hash(py, name)
 }
 
-/// List every tensor name stored in a v3 container blob, in index order.
-/// `skip_missing` has the same semantics as for :func:`decode_tensor`.
+/// List every tensor name stored in a container blob, in write (body)
+/// order. `skip_missing` has the same semantics as for :func:`decode_tensor`.
 #[pyfunction]
 #[pyo3(signature = (blob, skip_missing = false))]
 fn list_tensor_names(
     py: Python<'_>,
-    blob: &Bound<'_, pyo3::types::PyBytes>,
+    blob: &Bound<'_, PyAny>,
     skip_missing: bool,
 ) -> PyResult<Vec<String>> {
-    let data: Vec<u8> = blob.as_bytes().to_vec();
-    let names = py
-        .allow_threads(|| -> Result<Vec<String>, PtwmCoreError> {
-            let reader = if skip_missing {
-                ContainerReader::open_partial(&data)?
-            } else {
-                ContainerReader::open(&data)?
-            };
-            reader.tensor_names()
-        })
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-    Ok(names)
+    ContainerHandle::open(py, blob, skip_missing)?.names_vec(py)
 }
 
-/// Decode the shape-metadata map for a v3 tensor, if present.
+/// Decode the shape-metadata map for a tensor, if present.
 ///
 /// Returns ``(shape, dtype_name)`` or ``None`` when no CBOR shape metadata.
+/// `skip_missing` has the same semantics as for :func:`decode_tensor`.
 #[pyfunction]
+#[pyo3(signature = (blob, name, skip_missing = false))]
 fn decode_tensor_shape(
     py: Python<'_>,
-    blob: &Bound<'_, pyo3::types::PyBytes>,
+    blob: &Bound<'_, PyAny>,
     name: &str,
+    skip_missing: bool,
 ) -> PyResult<Option<(Vec<u64>, String)>> {
-    let data: Vec<u8> = blob.as_bytes().to_vec();
-    let name_owned = name.to_string();
-    let got = py
-        .allow_threads(|| -> Result<Option<(Vec<u64>, String)>, PtwmCoreError> {
-            let reader = ContainerReader::open(&data)?;
-            reader.tensor_shape(&name_owned)
-        })
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-    Ok(got)
+    ContainerHandle::open(py, blob, skip_missing)?.tensor_shape(py, name)
 }
 
-/// Per-plane summary for every tensor in a v3 container blob.
+/// Per-plane summary for every tensor in a container blob.
 ///
 /// Returns a list of (tensor_name, plane_index, role, codec_id,
-/// state_source, payload_len) tuples — one row per plane.
+/// state_source, payload_len) tuples — one row per plane, tensors in write
+/// order. `skip_missing` has the same semantics as for :func:`decode_tensor`.
 #[pyfunction]
+#[pyo3(signature = (blob, skip_missing = false))]
 fn list_plane_summaries(
     py: Python<'_>,
-    blob: &Bound<'_, pyo3::types::PyBytes>,
-) -> PyResult<Vec<(String, u32, u8, u16, u8, u64)>> {
-    use ptwm_core::tensor_record::parse_tensor_record;
-
-    let data: Vec<u8> = blob.as_bytes().to_vec();
-    let summaries = py
-        .allow_threads(
-            || -> Result<Vec<(String, u32, u8, u16, u8, u64)>, PtwmCoreError> {
-                let reader = ContainerReader::open(&data)?;
-                let names = reader.tensor_names()?;
-                let mut out = Vec::new();
-                for name in names {
-                    let record_bytes = reader.get_tensor_record_bytes(&name).ok_or_else(|| {
-                        PtwmCoreError::InvalidContainer(format!("tensor '{name}' not found"))
-                    })?;
-                    let (rec, _) = parse_tensor_record(record_bytes)?;
-                    for (idx, plane) in rec.terminals.iter().enumerate() {
-                        out.push((
-                            name.clone(),
-                            idx as u32,
-                            plane.role as u8,
-                            plane.codec_id.as_u16(),
-                            plane.state_source as u8,
-                            plane.payload_len,
-                        ));
-                    }
-                }
-                Ok(out)
-            },
-        )
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-    Ok(summaries)
+    blob: &Bound<'_, PyAny>,
+    skip_missing: bool,
+) -> PyResult<Vec<handle::PlaneSummary>> {
+    ContainerHandle::open(py, blob, skip_missing)?.plane_summary_rows(py)
 }
 
 /// Explode a `.ptwm` container into its canonical PTWM-JSON projection.
@@ -800,13 +817,12 @@ fn py_chain_blob_info(blob: &[u8]) -> PyResult<(usize, Vec<(u16, u16)>)> {
     use ptwm_core::extension::dispatch::{BuiltinKind, dispatch_builtin};
     use ptwm_core::extension::table::ExtensionTable;
 
-    // Parse the extension table.
-    let inline_table = ExtensionTable::from_bytes(blob)
+    // Parse the extension table; its size is the parse position, not the
+    // length of a re-serialization.
+    let (mut inline_table, et_size) = ExtensionTable::from_bytes_prefix(blob)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("chain blob et: {e}")))?;
-    let et_bytes = inline_table
-        .to_bytes()
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("chain blob et ser: {e}")))?;
-    let et_size = et_bytes.len();
+    // Blobs cached by another release carry that release's built-in ids.
+    ptwm_core::extension::normalize_builtin_ids(&mut inline_table);
 
     // Build (table_idx, op_id) pairs for every entry that resolves to an op.
     let mut table: Vec<(u16, u16)> = Vec::with_capacity(inline_table.entries.len());
@@ -817,6 +833,19 @@ fn py_chain_blob_info(blob: &[u8]) -> PyResult<(usize, Vec<(u16, u16)>)> {
     }
 
     Ok((et_size, table))
+}
+
+/// Byte count the Source node of a chain blob declares (shape × dtype
+/// storage size). Writers require it to equal the tensor's raw byte count;
+/// tests use it to check the Python chain builders against the Rust rule.
+#[pyfunction]
+#[pyo3(name = "chain_source_byte_len")]
+fn py_chain_source_byte_len(blob: &[u8]) -> PyResult<u64> {
+    let (chain, _) = ptwm_core::chain::wire::read_chain_blob(blob)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let desc = ptwm_core::chain::runtime::chain_source_descriptor(&chain)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(desc.length_bytes)
 }
 
 /// Parse a chain from the **legacy wire format**, where node op-ids were

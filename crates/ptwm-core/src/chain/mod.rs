@@ -5,5 +5,6 @@ pub mod graph;
 pub mod runtime;
 pub mod validate;
 pub mod wire;
+pub mod wire_compact;
 
 pub use graph::{Chain, ChainEdge, ChainNode, TerminalRef};

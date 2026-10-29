@@ -141,15 +141,26 @@ pub fn validate_chain(chain: &Chain, n_dependencies: u8) -> Result<(), PtwmCoreE
         let inputs: Vec<crate::types::descriptor::PlaneDescriptor> = input_edges
             .iter()
             .map(|e| {
-                // Apply role_override if present.
-                let src_desc = &node_outputs[e.src_node as usize][e.src_output_idx as usize];
+                // A wire-derived edge can name an output the source node
+                // does not produce; that is an error, not a panic.
+                let src_desc = node_outputs
+                    .get(e.src_node as usize)
+                    .and_then(|o| o.get(e.src_output_idx as usize))
+                    .ok_or_else(|| {
+                        PtwmCoreError::InvalidContainer(format!(
+                            "validate_chain: edge into node[{node_idx}] references missing \
+                             output (node={}, output={})",
+                            e.src_node, e.src_output_idx
+                        ))
+                    })?;
                 let mut desc = src_desc.clone();
+                // Apply role_override if present.
                 if let Some(ref role) = e.role_override {
                     desc.role = role.clone();
                 }
-                desc
+                Ok(desc)
             })
-            .collect();
+            .collect::<Result<_, PtwmCoreError>>()?;
 
         let outputs = op.propagate_descriptors(&inputs).map_err(|e| {
             PtwmCoreError::InvalidContainer(format!(
@@ -508,5 +519,20 @@ mod tests {
         };
         // n_dependencies = 2, dep_idx = 10 → should fail
         assert!(validate_chain(&chain, 2).is_err());
+    }
+
+    #[test]
+    fn edge_to_missing_output_is_an_error_not_a_panic() {
+        // Source produces one output; an edge from output 5 used to index
+        // past the end of node_outputs[0].
+        let mut chain = passthrough_terminal_chain();
+        chain.edges[0].src_output_idx = 5;
+        chain.terminals.push(TerminalRef {
+            node_idx: 0,
+            output_idx: 0,
+            role: Role::Raw,
+        });
+        let err = validate_chain(&chain, 0).unwrap_err().to_string();
+        assert!(err.contains("missing output"), "{err}");
     }
 }

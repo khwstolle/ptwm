@@ -5,7 +5,7 @@
 //! `TAG_RAW` / length-prefix framing the rANS codec uses, so a plane that
 //! tANS can't shrink is stored verbatim and decode stays self-describing.
 
-use crate::codec::{CodecId, Encoded, PlaneCodec};
+use crate::codec::{CodecId, Encoded, PlaneCodec, check_decoded_len};
 use crate::codecs::length_prefix;
 use crate::entropy::tans;
 use crate::error::PtwmCoreError;
@@ -135,6 +135,32 @@ impl PlaneCodec for Tans {
             }),
         }
     }
+
+    fn decode_bounded(
+        &self,
+        state_format_version: u8,
+        state_bytes: &[u8],
+        payload: &[u8],
+        layout: &PlaneLayout,
+        decoded_len: usize,
+        max_len: usize,
+    ) -> Result<Vec<u8>, PtwmCoreError> {
+        // The prefix check rejects an oversized coded plane before it is
+        // decoded. The check on the output also covers the raw-fallback tag,
+        // which carries no length prefix.
+        if let Some((&TAG_TANS, rest)) = payload.split_first() {
+            length_prefix::check_within(rest, max_len, "tans")?;
+        }
+        let out = self.decode(
+            state_format_version,
+            state_bytes,
+            payload,
+            layout,
+            decoded_len,
+        )?;
+        check_decoded_len(self.id(), out.len(), max_len)?;
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -259,5 +285,22 @@ mod tests {
             .decode(0, &enc.state_bytes, &enc.payload, &PlaneLayout::Flat, 0)
             .unwrap();
         assert!(dec == data);
+    }
+
+    #[test]
+    fn decode_bounded_rejects_an_oversized_raw_fallback_plane() {
+        // A plane stored raw (tag 0) carries no length prefix; the bound
+        // must still apply to its output.
+        let payload = vec![0u8; 100_001];
+        let err = Tans
+            .decode_bounded(0, &[], &payload, &PlaneLayout::Flat, 4096, 4096)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bound is 4096"), "{err}");
+        // Within the bound the raw plane decodes.
+        let ok = Tans
+            .decode_bounded(0, &[], &payload[..4097], &PlaneLayout::Flat, 4096, 4096)
+            .unwrap();
+        assert_eq!(ok.len(), 4096);
     }
 }

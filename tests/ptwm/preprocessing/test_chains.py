@@ -193,7 +193,6 @@ class TestChainsFor:
             CHAIN_BF16_SPLIT,
             CHAIN_BF16_SPLIT_INTDELTA,
             CHAIN_BF16_SPLIT_PREDICTOR_XOR,
-            CHAIN_BF16_MICROSCALE_REPACK,
             CHAIN_BF16_SPLIT_MZS_K1,
             CHAIN_BF16_SPLIT_MZS_K2,
             CHAIN_BF16_SPLIT_MZS_K3,
@@ -202,6 +201,33 @@ class TestChainsFor:
             CHAIN_BF16_ALPHA_STABLE_NORMALIZE,
             CHAIN_BF16_HUFF_LLM_RAW,
         ]
+
+    def test_microscale_repack_is_not_a_production_candidate(self):
+        # Kept out of every table so the legacy writer's bf16 output stays
+        # byte-identical; see the comment above PRODUCTION_CHAINS. The
+        # builder itself still works when passed explicitly
+        # (TestCanonicalChains).
+        for code in (DT.BFLOAT16.code, DT.FLOAT16.code):
+            for role in ClassifierRole:
+                assert CHAIN_BF16_MICROSCALE_REPACK not in chains_for(code, role)
+
+    @pytest.mark.parametrize(
+        "builder",
+        [
+            CHAIN_BF16_SPHERICAL_NORMALIZE,
+            CHAIN_FP16_SPHERICAL_NORMALIZE,
+            CHAIN_FP32_SPHERICAL_NORMALIZE,
+            CHAIN_BF16_ALPHA_STABLE_NORMALIZE,
+            CHAIN_FP16_ALPHA_STABLE_NORMALIZE,
+            CHAIN_FP32_ALPHA_STABLE_NORMALIZE,
+        ],
+    )
+    def test_row_normalizers_decline_empty_dimensions(self, builder):
+        # The ops reject a matrix with no rows or no columns, so the builders
+        # must drop the candidate rather than fail the whole tensor.
+        assert builder([5, 0]) is None
+        assert builder([0, 5]) is None
+        assert builder([5, 3]) is not None
 
     def test_float16_standard_same_chain_as_bf16(self):
         result = chains_for(DT.FLOAT16.code, ClassifierRole.STANDARD)
@@ -269,6 +295,7 @@ class TestCanonicalChains:
             (CHAIN_F32_GLOBAL_SCALE, [1]),
             (CHAIN_FP4_NIBBLE_PASSTHROUGH, [64]),
             (CHAIN_BYTE_PASSTHROUGH_VALUE, [256]),
+            (CHAIN_BF16_MICROSCALE_REPACK, [4, 64]),
         ],
     )
     def test_builder_produces_chain(self, builder, shape):

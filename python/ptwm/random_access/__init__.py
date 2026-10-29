@@ -1,9 +1,10 @@
-"""Random-access loader for ``.ptwm`` containers.
+r"""Random-access loader for ``.ptwm`` containers.
 
-:class:`TensorIndex` opens a compressed bundle and decompresses individual
-tensors on demand. The index is tiny (a manifest of name → offset/length
-records), so opening a bundle and fetching one tensor touches only that
-tensor's bytes.
+:class:`TensorIndex` opens a compressed bundle in either layout (magic
+``\x89PTWM``, ``\x89PTWX`` or ``\x89PTWC``) and decompresses individual
+tensors on demand. The container is parsed once into a
+:class:`ptwm._rust.ContainerHandle`; fetching one tensor then decodes only
+that tensor's bytes.
 
     idx = TensorIndex.open("model.safetensors.ptwm")
     weight = idx.get_tensor("layer_5.weight")
@@ -21,9 +22,8 @@ from typing import Self
 import torch
 
 from .. import _rust
+from .._magic import is_container
 from ..utils import raw_to_tensor
-
-_MAGIC = b"\x89PTWM"
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,10 +39,11 @@ class TensorIndex:
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
         self._blob: bytes = self._path.read_bytes()
-        if self._blob[: len(_MAGIC)] != _MAGIC:
+        if not is_container(self._blob):
             msg = f"{self._path} is not a .ptwm container"
             raise ValueError(msg)
-        self._names: list[str] = list(_rust.list_tensor_names(self._blob))
+        self._handle = _rust.ContainerHandle(self._blob)
+        self._names: list[str] = self._handle.names()
         self._entries_by_name: dict[str, TensorEntry] = {
             n: TensorEntry(name=n) for n in self._names
         }
@@ -59,12 +60,22 @@ class TensorIndex:
         """Filesystem path this index was opened from."""
         return self._path
 
+    @property
+    def layout(self) -> str:
+        """Container layout: ``"legacy"`` or ``"compact"``."""
+        return self._handle.layout
+
     def names(self) -> list[str]:
-        """Return tensor names in manifest (write) order."""
+        """Return tensor names in write order.
+
+        This is the order the writer appended the tensors (the order of the
+        records in the file), for both layouts. It is not the order of the
+        legacy on-disk index, which is sorted by name hash.
+        """
         return list(self._names)
 
     def entries(self) -> list[TensorEntry]:
-        """Return every :class:`TensorEntry` in manifest order."""
+        """Return every :class:`TensorEntry` in write order."""
         return [self._entries_by_name[n] for n in self._names]
 
     def entry(self, name: str) -> TensorEntry:
@@ -80,10 +91,10 @@ class TensorIndex:
         """Return the raw decompressed bytes for ``name``."""
         if name not in self._entries_by_name:
             raise KeyError(name)
-        return _rust.decode_tensor(self._blob, name)
+        return self._handle.decode(name)
 
     def _get_shape_dtype(self, name: str) -> tuple[list[int], str] | None:
-        return _rust.decode_tensor_shape(self._blob, name)
+        return self._handle.shape(name)
 
     def get_tensor(self, name: str) -> torch.Tensor:
         """Decompress ``name`` and return a :class:`torch.Tensor`.

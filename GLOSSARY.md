@@ -38,6 +38,8 @@
 | Term | Definition | Aliases to avoid |
 | --- | --- | --- |
 | **`.ptwm` container** | The multi-tensor on-disk format: shared-state prelude, tensor index, and per-plane codec dispatch | ptwm file, container format |
+| **Container layout** | One of the two byte layouts of a `.ptwm` container: compact (`\x89PTWC`, the default) or legacy (`\x89PTWM`, readable before v1.2). Selected with `container_layout` | format version |
+| **Compact frame** | The single-tensor format (`\x89PTWS`) that `Compressor.compress` writes by default | PTWS container |
 | **Header** | The wire-format structure describing a `.ptwm` container's layout | wire header |
 | **Format** | The input/output data kind a tensor is read from or written to: `BYTE`, `TORCH`, `NUMPY`, or `FILE` | data format (only when meaning this specific enum) |
 | **Mode `a` / Mode `b`** | For safetensors input: `a` writes a native `.ptwm` directory; `b` writes a `.safetensors` shell wrapping a `.ptwm` blob | native mode / shell mode |

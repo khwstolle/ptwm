@@ -13,9 +13,10 @@ who want to extend, refactor, or audit it.
 A first-time reader can take these in order. Each builds on the
 previous one.
 
-1. `wire-format.md` covers the on-disk container, since the wire
-   format is the most stable surface in the codebase and every other
-   subsystem either writes to it or reads from it.
+1. `wire-format.md` covers the on-disk formats (the legacy and compact
+   containers and the single-tensor frame), since the wire format is
+   the most stable surface in the codebase and every other subsystem
+   either writes to it or reads from it.
 2. `ppg.md` describes the preprocessing graph, which decides what
    bytes the entropy coder ever sees. The compression-ratio story
    lives almost entirely in this stage.

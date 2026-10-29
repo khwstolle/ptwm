@@ -267,14 +267,26 @@ impl Op for SphericalNormalize {
             ));
         }
         let rows = d.length_bytes / (row_len * w);
+        // Checked: a corrupt chain can declare a length near `u64::MAX`.
+        let overflow = || {
+            PtwmCoreError::InvalidContainer(format!(
+                "SphericalNormalize: output length overflows for {} input bytes",
+                d.length_bytes
+            ))
+        };
+        let radius_len = rows.checked_mul(4).ok_or_else(overflow)?;
+        let direction_len = rows
+            .checked_mul(row_len)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(overflow)?;
         Ok(vec![
             // radius: one f32 per row
-            Self::raw_descriptor(Role::Raw, ElementWidth::Word4, rows * 4, Layout::Flat),
+            Self::raw_descriptor(Role::Raw, ElementWidth::Word4, radius_len, Layout::Flat),
             // direction: bf16 per component
             Self::raw_descriptor(
                 Role::Raw,
                 ElementWidth::Word2,
-                rows * row_len * 2,
+                direction_len,
                 Layout::Rows {
                     row_len: row_len as u32,
                 },
@@ -739,5 +751,22 @@ mod op_tests {
         let mut inp = input_plane(1, 8, 0, &[1.0; 8]);
         inp.descriptor.layout = Layout::Flat;
         assert!(op.forward(&[inp]).is_err());
+    }
+
+    #[test]
+    fn propagate_descriptors_overflow_is_an_error() {
+        // 16-bit rows of one element: the radius plane is twice the input.
+        let op = SphericalNormalize::new(0, 0, 2).unwrap();
+        let d = PlaneDescriptor {
+            role: Role::Raw,
+            element_width: ElementWidth::Word2,
+            length_bytes: u64::MAX - 1,
+            layout: Layout::Rows { row_len: 1 },
+            derives_from_tensor: None,
+            residual_of: None,
+            is_nibble_packed: false,
+            vendor_bytes: vec![],
+        };
+        assert!(op.propagate_descriptors(&[d]).is_err());
     }
 }

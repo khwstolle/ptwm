@@ -109,8 +109,27 @@ impl PlaneCodec for ZstdDict {
         state_format_version: u8,
         state_bytes: &[u8],
         payload: &[u8],
+        layout: &PlaneLayout,
+        decoded_len: usize,
+    ) -> Result<Vec<u8>, PtwmCoreError> {
+        self.decode_bounded(
+            state_format_version,
+            state_bytes,
+            payload,
+            layout,
+            decoded_len,
+            usize::MAX,
+        )
+    }
+
+    fn decode_bounded(
+        &self,
+        state_format_version: u8,
+        state_bytes: &[u8],
+        payload: &[u8],
         _layout: &PlaneLayout,
         decoded_len: usize,
+        max_len: usize,
     ) -> Result<Vec<u8>, PtwmCoreError> {
         #[cfg(feature = "codec-zstd")]
         {
@@ -127,18 +146,19 @@ impl PlaneCodec for ZstdDict {
                 return Ok(Vec::new());
             }
             if state_bytes.is_empty() {
-                zstd::decode_all(payload)
-            } else {
-                decode_with_dict(payload, state_bytes, decoded_len)
+                return crate::codec_tagged::zstd_decode_bounded(payload, decoded_len, max_len);
             }
-            .map_err(|e| PtwmCoreError::CodecDecode {
-                codec: "zstd_dict",
-                msg: e.to_string(),
-            })
+            decode_with_dict(payload, state_bytes, decoded_len, max_len)
         }
         #[cfg(not(feature = "codec-zstd"))]
         {
-            let _ = (state_format_version, state_bytes, payload, decoded_len);
+            let _ = (
+                state_format_version,
+                state_bytes,
+                payload,
+                decoded_len,
+                max_len,
+            );
             Err(PtwmCoreError::InvalidContainer(
                 "codec-zstd feature is disabled".into(),
             ))
@@ -160,22 +180,32 @@ fn encode_with_dict(plane: &[u8], dict: &[u8], level: i32) -> std::io::Result<Ve
     compressor.compress(plane)
 }
 
+/// Decode a dictionary-compressed frame to at most `max_len` bytes.
+///
+/// The frame is read as a stream so the output grows with the decoded
+/// data. `decoded_len` comes from the file and only sizes the first
+/// reservation, capped by what the payload can decode to (see
+/// [`crate::codec_tagged::zstd_read_bounded`]).
 #[cfg(feature = "codec-zstd")]
-fn decode_with_dict(payload: &[u8], dict: &[u8], decoded_len: usize) -> std::io::Result<Vec<u8>> {
-    let mut decompressor = zstd::bulk::Decompressor::with_dictionary(dict)?;
-    // The bulk Decompressor writes into a buffer of exactly the
-    // capacity we pass in. The dispatcher knows the decoded length
-    // from the propagated terminal descriptor and forwards it via the
-    // `decoded_len` argument. When that is zero (older callers that
-    // don't propagate it), fall back to the frame's pledged source
-    // size if present, then to an 8x heuristic.
-    let capacity = if decoded_len > 0 {
-        decoded_len
-    } else {
-        zstd::bulk::Decompressor::upper_bound(payload)
-            .unwrap_or_else(|| payload.len().saturating_mul(8))
-    };
-    decompressor.decompress(payload, capacity)
+fn decode_with_dict(
+    payload: &[u8],
+    dict: &[u8],
+    decoded_len: usize,
+    max_len: usize,
+) -> Result<Vec<u8>, PtwmCoreError> {
+    let decoder = zstd::stream::read::Decoder::with_dictionary(payload, dict).map_err(|e| {
+        PtwmCoreError::CodecDecode {
+            codec: "zstd_dict",
+            msg: e.to_string(),
+        }
+    })?;
+    crate::codec_tagged::zstd_read_bounded(
+        decoder,
+        "zstd_dict",
+        payload.len(),
+        decoded_len,
+        max_len,
+    )
 }
 
 #[cfg(all(test, feature = "codec-zstd"))]
@@ -200,6 +230,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dec, data);
+    }
+
+    /// A file-supplied plane length must not size the first allocation,
+    /// with or without a dictionary.
+    #[test]
+    fn huge_decoded_len_does_not_preallocate() {
+        let c = ZstdDict;
+        let pattern = b"the quick brown fox jumps over the lazy dog ";
+        let dict: Vec<u8> = pattern.repeat(8);
+        let data: Vec<u8> = pattern.repeat(64);
+        let enc = c.encode(&data, Some(&dict), &PlaneLayout::Flat).unwrap();
+        let plain = c.encode(&data, None, &PlaneLayout::Flat).unwrap();
+        for (state, payload) in [(&dict[..], &enc.payload), (&[][..], &plain.payload)] {
+            let version = if state.is_empty() {
+                0
+            } else {
+                STATE_FORMAT_VERSION
+            };
+            let dec = c
+                .decode_bounded(
+                    version,
+                    state,
+                    payload,
+                    &PlaneLayout::Flat,
+                    1 << 40,
+                    1 << 41,
+                )
+                .unwrap();
+            assert_eq!(dec, data);
+            let err = c
+                .decode_bounded(version, state, payload, &PlaneLayout::Flat, 1 << 40, 100)
+                .unwrap_err();
+            assert!(err.to_string().contains("more than 100 bytes"), "{err}");
+        }
     }
 
     #[test]

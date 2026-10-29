@@ -5,6 +5,7 @@
 //! capability-keyed [`dispatch`] menu, fits Pass-2 shared state on the
 //! chosen terminals, and writes a chain-registry-backed `.ptwm` container.
 
+use std::collections::HashMap;
 use std::io::{Seek, Write};
 use std::sync::Arc;
 
@@ -12,11 +13,11 @@ use rayon::prelude::*;
 use xxhash_rust::xxh64::xxh64;
 
 use crate::chain::Chain;
-use crate::chain::runtime::{ForwardContext, forward_chain};
+use crate::chain::runtime::{ForwardContext, chain_source_descriptor, forward_chain};
 use crate::chain::validate::validate_chain;
 use crate::codec::{CodecId, StateSource, codec_for};
 use crate::codecs::order1_scale_ac;
-use crate::container::{ChainRegistry, ContainerWriter};
+use crate::container::{ChainRegistry, ContainerLayout, ContainerWriter};
 use crate::dispatch::dispatch;
 use crate::error::PtwmCoreError;
 use crate::extension::CanonicalId;
@@ -27,7 +28,8 @@ use crate::plane_record::PlaneRecord;
 use crate::prelude::PreludeEntry;
 use crate::select::{MenuItem, TrialResult, trial_encode_plane};
 use crate::tensor_record::{Dependency, RefKind, TENSOR_FLAG_PAYLOAD_HASH, TensorRecord};
-use crate::transforms::op::Plane;
+use crate::tensor_record_compact::record_binding;
+use crate::transforms::op::{OpId, Plane};
 use crate::types::PlaneRole;
 use crate::types::descriptor::{ElementWidth, Layout, PlaneDescriptor};
 use crate::types::role::{NibbleKind, Role};
@@ -38,7 +40,7 @@ use crate::types::role::{NibbleKind, Role};
 
 /// Map a builtin [`CodecId`] to its [`CanonicalId`] so the compressor can
 /// intern the codec into the Extension Table and fill `codec_table_idx`.
-fn codec_canonical_id(id: CodecId) -> CanonicalId {
+pub(crate) fn codec_canonical_id(id: CodecId) -> CanonicalId {
     use crate::extension::builtin_canonical_id;
     match id {
         CodecId::Identity => builtin_canonical_id("identity"),
@@ -87,7 +89,11 @@ pub struct InputTensor<'a> {
     pub delta_reference_blake3: Option<[u8; 32]>,
 }
 
-/// Compressor options.
+/// Compressor options. `Default` gives no hint, no hash or CRC, dispatcher
+/// codec selection, whole planes and the compact container layout
+/// (`\x89PTWC`, readable by v1.2 and later). Set `container_layout` to
+/// [`ContainerLayout::Legacy`] for output that v1.1 and later read.
+#[derive(Default)]
 pub struct CompressorOptions {
     /// Header hint to readers about the dominant codec.
     pub method_hint: u16,
@@ -105,6 +111,9 @@ pub struct CompressorOptions {
     pub allow_codec_ids: Option<Vec<CodecId>>,
     /// When `Some`, encode each plane in fixed-size chunks.
     pub chunk_size: Option<u32>,
+    /// On-disk layout of the written container. Defaults to
+    /// [`ContainerLayout::Compact`].
+    pub container_layout: ContainerLayout,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,7 +148,7 @@ fn legacy_plane_role(role: &Role) -> PlaneRole {
 }
 
 /// Map a typed [`Layout`] to the on-disk [`PlaneLayout`].
-fn legacy_plane_layout(layout: Layout) -> PlaneLayout {
+pub(crate) fn legacy_plane_layout(layout: Layout) -> PlaneLayout {
     match layout {
         Layout::Flat => PlaneLayout::Flat,
         Layout::Rows { row_len } => PlaneLayout::rows(row_len).unwrap_or(PlaneLayout::Flat),
@@ -288,18 +297,18 @@ fn append_shared_menu_items(
 }
 
 /// One terminal plane chosen by the trial-encoder, ready to be written.
-struct ChosenTerminal {
-    role: PlaneRole,
-    codec_id: CodecId,
-    state_source: StateSource,
-    shared_state_id: Option<u16>,
-    encoded_state_bytes: Vec<u8>,
-    encoded_state_version: u8,
-    payload_bytes: Vec<u8>,
+pub(crate) struct ChosenTerminal {
+    pub(crate) role: PlaneRole,
+    pub(crate) codec_id: CodecId,
+    pub(crate) state_source: StateSource,
+    pub(crate) shared_state_id: Option<u16>,
+    pub(crate) encoded_state_bytes: Vec<u8>,
+    pub(crate) encoded_state_version: u8,
+    pub(crate) payload_bytes: Vec<u8>,
     // Arc-shared with the terminal plane: an O(1) clone, avoiding a full copy
     // of every plane (~the whole model) in the hot Pass-1 loop.
-    raw_plane_for_crc: Arc<[u8]>,
-    layout: PlaneLayout,
+    pub(crate) raw_plane_for_crc: Arc<[u8]>,
+    pub(crate) layout: PlaneLayout,
 }
 
 /// Frame a single encoded chunk for storage inside a plane's payload_bytes.
@@ -460,8 +469,8 @@ fn trial_encode_terminal(
 /// terminal planes, and the per-terminal `TrialResult`s under inline
 /// menus only — Pass 2 (shared-state fit) re-trials terminals that may
 /// benefit from a `Shared` variant.
-struct Pass1Outcome {
-    chain_idx: usize,
+pub(crate) struct Pass1Outcome {
+    pub(crate) chain_idx: usize,
     terminals: Vec<(Plane, Role)>,
     trials: Vec<TrialResult>,
     /// Forced+chunked skip path only: the per-terminal `(payload, chunk_table)`
@@ -518,9 +527,43 @@ fn pass1_select_chain(
     let mut n_failed: usize = 0;
 
     for (idx, chain) in candidates.iter().enumerate() {
+        // Decoders rebuild every plane descriptor from the chain's Source
+        // node, so a chain whose Source does not declare exactly the raw
+        // byte count would write planes the decoder sizes wrongly. Skip it
+        // like any other failing candidate.
+        let chain_src = match chain_source_descriptor(chain) {
+            Ok(d) => d,
+            Err(e) => {
+                last_err = Some(e);
+                n_failed += 1;
+                continue;
+            }
+        };
+        let declared = chain_src.length_bytes;
+        if declared != raw_bytes.len() as u64 {
+            let e = PtwmCoreError::InvalidContainer(format!(
+                "candidate chain {idx} Source declares {declared} bytes, tensor has {}",
+                raw_bytes.len()
+            ));
+            tracing::warn!("pass1_select_chain: {e}; skipping and trying remaining candidates");
+            last_err = Some(e);
+            n_failed += 1;
+            continue;
+        }
+        // `source_descriptor` derives the element width from the record's
+        // dtype code, which is in the public `Dtype` code space, while the
+        // decoder derives it from the chain's Source node, which uses the
+        // chain-internal code space (fp32 is 1 in one and 0x0003 in the
+        // other). Take the width and packing from the chain so encode-time
+        // and decode-time descriptors agree. The layout stays as given: the
+        // record's shape decides it, and changing it would change the
+        // legacy writer's output.
+        let mut forward_source = source_descriptor.clone();
+        forward_source.element_width = chain_src.element_width;
+        forward_source.is_nibble_packed = chain_src.is_nibble_packed;
         let ctx = ForwardContext {
             source_bytes: raw_bytes,
-            source_descriptor: source_descriptor.clone(),
+            source_descriptor: forward_source,
             deps: &[],
         };
         let fwd = match forward_chain(chain, &ctx) {
@@ -616,46 +659,73 @@ fn pass1_select_chain(
 
 /// Build the deduped chain registry. Returns the registry and a per-tensor
 /// vector of registry indices (each in 0..registry.chains.len()).
-fn build_chain_registry(chains: &[Chain]) -> (ChainRegistry, Vec<u16>) {
+///
+/// Fails when the tensors need more distinct chains than a registry can
+/// address ([`crate::container::MAX_REGISTRY_CHAINS`]).
+fn build_chain_registry(chains: &[Chain]) -> Result<(ChainRegistry, Vec<u16>), PtwmCoreError> {
+    build_chain_registry_with_limit(chains, crate::container::MAX_REGISTRY_CHAINS)
+}
+
+/// [`build_chain_registry`] with an explicit chain limit, so tests can reach
+/// the limit without building 32768 chains.
+fn build_chain_registry_with_limit(
+    chains: &[Chain],
+    max_chains: usize,
+) -> Result<(ChainRegistry, Vec<u16>), PtwmCoreError> {
     let mut registry: Vec<(u16, Chain)> = Vec::new();
+    let mut ids: HashMap<&Chain, u16> = HashMap::with_capacity(chains.len());
     let mut tensor_to_idx: Vec<u16> = Vec::with_capacity(chains.len());
     for c in chains {
-        let existing = registry.iter().position(|(_, rc)| rc == c);
-        match existing {
-            Some(pos) => tensor_to_idx.push(pos as u16),
-            None => {
-                let new_id = registry.len() as u16;
-                registry.push((new_id, c.clone()));
-                tensor_to_idx.push(new_id);
-            }
+        if let Some(&id) = ids.get(c) {
+            tensor_to_idx.push(id);
+            continue;
         }
+        if registry.len() >= max_chains {
+            return Err(PtwmCoreError::InvalidContainer(format!(
+                "compress_model: more than {max_chains} distinct chains"
+            )));
+        }
+        let new_id = registry.len() as u16;
+        ids.insert(c, new_id);
+        registry.push((new_id, c.clone()));
+        tensor_to_idx.push(new_id);
     }
-    (ChainRegistry { chains: registry }, tensor_to_idx)
+    Ok((ChainRegistry { chains: registry }, tensor_to_idx))
+}
+
+/// Replace the Source params of `chain` with empty params (a bound Source,
+/// see [`crate::chain::wire_compact::write_chain_compact_deferred`]) when
+/// they equal `binding`, the params the tensor record's shape gives. The
+/// compact layout then stores one registry chain for tensors that differ
+/// only in shape.
+fn bind_source(chain: &mut Chain, binding: Option<&[u8]>) {
+    if let (Some(node), Some(params)) = (chain.nodes.first_mut(), binding)
+        && node.op == OpId::Source
+        && node.params == params
+    {
+        node.params.clear();
+    }
 }
 
 // ---------------------------------------------------------------------------
 // compress_model
 // ---------------------------------------------------------------------------
 
-/// PPG entry point. Each input tensor carries one or more candidate
-/// [`Chain`]s; the compressor selects the chain that produces the smallest
-/// total compressed payload (multi-chain trial-encode), then writes a
-/// chain-registry-backed `.ptwm` container.
-///
-/// Returns the per-tensor chosen chain *registry index* (after dedup) for
-/// audit. The order matches the input slice.
-///
-/// **Pass-2 ordering note.** Shared-state fitting is performed *after*
-/// Pass-1 multi-chain selection. This means the multi-chain ranker sees only
-/// inline trial-encode payloads. For monotone shared-state codecs (PGC,
-/// O1SAC), Inline is the lower bound on what the chain can achieve, so the
-/// multi-chain ranking remains correct; per-terminal final encoding may
-/// later switch to a `Shared` variant if it wins the re-trial.
-pub fn compress_model<W: Write + Seek>(
-    writer: W,
+/// Output of passes 0–3: the chosen chain and per-plane codec encoding of
+/// every tensor, plus the shared-state prelude entries those planes use.
+pub(crate) struct ModelPlan {
+    pub(crate) pass1: Vec<Pass1Outcome>,
+    pub(crate) chosen_per_tensor: Vec<Vec<ChosenTerminal>>,
+    pub(crate) prelude_entries: Vec<PreludeEntry>,
+}
+
+/// Passes 0–3 of [`compress_model`]: validate the candidate chains, select a
+/// chain per tensor, fit shared state, and pick the final codec per plane.
+/// Writes nothing; the caller serializes the plan.
+pub(crate) fn plan_model(
     inputs: &[InputTensor<'_>],
-    opts: CompressorOptions,
-) -> Result<Vec<u16>, PtwmCoreError> {
+    opts: &CompressorOptions,
+) -> Result<ModelPlan, PtwmCoreError> {
     // ---- Pass 0: structural validation of every candidate chain. ----------
     // Reject malformed chains at the API boundary so downstream stages can
     // assume well-formed graphs (Source at 0, no cycles, all output indices
@@ -732,7 +802,7 @@ pub fn compress_model<W: Write + Seek>(
     for (i, o) in computed {
         pass1_slots[i] = Some(o);
     }
-    let mut pass1: Vec<Pass1Outcome> = pass1_slots
+    let pass1: Vec<Pass1Outcome> = pass1_slots
         .into_iter()
         .map(|o| o.expect("every tensor index computed in pass1"))
         .collect();
@@ -846,7 +916,9 @@ pub fn compress_model<W: Write + Seek>(
         chosen_per_tensor.push(chosen_planes);
     }
 
-    prof!(prof_t, "pass2+3_fit+retrial");
+    if profile {
+        eprintln!("[ptwm-profile] pass2+3_fit+retrial: {:?}", prof_t.elapsed());
+    }
 
     // Drop unreferenced prelude entries.
     let prelude_entries: Vec<PreludeEntry> = prelude_candidates
@@ -854,18 +926,94 @@ pub fn compress_model<W: Write + Seek>(
         .filter(|e| used_shared_ids.contains(&e.shared_state_id))
         .collect();
 
+    Ok(ModelPlan {
+        pass1,
+        chosen_per_tensor,
+        prelude_entries,
+    })
+}
+
+/// PPG entry point. Each input tensor carries one or more candidate
+/// [`Chain`]s; the compressor selects the chain that produces the smallest
+/// total compressed payload (multi-chain trial-encode), then writes a
+/// chain-registry-backed `.ptwm` container.
+///
+/// Returns the per-tensor chosen chain *registry index* (after dedup) for
+/// audit. The order matches the input slice.
+///
+/// **Pass-2 ordering note.** Shared-state fitting is performed *after*
+/// Pass-1 multi-chain selection. This means the multi-chain ranker sees only
+/// inline trial-encode payloads. For monotone shared-state codecs (PGC,
+/// O1SAC), Inline is the lower bound on what the chain can achieve, so the
+/// multi-chain ranking remains correct; per-terminal final encoding may
+/// later switch to a `Shared` variant if it wins the re-trial.
+pub fn compress_model<W: Write + Seek>(
+    writer: W,
+    inputs: &[InputTensor<'_>],
+    opts: CompressorOptions,
+) -> Result<Vec<u16>, PtwmCoreError> {
+    let profile = std::env::var_os("PTWM_PROFILE").is_some();
+    let ModelPlan {
+        mut pass1,
+        chosen_per_tensor,
+        prelude_entries,
+    } = plan_model(inputs, &opts)?;
+    let mut prof_t = std::time::Instant::now();
+    macro_rules! prof {
+        ($t:expr, $label:expr) => {
+            if profile {
+                eprintln!("[ptwm-profile] {}: {:?}", $label, $t.elapsed());
+                $t = std::time::Instant::now();
+            }
+        };
+    }
     // ---- Pass 4: write container. -----------------------------------------
     // Build a deduped chain registry from the chosen chain per tensor.
+    let tensor_metadata: Vec<Option<Vec<u8>>> = inputs
+        .iter()
+        .map(|inp| match (&inp.shape, &inp.dtype_name) {
+            (Some(shape), Some(name)) => Some(encode_shape_metadata(shape, name)),
+            _ => None,
+        })
+        .collect();
+    let compact = opts.container_layout == ContainerLayout::Compact;
     let chosen_chains: Vec<Chain> = pass1
         .iter()
         .zip(inputs.iter())
-        .map(|(outcome, inp)| inp.candidate_chains[outcome.chain_idx].clone())
+        .zip(tensor_metadata.iter())
+        .map(|((outcome, inp), meta)| {
+            let mut chain = inp.candidate_chains[outcome.chain_idx].clone();
+            if compact {
+                let binding = record_binding(meta.as_deref(), inp.dtype_code);
+                bind_source(&mut chain, binding.as_deref());
+            }
+            chain
+        })
         .collect();
-    let (registry, tensor_chain_indices) = build_chain_registry(&chosen_chains);
+    let (registry, tensor_chain_indices) = build_chain_registry(&chosen_chains)?;
 
-    let mut writer = ContainerWriter::new(writer)?;
+    let mut writer = ContainerWriter::with_layout(writer, opts.container_layout)?;
     writer.set_prelude(&prelude_entries)?;
-    writer.set_chain_registry(registry)?;
+    if compact {
+        // Intern only the codecs the planes reference: interning every
+        // built-in codec costs about 125 B per unused entry, which dominates
+        // small files.
+        let mut used_codecs: Vec<CanonicalId> = Vec::new();
+        for cp in chosen_per_tensor.iter().flatten() {
+            let id = codec_canonical_id(cp.codec_id);
+            if !used_codecs.contains(&id) {
+                used_codecs.push(id);
+            }
+        }
+        writer.set_chain_registry_with_codecs(registry, &used_codecs)?;
+    } else {
+        // The legacy layout keeps the v1.1 table: every built-in codec, in
+        // built-in order. A v1.1 transcoder rebuilds exactly this table when
+        // it implodes an exploded store, and copies each plane's
+        // `codec_table_idx` unchanged, so a trimmed table would make those
+        // indices name the wrong codecs.
+        writer.set_chain_registry(registry)?;
+    }
 
     // Pre-compute the chunked-path payloads in parallel before the sequential
     // write loop. Otherwise encode_plane_chunked runs inside the writer's
@@ -908,6 +1056,7 @@ pub fn compress_model<W: Write + Seek>(
 
     prof!(prof_t, "pass4_chunked_encode");
 
+    let mut tensor_metadata = tensor_metadata;
     let mut tensor_records: Vec<TensorRecord> = Vec::with_capacity(inputs.len());
     for (idx, inp) in inputs.iter().enumerate() {
         let chosen_planes = &chosen_per_tensor[idx];
@@ -981,11 +1130,6 @@ pub fn compress_model<W: Write + Seek>(
             None
         };
 
-        let tensor_metadata = match (&inp.shape, &inp.dtype_name) {
-            (Some(shape), Some(name)) => Some(encode_shape_metadata(shape, name)),
-            _ => None,
-        };
-
         let dependencies: Vec<Dependency> = match inp.delta_reference_blake3 {
             Some(hash) => vec![Dependency {
                 ref_kind: RefKind::ExternalSafetensors,
@@ -1006,26 +1150,20 @@ pub fn compress_model<W: Write + Seek>(
             payload_hash,
             inline_chain: None,
             dependencies,
-            tensor_metadata,
+            tensor_metadata: tensor_metadata[idx].take(),
             terminals: plane_records,
         };
         tensor_records.push(rec);
     }
 
     // Serialize tensor records (the payload-copy-heavy step) in parallel —
-    // write_tensor_record is pure per record — then append the finished byte
-    // blocks sequentially, which is all the ordered writer needs to do.
+    // encoding is pure per record — then append the finished byte blocks
+    // sequentially, which is all the ordered writer needs to do. The encoder
+    // writes the writer's layout.
+    let encoder = writer.record_encoder();
     let serialized: Vec<Vec<u8>> = tensor_records
         .par_iter()
-        .map(|rec| {
-            // Pre-size to the plane payloads (the dominant term) plus headroom
-            // for record/plane metadata, so the large payload copies don't
-            // repeatedly reallocate.
-            let est: usize = rec.terminals.iter().map(|t| t.payload_bytes.len()).sum();
-            let mut buf = Vec::with_capacity(est + 1024);
-            crate::tensor_record::write_tensor_record(rec, &mut buf)?;
-            Ok::<Vec<u8>, PtwmCoreError>(buf)
-        })
+        .map(|rec| encoder.encode(rec))
         .collect::<Result<Vec<_>, _>>()?;
     for (rec, buf) in tensor_records.iter().zip(serialized.iter()) {
         writer.append_serialized_tensor(&rec.name, buf)?;
@@ -1272,6 +1410,8 @@ mod tests {
                 forced_codec: None,
                 allow_codec_ids: None,
                 chunk_size: None,
+                // Parses legacy records, so the layout is pinned.
+                container_layout: ContainerLayout::Legacy,
             },
         )
         .expect("compress succeeds");
@@ -1337,6 +1477,100 @@ mod tests {
     }
 
     #[test]
+    fn candidate_with_mis_sized_source_is_skipped() {
+        let raw: Vec<u8> = (0..256u32).map(|i| (i % 7) as u8).collect();
+        let opts = || CompressorOptions {
+            method_hint: 1,
+            emit_payload_hash: true,
+            emit_plane_crc: true,
+            forced_codec: None,
+            allow_codec_ids: None,
+            chunk_size: None,
+            ..Default::default()
+        };
+        let input = |chains: Vec<Chain>| InputTensor {
+            name: "t".into(),
+            candidate_chains: chains,
+            dtype_code: 0x0005,
+            input_format: 0,
+            raw_bytes: &raw,
+            shape: None,
+            dtype_name: None,
+            delta_reference_blake3: None,
+        };
+
+        // The first candidate declares 4× the raw size (the old Python
+        // byte-input bug); the writer must pick the exact one.
+        let mut buf: Vec<u8> = Vec::new();
+        let picked = compress_model(
+            Cursor::new(&mut buf),
+            &[input(vec![
+                passthrough_value_chain(raw.len() as u32 * 4),
+                passthrough_value_chain(raw.len() as u32),
+            ])],
+            opts(),
+        )
+        .unwrap();
+        assert_eq!(picked, vec![0]);
+        let reader = ContainerReader::open(&buf).unwrap();
+        assert_eq!(reader.chain_registry.chains.len(), 1);
+        assert_eq!(
+            reader.chain_registry.chains[0].1,
+            passthrough_value_chain(raw.len() as u32)
+        );
+        assert_eq!(reader.decode_tensor("t").unwrap(), raw);
+
+        // With only mis-sized candidates (over- and understated), compression
+        // fails and names the mismatch.
+        let mut buf: Vec<u8> = Vec::new();
+        let err = compress_model(
+            Cursor::new(&mut buf),
+            &[input(vec![
+                passthrough_value_chain(raw.len() as u32 * 4),
+                passthrough_value_chain(raw.len() as u32 / 2),
+            ])],
+            opts(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("all 2 candidate chains failed"), "{err}");
+        assert!(
+            err.contains("Source declares 128 bytes, tensor has 256"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn encode_descriptors_take_element_width_from_the_chain() {
+        // The record's dtype code (fp16 is 4 in the public code space) maps
+        // to Word8 in the chain-internal space; the chain's Source says
+        // Word2. Encode-time planes must carry the chain's width, as the
+        // decoder rebuilds them from the chain.
+        let n = 64u32;
+        let raw: Vec<u8> = (0..n)
+            .flat_map(|i| (0x3800u16 | i as u16).to_le_bytes())
+            .collect();
+        let chain = fp16_split_chain(n);
+        let outcome = pass1_select_chain(
+            std::slice::from_ref(&chain),
+            &raw,
+            &source_descriptor_for(4, raw.len() as u64, None),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let decoded = crate::chain::runtime::propagate_terminal_descriptors(&chain).unwrap();
+        assert_eq!(outcome.terminals.len(), decoded.len());
+        for ((plane, _), want) in outcome.terminals.iter().zip(&decoded) {
+            assert_eq!(plane.descriptor.element_width, want.element_width);
+            assert_eq!(plane.descriptor.is_nibble_packed, want.is_nibble_packed);
+            assert_eq!(plane.descriptor.length_bytes, want.length_bytes);
+        }
+    }
+
+    #[test]
     fn compress_forced_chunked_skip_roundtrip() {
         // Exercises the deferred-encode fast path: a forced codec + single
         // candidate chain + chunk_size makes Pass 1 emit placeholder trials and
@@ -1373,6 +1607,7 @@ mod tests {
                 forced_codec: Some(CodecId::Rans),
                 allow_codec_ids: None,
                 chunk_size: Some(512), // small → multiple chunks per plane
+                ..Default::default()
             },
         )
         .expect("compress succeeds");
@@ -1492,6 +1727,7 @@ mod tests {
                 forced_codec: None,
                 allow_codec_ids: None,
                 chunk_size: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1579,6 +1815,8 @@ mod tests {
                 forced_codec: None,
                 allow_codec_ids: None,
                 chunk_size: None,
+                // Parses legacy records, so the layout is pinned.
+                container_layout: ContainerLayout::Legacy,
             },
         )
         .unwrap();
@@ -1661,6 +1899,8 @@ mod tests {
                 forced_codec: None,
                 allow_codec_ids: None,
                 chunk_size: None,
+                // Parses legacy records, so the layout is pinned.
+                container_layout: ContainerLayout::Legacy,
             },
         )
         .unwrap();
@@ -1681,6 +1921,31 @@ mod tests {
             assert_eq!(rec.chain_ref, 0);
             assert!(rec.inline_chain.is_none());
         }
+    }
+
+    #[test]
+    fn build_chain_registry_rejects_too_many_distinct_chains() {
+        let chain = |b: u8| Chain {
+            nodes: vec![ChainNode {
+                op: OpId::BytePassthrough,
+                params: vec![b],
+            }],
+            edges: vec![],
+            terminals: vec![TerminalRef {
+                node_idx: 0,
+                output_idx: 0,
+                role: Role::Raw,
+            }],
+        };
+        // Duplicates share an id and do not count against the limit.
+        let (reg, idx) =
+            build_chain_registry_with_limit(&[chain(0), chain(1), chain(0)], 2).unwrap();
+        assert_eq!(reg.chains.len(), 2);
+        assert_eq!(idx, vec![0, 1, 0]);
+        let err = build_chain_registry_with_limit(&[chain(0), chain(1), chain(2)], 2)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than 2 distinct chains"), "{err}");
     }
 }
 

@@ -21,6 +21,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
+from .._config import ContainerLayout, container_layout_name
 from ..sharding import compress_ptwm_blob, plan_shards
 from ._common import (
     ExplodedModel,
@@ -70,18 +71,28 @@ def write_webdataset(
     max_shard_size: int = _DEFAULT_MAX_SHARD_SIZE,
     method_hint: int = 3,
     chains_per_tensor: list[list[bytes]] | None = None,
+    container_layout: ContainerLayout | str = "compact",
 ) -> Path:
     """Write ``tensors`` as a WebDataset shard set rooted at ``out_dir``.
 
     Returns the directory path. ``tensors`` is a sequence of
     ``(name, raw_bytes, dtype, shape)``; shards are packed by compressed size
     via :func:`ptwm.sharding.plan_shards` so a tensor never straddles a shard.
+    ``container_layout`` (``"compact"``, the default, or ``"legacy"``) selects the
+    container the tensors are compressed into; the registry manifest records
+    it, and readers rebuild each tensor in that layout. An unknown
+    ``container_layout`` raises :class:`ValueError` before ``out_dir`` is
+    created.
     """
+    container_layout = container_layout_name(container_layout)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     blob = compress_ptwm_blob(
-        tensors, chains_per_tensor=chains_per_tensor, method_hint=method_hint
+        tensors,
+        chains_per_tensor=chains_per_tensor,
+        method_hint=method_hint,
+        container_layout=container_layout,
     )
     model = explode_model(blob)
     _write_exploded(out_dir, model, max(1, max_shard_size))

@@ -1,3 +1,5 @@
+import multiprocessing
+import shutil
 import sys
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -20,6 +22,27 @@ _CODEC_NAME_MAP: dict[str, CodecId] = {
     "per-group-codebook": CodecId.PerGroupCodebook,
     "order1-scale-ac": CodecId.Order1ScaleAC,
 }
+
+
+_CONTAINER_LAYOUT_HELP = (
+    "Layout of written .ptwm containers: 'compact' (default; magic "
+    "\\x89PTWC, readable by ptwm v1.2 and later) or 'legacy' (magic "
+    "\\x89PTWM, readable by v1.1 and later). With 'legacy', per-tensor "
+    "safetensors output also uses full \\x89PTWM containers instead of "
+    "the v1.2 \\x89PTWS frame."
+)
+
+
+def _add_container_layout_argument(parser) -> None:  # noqa: ANN001
+    """Add ``--container-layout {compact,legacy}`` to ``parser``."""
+    parser.add_argument(
+        "--container-layout",
+        type=str.lower,
+        choices=["compact", "legacy"],
+        default="compact",
+        dest="container_layout",
+        help=_CONTAINER_LAYOUT_HELP,
+    )
 
 
 def _parse_codec_menu(arg: str | None) -> list[CodecId] | None:
@@ -131,13 +154,19 @@ def compress_file(
     codec_menu: list[CodecId] | None = None,
     codec: str | None = None,
     device: int | None = None,
+    container_layout: str = "compact",
 ) -> None:
-    """Compress a single file."""
+    """Compress a single file.
+
+    The output is a full ``.ptwm`` container in ``container_layout``
+    (``"compact"`` or ``"legacy"``).
+    """
     from ptwm import (  # noqa: PLC0415
         CompressionConfig,
         Compressor,
         DecompressionConfig,
         Decompressor,
+        Framing,
         Method,
     )
 
@@ -162,6 +191,10 @@ def compress_file(
     compressor = Compressor(
         CompressionConfig(
             bytearray_dtype=dtype,
+            # `.ptwm` files stay full containers so the random-access, store
+            # and inspect tools can open them (they read both layouts).
+            framing=Framing.CONTAINER,
+            container_layout=container_layout,
             is_streaming=is_streaming,
             streaming_chunk=chunk_size,
             method=Method(method),
@@ -246,13 +279,18 @@ def compress_file_delta(
     codec_menu: list[CodecId] | None = None,
     codec: str | None = None,
     device: int | None = None,
+    container_layout: str = "compact",
 ) -> None:
-    """Compress a file using delta compression."""
+    """Compress a file using delta compression.
+
+    The output is a full ``.ptwm`` container in ``container_layout``.
+    """
     from ptwm import (  # noqa: PLC0415
         CompressionConfig,
         Compressor,
         DecompressionConfig,
         Decompressor,
+        Framing,
         Method,
     )
 
@@ -284,7 +322,9 @@ def compress_file_delta(
 
     compressor = Compressor(
         CompressionConfig(
-            bytearray_dtype="float32" if dtype else "bfloat16",
+            bytearray_dtype=dtype,
+            framing=Framing.CONTAINER,
+            container_layout=container_layout,
             is_streaming=is_streaming,
             streaming_chunk=chunk_size,
             delta_compressed_type="file",
@@ -298,21 +338,20 @@ def compress_file_delta(
 
     with full_path.open("rb") as f:
         file_data = f.read()
-    compressed_data = compressor.compress(file_data, delta_second_data=delta_file)
+    reference = delta_path.read_bytes()
+    compressed_data = compressor.compress(file_data, delta_second_data=reference)
 
     if verification:
         # `device` is not forwarded here either; see the note in
         # `compress_file`.
         decompressor = Decompressor(
             DecompressionConfig(
-                delta_second_data=delta_path.read_bytes(),
+                delta_second_data=reference,
                 threads=threads,
             )
         )
-        with full_path.open("rb") as f:
-            file_data2 = f.read()
         decompressed_data = decompressor.decompress(compressed_data)
-        if decompressed_data != file_data2:
+        if decompressed_data != file_data:
             msg = "Decompressed file should be equal to original file."
             raise RuntimeError(msg)
 
@@ -344,8 +383,15 @@ def compress_safetensors_file(
     codec_menu: list[CodecId] | None = None,
     codec: str | None = None,
     device: int | None = None,
+    container_layout: str = "compact",
 ) -> None:
-    """Compress a safetensors file."""
+    r"""Compress a safetensors file.
+
+    With ``container_layout="compact"`` (the default) each tensor is a
+    ``\x89PTWS`` frame, or a ``\x89PTWC`` container when it does not fit
+    the frame. With ``container_layout="legacy"`` each tensor is a
+    ``\x89PTWM`` container, which v1.1 readers open.
+    """
     import torch  # noqa: PLC0415
     from safetensors import safe_open  # noqa: PLC0415
     from safetensors.torch import save_file  # noqa: PLC0415
@@ -355,7 +401,7 @@ def compress_safetensors_file(
         Compressor,
         Method,
     )
-    from ptwm._config import Format  # noqa: PLC0415
+    from ptwm._config import Format, Framing, container_layout_name  # noqa: PLC0415
     from ptwm.utils._safetensors import (  # noqa: PLC0415
         COMPRESSED_DTYPE,
         COMPRESSION_METHOD,
@@ -391,6 +437,13 @@ def compress_safetensors_file(
     )
 
     compressor_cache = {}
+    # The compact single-tensor frame is a v1.2 format, so legacy output
+    # writes every tensor as a full container.
+    framing = (
+        Framing.CONTAINER
+        if container_layout_name(container_layout) == "legacy"
+        else Framing.COMPACT
+    )
 
     with safe_open(filename, "pt", "cpu") as f:
         for name in f.keys():  # noqa: SIM118
@@ -409,6 +462,8 @@ def compress_safetensors_file(
                         codec_menu=codec_menu,
                         codec=codec,
                         device=device,
+                        framing=framing,
+                        container_layout=container_layout,
                     )
                 )
             compressor = compressor_cache[dtype_str]
@@ -427,7 +482,7 @@ def compress_safetensors_file(
 
         metadata = f.metadata()
 
-    set_compressed_tensors_metadata(compressed_tensor_infos, metadata)
+    metadata = set_compressed_tensors_metadata(compressed_tensor_infos, metadata)
     save_file(tensors, str(compressed_path), metadata)
 
     if delete and not hf_cache:
@@ -467,6 +522,7 @@ def compress_path(
     codec_menu: list[CodecId] | None = None,
     codec: str | None = None,
     device: int | None = None,
+    container_layout: str = "compact",
 ) -> None:
     """Compress all files with the given suffix in the specified path."""
     overwrite_first = True
@@ -563,6 +619,7 @@ def compress_path(
             codec_menu,
             codec,
             device,
+            container_layout,
         )
     else:
         compression_func = compress_safetensors_file
@@ -576,31 +633,47 @@ def compress_path(
             codec_menu,
             codec,
             device,
+            container_layout,
         )
 
     failures: list[tuple[str, BaseException]] = []
-    with ProcessPoolExecutor(max_workers=max_processes) as executor:
-        future_to_file = {
-            executor.submit(compression_func, file, *comp_args): file
-            for file in file_list[:max_processes]
-        }
-        remaining_files = deque(file_list[max_processes:])
-        while future_to_file:
-            for future in as_completed(future_to_file):
-                file = future_to_file.pop(future)
-                try:
-                    future.result()
-                except Exception as exc:  # noqa: BLE001
-                    failures.append((file, exc))
-                    print(
-                        f"{RED}error compressing {file}: {exc!r}{RESET}",
-                        file=sys.stderr,
-                    )
-                if remaining_files:
-                    next_file = remaining_files.popleft()
-                    future_to_file[
-                        executor.submit(compression_func, next_file, *comp_args)
-                    ] = next_file
+
+    def record(file: str, exc: BaseException) -> None:
+        failures.append((file, exc))
+        print(f"{RED}error compressing {file}: {exc!r}{RESET}", file=sys.stderr)
+
+    if max_processes <= 1:
+        # One worker: compress in this process. A forked pool child can
+        # deadlock on locks that the parent's Rust or torch threads held at
+        # fork time.
+        for file in file_list:
+            try:
+                compression_func(file, *comp_args)
+            except Exception as exc:  # noqa: BLE001
+                record(file, exc)
+    else:
+        # Several workers run in "spawn" children for the same reason.
+        with ProcessPoolExecutor(
+            max_workers=max_processes,
+            mp_context=multiprocessing.get_context("spawn"),
+        ) as executor:
+            future_to_file = {
+                executor.submit(compression_func, file, *comp_args): file
+                for file in file_list[:max_processes]
+            }
+            remaining_files = deque(file_list[max_processes:])
+            while future_to_file:
+                for future in as_completed(list(future_to_file)):
+                    file = future_to_file.pop(future)
+                    try:
+                        future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        record(file, exc)
+                    if remaining_files:
+                        next_file = remaining_files.popleft()
+                        future_to_file[
+                            executor.submit(compression_func, next_file, *comp_args)
+                        ] = next_file
     if failures:
         print(
             f"{RED}{len(failures)} of {len(file_list)} file(s) failed to compress{RESET}",
@@ -695,6 +768,7 @@ def main(argv: list[str] | None = None) -> int:
         dest="classify_heuristic",
         help="Enable the built-in name-pattern heuristic classifier.",
     )
+    _add_container_layout_argument(parser)
 
     args = parser.parse_args(argv)
 
@@ -736,11 +810,12 @@ def main(argv: list[str] | None = None) -> int:
             mode=args.mode,
             classifier=chain,
             max_shard_size=_parse_size(args.max_shard_size),
+            container_layout=args.container_layout,
         )
         return 0
 
     # Fallback: raw-bytes compression via the existing helper.
-    compress_file(input_file=str(input_path))
+    compress_file(input_file=str(input_path), container_layout=args.container_layout)
     return 0
 
 
@@ -903,7 +978,10 @@ def add_compress_parser(subparsers):
         help=(
             "Output path for .safetensors inputs. With --mode a, the output "
             "is a directory (default <input>.ptwm/). With --mode b, the "
-            "output is a single .safetensors-shaped file."
+            "output is a single .safetensors-shaped file (default "
+            "<input stem>.ptwm.safetensors); output that needs several "
+            "shards goes to a directory named after it without the "
+            "'.safetensors' suffix."
         ),
     )
     parser.add_argument(
@@ -955,6 +1033,7 @@ def add_compress_parser(subparsers):
         dest="lmdb_map_size",
         help="LMDB environment map size (e.g. 8GB). --format lmdb only.",
     )
+    _add_container_layout_argument(parser)
     return parser
 
 
@@ -986,6 +1065,7 @@ def _compress_safetensors_store(args, store_format: str) -> int:  # noqa: ANN001
             layout=args.lmdb_layout,
             map_size=map_size,
             method_hint=method_hint,
+            container_layout=_container_layout_arg(args),
         )
     else:
         from ptwm.stores import write_webdataset  # noqa: PLC0415
@@ -1002,9 +1082,18 @@ def _compress_safetensors_store(args, store_format: str) -> int:  # noqa: ANN001
         )
         print(f"Compressing {input_path} → {out_path} (webdataset)")  # noqa: T201
         write_webdataset(
-            out_path, tensors, max_shard_size=max_shard, method_hint=method_hint
+            out_path,
+            tensors,
+            max_shard_size=max_shard,
+            method_hint=method_hint,
+            container_layout=_container_layout_arg(args),
         )
     return 0
+
+
+def _container_layout_arg(args) -> str:  # noqa: ANN001
+    """Return ``args.container_layout``, or ``"compact"`` when it is unset."""
+    return getattr(args, "container_layout", None) or "compact"
 
 
 def _method_hint_from_name(name: str) -> int:
@@ -1046,21 +1135,28 @@ def _compress_safetensors_integration(args, mode: str) -> int:  # noqa: ANN001
         )
         out_dir = out_path
         out_dir.mkdir(parents=True, exist_ok=True)
-        is_existing_non_empty = any(out_dir.iterdir())
+        existing = [out_dir] if any(out_dir.iterdir()) else []
     else:
         out_path = (
             Path(args.out) if args.out else input_path.with_suffix(".ptwm.safetensors")
         )
+        # The shards are written to a staging directory first and moved
+        # into place afterwards (see `_finish_mode_b`). One shard becomes
+        # `out_path`; several become the directory `out_path` without its
+        # last suffix. Either may be replaced, so the guard covers both.
         out_dir = out_path.parent / (out_path.stem + "__staging")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        is_existing_non_empty = out_path.exists()
+        existing = [p for p in (out_path, out_path.with_suffix("")) if p.exists()]
 
-    if not args.force and is_existing_non_empty:
-        user_input = (
-            input(f"{out_path} already exists; overwrite (y/n)? ").strip().lower()
-        )
+    if not args.force and existing:
+        shown = " and ".join(str(p) for p in existing)
+        user_input = input(f"{shown} already exists; overwrite (y/n)? ").strip().lower()
         if user_input not in ("yes", "y"):
             return 0
+
+    if mode == "b":
+        if out_dir.exists():
+            shutil.rmtree(out_dir)
+        out_dir.mkdir(parents=True)
 
     input_bytes = input_path.stat().st_size
     if explore_options is not None:
@@ -1078,12 +1174,47 @@ def _compress_safetensors_integration(args, mode: str) -> int:  # noqa: ANN001
         classifier=ClassifierChain([HeuristicClassifier()]),
         explore_options=explore_options,
         use_user_cache=not getattr(args, "no_cache", False),
+        container_layout=_container_layout_arg(args),
     )
 
     output_bytes = sum(p.stat().st_size for p in out_dir.rglob("*") if p.is_file())
+    if mode == "b":
+        final = _finish_mode_b(out_dir, out_path)
+        if final != out_path:
+            print(  # noqa: T201
+                f"The output needs more than one shard; wrote {final}/"
+            )
     if explore_options is not None:
         _print_explore_summary(audit, input_bytes, output_bytes)
     return 0
+
+
+def _finish_mode_b(staging: Path, out_path: Path) -> Path:
+    """Move mode-b shards from ``staging`` to their final place.
+
+    A single shard becomes the file ``out_path``; its index is dropped, since
+    a single ``.safetensors`` file needs none. Several shards and their index
+    move to the directory ``out_path`` without its last suffix (for example
+    ``model.ptwm.safetensors`` -> ``model.ptwm/``). Returns the final path.
+    """
+    shards = sorted(staging.glob("*.safetensors"))
+    if len(shards) == 1:
+        _remove_path(out_path)
+        shards[0].replace(out_path)
+        shutil.rmtree(staging)
+        return out_path
+    final_dir = out_path.with_suffix("")
+    _remove_path(final_dir)
+    staging.rename(final_dir)
+    return final_dir
+
+
+def _remove_path(path: Path) -> None:
+    """Remove ``path``, a file or a directory, if it exists."""
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
 
 
 def _resolve_compress_mode(args) -> str | None:  # noqa: ANN001
@@ -1156,6 +1287,7 @@ def handle_compress(args):
             codec_menu=codec_menu,
             codec=args.codec,
             device=args.device,
+            container_layout=_container_layout_arg(args),
         )
     elif path.is_file():
         if args.delta:
@@ -1175,6 +1307,7 @@ def handle_compress(args):
                 codec_menu=codec_menu,
                 codec=args.codec,
                 device=args.device,
+                container_layout=_container_layout_arg(args),
             )
         elif path.suffix == ".safetensors" and not args.file_compression:
             compress_safetensors_file(
@@ -1187,6 +1320,7 @@ def handle_compress(args):
                 codec_menu=codec_menu,
                 codec=args.codec,
                 device=args.device,
+                container_layout=_container_layout_arg(args),
             )
         else:
             compress_file(
@@ -1204,6 +1338,7 @@ def handle_compress(args):
                 codec_menu=codec_menu,
                 codec=args.codec,
                 device=args.device,
+                container_layout=_container_layout_arg(args),
             )
     elif args.hf_cache and args.model:
         compress_path(
@@ -1227,6 +1362,7 @@ def handle_compress(args):
             codec_menu=codec_menu,
             codec=args.codec,
             device=args.device,
+            container_layout=_container_layout_arg(args),
         )
     else:
         print(  # noqa: T201

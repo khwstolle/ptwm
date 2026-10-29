@@ -7,17 +7,20 @@ multi-tensor ``.ptwm`` container with per-tensor random-access lookup.
 
 Public entry points: :class:`Compressor`, :class:`Decompressor`,
 :class:`CompressionConfig`, :class:`DecompressionConfig`,
-:class:`Method`, :class:`Format`. Third-party integrations
-(HuggingFace `transformers`, `safetensors`) live in :mod:`ptwm.integrations`
-and are imported from there explicitly, not re-exported here.
+:class:`Method`, :class:`Format`, :class:`Framing`,
+:class:`ContainerLayout`. Third-party integrations (HuggingFace
+`transformers`, `safetensors`) live in :mod:`ptwm.integrations` and are
+imported from there explicitly, not re-exported here.
 """
 
 from importlib.metadata import PackageNotFoundError, version
 
 from ._config import (
     CompressionConfig,
+    ContainerLayout,
     DecompressionConfig,
     Format,
+    Framing,
     Lossy,
     Method,
 )
@@ -39,9 +42,11 @@ __all__ = [
     "CompressionConfig",
     "CompressionMethodNotSupportedError",
     "Compressor",
+    "ContainerLayout",
     "DecompressionConfig",
     "Decompressor",
     "Format",
+    "Framing",
     "Lossy",
     "Method",
     "Error",

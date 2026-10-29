@@ -92,19 +92,23 @@ def test_safe_open_ptwm_float32_tensor(tmp_path):
 
 
 def test_lazy_decoding_only_decodes_requested_tensor(tmp_path):
-    """decode_tensor must NOT be called during __init__, only from get_tensor."""
+    """No tensor is decoded during __init__, only from get_tensor.
+
+    SafeOpen decodes through one ``ContainerHandle``, so the spy wraps
+    ``ContainerHandle.decode``.
+    """
     ptwm_path = _make_ptwm(tmp_path)
 
     import ptwm._rust as _rust_mod
 
-    original = _rust_mod.decode_tensor
+    original = _rust_mod.ContainerHandle.decode
     call_log: list[str] = []
 
-    def recording_decode(blob: bytes, name: str) -> bytes:
+    def recording_decode(self: _rust_mod.ContainerHandle, name: str) -> bytes:
         call_log.append(name)
-        return original(blob, name)
+        return original(self, name)
 
-    _rust_mod.decode_tensor = recording_decode
+    _rust_mod.ContainerHandle.decode = recording_decode
     try:
         f = SafeOpen(str(ptwm_path), framework="pt")
         # __init__ must not have triggered any decode.
@@ -115,7 +119,7 @@ def test_lazy_decoding_only_decodes_requested_tensor(tmp_path):
         # Only the requested tensor should have been decoded.
         assert call_log == [target_key], f"unexpected decode calls: {call_log}"
     finally:
-        _rust_mod.decode_tensor = original
+        _rust_mod.ContainerHandle.decode = original
 
 
 def test_safe_open_bf16_round_trip(tmp_path):

@@ -112,21 +112,25 @@ def test_mode_b_get_tensor_dtype_and_shape(tmp_path):
 
 
 def test_mode_b_lazy_decoding(tmp_path):
-    """decode_tensor must NOT be called during SafeOpen.__init__ for Mode B."""
+    """No tensor is decoded during SafeOpen.__init__ for Mode B.
+
+    SafeOpen decodes through one ``ContainerHandle``, so the spy wraps
+    ``ContainerHandle.decode``.
+    """
     blob = _make_ptwm_bytes(tmp_path)
     out = tmp_path / "shell.safetensors"
     write_mode_b_shell(out, blob)
 
     import ptwm._rust as _rust_mod
 
-    original = _rust_mod.decode_tensor
+    original = _rust_mod.ContainerHandle.decode
     call_log: list[str] = []
 
-    def recording_decode(b: bytes, name: str) -> bytes:
+    def recording_decode(self: _rust_mod.ContainerHandle, name: str) -> bytes:
         call_log.append(name)
-        return original(b, name)
+        return original(self, name)
 
-    _rust_mod.decode_tensor = recording_decode
+    _rust_mod.ContainerHandle.decode = recording_decode
     try:
         f = SafeOpen(str(out), framework="pt")
         assert call_log == [], f"decode called during __init__: {call_log}"
@@ -135,7 +139,7 @@ def test_mode_b_lazy_decoding(tmp_path):
         _t = f.get_tensor(target_key)
         assert call_log == [target_key], f"unexpected decode calls: {call_log}"
     finally:
-        _rust_mod.decode_tensor = original
+        _rust_mod.ContainerHandle.decode = original
 
 
 def test_mode_b_bf16_round_trip(tmp_path):

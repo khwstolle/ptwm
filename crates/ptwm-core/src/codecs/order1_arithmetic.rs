@@ -7,6 +7,7 @@
 
 use crate::codec::{CodecId, Encoded, PlaneCodec};
 use crate::codecs::arithmetic::{frame_payload, unframe_payload};
+use crate::codecs::length_prefix;
 use crate::entropy::arithmetic::{Order1Static, decode_bytes, encode_bytes};
 use crate::error::PtwmCoreError;
 use crate::layout::PlaneLayout;
@@ -106,6 +107,25 @@ impl PlaneCodec for Order1Arithmetic {
         let mut model = Order1Static::deserialize(state_bytes)?;
         let (n, body) = unframe_payload(payload, "order1_arithmetic")?;
         Ok(decode_bytes(&mut model, body, n))
+    }
+
+    fn decode_bounded(
+        &self,
+        state_format_version: u8,
+        state_bytes: &[u8],
+        payload: &[u8],
+        layout: &PlaneLayout,
+        decoded_len: usize,
+        max_len: usize,
+    ) -> Result<Vec<u8>, PtwmCoreError> {
+        length_prefix::check_within(payload, max_len, "order1_arithmetic")?;
+        self.decode(
+            state_format_version,
+            state_bytes,
+            payload,
+            layout,
+            decoded_len,
+        )
     }
 }
 

@@ -32,6 +32,7 @@ from typing import Any
 from packaging.version import Version
 
 from .. import _rust
+from .._magic import is_container
 from ..core import Decompressor
 
 try:
@@ -91,34 +92,46 @@ def _decompress_alongside(path: Path) -> Path:
     return out_path
 
 
-def _is_multi_tensor(blob: bytes) -> bool:
-    """Return True if ``blob`` is a multi-tensor v3 ``.ptwm`` container.
+def _open_multi_tensor(blob: bytes) -> _rust.ContainerHandle | None:
+    """Open ``blob`` if it is a multi-tensor ``.ptwm`` container.
 
-    A multi-tensor v3 container has a non-empty tensor name list, and none of
-    the names is ``"_"`` (the BYTE-format sentinel for single-tensor blobs).
+    A multi-tensor container (either layout) has a non-empty tensor name
+    list, and none of the names is ``"_"`` (the BYTE-format sentinel for
+    single-tensor blobs). Returns the open handle, or ``None`` for anything
+    else (a single-tensor blob, a compact frame or unreadable bytes).
     """
+    if not is_container(blob):
+        return None
     try:
-        names = _rust.list_tensor_names(blob)
+        handle = _rust.ContainerHandle(blob)
+        names = handle.names()
     except Exception:  # noqa: BLE001
-        return False
-    return bool(names) and "_" not in names
+        return None
+    return handle if names and "_" not in names else None
 
 
-def _load_multi_tensor_ptwm(path: Path) -> dict[str, Any]:
-    """Decompress a multi-tensor v3 ``.ptwm`` container to a state dict.
+def _is_multi_tensor(blob: bytes) -> bool:
+    """Return True if ``blob`` is a multi-tensor ``.ptwm`` container."""
+    return _open_multi_tensor(blob) is not None
 
-    Reads ``path``, lists every tensor name via the embedded index, decodes
-    each tensor's raw bytes and shape metadata, and reconstructs the original
-    :class:`torch.Tensor` objects.
+
+def _load_multi_tensor_ptwm(
+    path: Path, handle: _rust.ContainerHandle | None = None
+) -> dict[str, Any]:
+    """Decompress a multi-tensor ``.ptwm`` container to a state dict.
+
+    Opens ``path`` once (or uses ``handle``, already opened over its bytes),
+    decodes every tensor's raw bytes and shape metadata in write order, and
+    reconstructs the original :class:`torch.Tensor` objects.
 
     BF16 round-trip: the Rust layer stores BF16 data as raw ``uint16`` bytes;
     recovery uses the shared :func:`ptwm.utils.decode_ptwm_tensor` helper.
     """
     from ..utils import decode_ptwm_tensor
 
-    blob = path.read_bytes()
-    names = _rust.list_tensor_names(blob)
-    return {name: decode_ptwm_tensor(blob, name) for name in names}
+    if handle is None:
+        handle = _rust.ContainerHandle(path.read_bytes())
+    return {name: decode_ptwm_tensor(handle, name) for name in handle.names()}
 
 
 def materialize_hf_cache(
@@ -279,12 +292,12 @@ def patch_transformers() -> None:
     ) -> Any:
         path = Path(checkpoint_file)
         if any(path.name.endswith(s) for s in _COMPRESSED_SUFFIXES):
-            blob = path.read_bytes()
-            if _is_multi_tensor(blob):
-                # Multi-tensor v3 .ptwm: decode via tensor index and return
+            handle = _open_multi_tensor(path.read_bytes())
+            if handle is not None:
+                # Multi-tensor .ptwm: decode via the tensor index and return
                 # the state dict directly; the original load_state_dict does
                 # not understand this format.
-                return _load_multi_tensor_ptwm(path)
+                return _load_multi_tensor_ptwm(path, handle)
             # Single-tensor BYTE-format blob (legacy path): decompress to a
             # sibling file and hand off to the original loader.
             path = _decompress_alongside(path)

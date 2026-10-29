@@ -144,3 +144,50 @@ def test_decompress_asks_before_overwriting_the_restored_file(
     _decompress(tmp_path / "weights_delta_base.bin.ptwm", ref)
     assert prompts == [f"{src} already exists; overwrite (y/n)? "]
     assert src.read_bytes() == b"keep me"
+
+
+@pytest.mark.parametrize(
+    ("input_name", "reference"),
+    [
+        # Another input whose reference name contains `_delta_`.
+        ("model.pt", "base_delta_v1.bin"),
+        # A `.bin` input whose stem contains `.delta.`.
+        ("a.delta.b.bin", "ref.bin"),
+    ],
+)
+def test_ambiguous_name_after_reference_rename_is_refused(
+    input_name: str, reference: str
+) -> None:
+    """With the reference renamed, a `_delta_` after the last `.delta.` reads
+    two ways; the helper refuses instead of guessing."""
+    compressed = delta_compressed_name(input_name, reference)
+    # With the original reference name the name still decodes exactly.
+    assert delta_restored_name(compressed, reference) == input_name
+    with pytest.raises(ValueError, match="cannot tell the original file name"):
+        delta_restored_name(compressed, "renamed.bin")
+
+
+def test_cli_refuses_ambiguous_restore_and_writes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI reports the ambiguity and leaves both candidate files alone,
+    even with --force."""
+    src = tmp_path / "model.pt"
+    rng = np.random.default_rng(5)
+    ref_arr = rng.standard_normal(512).astype(np.float32)
+    src.write_bytes((ref_arr + 1e-3).tobytes())
+    ref = tmp_path / "base_delta_v1.bin"
+    ref.write_bytes(ref_arr.tobytes())
+    _compress(src, ref)
+    blob = tmp_path / "model.pt.delta.base_delta_v1.bin.ptwm"
+    assert blob.exists()
+
+    src.unlink()
+    bystander = tmp_path / "model.pt.delta.base.bin"
+    bystander.write_bytes(b"keep")
+    renamed = ref.rename(tmp_path / "renamed.bin")
+    _decompress(blob, renamed, "--force")
+
+    assert "cannot tell the original file name" in capsys.readouterr().err
+    assert bystander.read_bytes() == b"keep"
+    assert not src.exists()

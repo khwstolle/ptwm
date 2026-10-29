@@ -9,6 +9,7 @@ from ptwm.cli.utils import (
     RED,
     RESET,
     check_and_install_ptwm,
+    delta_compressed_name,
     parse_streaming_chunk_size,
     replace_in_file,
 )
@@ -306,11 +307,8 @@ def compress_file_delta(
         msg = f"{RED}Delete not supported yet for delta compression.{RESET}"
         raise ValueError(msg)
 
-    folder_path = full_path.parent
-    input_filename = full_path.name
-    delta_filename = delta_path.name
-    output_file = folder_path / (
-        input_filename[:-4] + "_delta_" + delta_filename + ".ptwm"
+    output_file = full_path.parent / delta_compressed_name(
+        full_path.name, delta_path.name
     )
 
     if not test and not force and output_file.exists():

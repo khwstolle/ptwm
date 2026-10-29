@@ -38,7 +38,9 @@ ptwm compress model.safetensors
 # Compress every safetensors file in a directory
 ptwm compress ./my_model_dir
 
-# Delta compression
+# Delta compression (writes model_delta_base_model.bin.ptwm; an input
+# without the .bin extension, such as model.pt, writes
+# model.pt.delta.base_model.bin.ptwm)
 ptwm compress model.bin --delta base_model.bin
 
 # Hugging Face cache compression
@@ -60,7 +62,7 @@ ptwm decompress model.ptwm.safetensors
 ptwm decompress ./my_model_dir
 
 # Delta decompression
-ptwm decompress model_delta_base.ptwm --delta base_model.bin
+ptwm decompress model_delta_base_model.bin.ptwm --delta base_model.bin
 ```
 
 ## Advanced options

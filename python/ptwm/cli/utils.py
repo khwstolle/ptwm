@@ -12,6 +12,41 @@ GREEN = "\033[92m"
 RESET = "\033[0m"
 
 
+# `ptwm compress X --delta R` writes its output next to X. A `.bin` input
+# keeps the name used before v1.2, `<X without .bin>_delta_<R>.ptwm`; any
+# other input is named `<X>.delta.<R>.ptwm`. The character before `<R>`
+# (`_` or `.`) tells the two forms apart, so both decode to X.
+_DELTA_LEGACY_SEP = "_delta_"
+_DELTA_SEP = ".delta."
+
+
+def delta_compressed_name(input_name: str, reference_name: str) -> str:
+    """Return the file name of the delta-compressed form of ``input_name``."""
+    if input_name.endswith(".bin"):
+        stem = input_name.removesuffix(".bin")
+        return f"{stem}{_DELTA_LEGACY_SEP}{reference_name}.ptwm"
+    return f"{input_name}{_DELTA_SEP}{reference_name}.ptwm"
+
+
+def delta_restored_name(compressed_name: str, reference_name: str) -> str:
+    """Return the input file name that ``compressed_name`` was made from.
+
+    Inverse of :func:`delta_compressed_name`. A name that does not end in
+    either delta form for ``reference_name`` (for example, the reference
+    was renamed) falls back to the pre-v1.2 rule: the part before the
+    first ``_delta_`` plus ``.bin``, else the name without ``.ptwm``.
+    """
+    tail = f"{_DELTA_SEP}{reference_name}.ptwm"
+    if compressed_name.endswith(tail) and len(compressed_name) > len(tail):
+        return compressed_name.removesuffix(tail)
+    legacy_tail = f"{_DELTA_LEGACY_SEP}{reference_name}.ptwm"
+    if compressed_name.endswith(legacy_tail):
+        return compressed_name.removesuffix(legacy_tail) + ".bin"
+    if _DELTA_LEGACY_SEP in compressed_name:
+        return compressed_name.split(_DELTA_LEGACY_SEP, 1)[0] + ".bin"
+    return compressed_name.removesuffix(".ptwm")
+
+
 def check_and_install_ptwm() -> None:
     """Check if ptwm is installed, and exit with instructions otherwise."""
     try:

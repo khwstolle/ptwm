@@ -8,6 +8,7 @@ from ptwm.cli.utils import (
     RED,
     RESET,
     check_and_install_ptwm,
+    delta_restored_name,
     replace_in_file,
 )
 
@@ -94,22 +95,17 @@ def decompress_file_delta(
             msg = f"{RED}Delete not supported yet for delta decompression.{RESET}"
             raise ValueError(msg)
 
-        decompressed_path = full_path.with_suffix("")
-        if not force and decompressed_path.exists():
+        output_file = full_path.parent / delta_restored_name(
+            full_path.name, delta_path.name
+        )
+        if not force and output_file.exists():
             user_input = (
-                input(f"{decompressed_path} already exists; overwrite (y/n)? ")
+                input(f"{output_file} already exists; overwrite (y/n)? ")
                 .strip()
                 .lower()
             )
             if user_input not in ("yes", "y"):
                 return
-
-        if "_delta_" in full_path.name:
-            output_file = full_path.parent / (
-                full_path.name.split("_delta_")[0] + ".bin"
-            )
-        else:
-            output_file = decompressed_path
 
         decompressor = Decompressor(
             DecompressionConfig(

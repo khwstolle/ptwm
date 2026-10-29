@@ -431,6 +431,45 @@ fn resolve_row_len_decode(
     Ok(row_len)
 }
 
+/// Largest number of symbols that [`RangeEncoder`] can encode into
+/// `payload_len` bytes under the PMFs of `state`.
+///
+/// The encoder writes `R + 6` bytes, where `R` is the number of
+/// renormalization shifts: one alignment byte, `R` data bytes and five
+/// flush bytes. Each symbol multiplies `range` by at most `p_max / T`, and
+/// each shift multiplies it by 256. `range` starts below `2^32` and stays
+/// at or above `2^24` after each symbol, so
+/// `2^24 <= 2^32 * (p_max / T)^n * 256^R`, that is
+/// `n * log2(T / p_max) <= 8 * (R + 1) = 8 * (payload_len - 5)`.
+///
+/// `p_max < T` because every PMF has 256 nonzero entries, so the bound is
+/// finite: about 86 symbols per payload byte at worst.
+///
+/// [`RangeEncoder`]: crate::range_coder::RangeEncoder
+fn max_decodable_len(state: &StateV0, payload_len: usize) -> usize {
+    let p_max = state
+        .conditional_rows
+        .iter()
+        .chain(std::iter::once(&state.marginal))
+        .flat_map(|row| row.iter())
+        .copied()
+        .max()
+        .unwrap_or(0) as u32;
+    if p_max == 0 || p_max >= ORDER1_QUANT_TOTAL {
+        // Not reachable for a validated state; do not bound.
+        return usize::MAX;
+    }
+    let bits_per_symbol = (ORDER1_QUANT_TOTAL as f64 / p_max as f64).log2();
+    let budget_bits = 8.0 * payload_len.saturating_sub(5) as f64;
+    // One symbol of slack covers floating-point rounding.
+    let n = (budget_bits / bits_per_symbol).floor() + 1.0;
+    if n >= usize::MAX as f64 {
+        usize::MAX
+    } else {
+        n as usize
+    }
+}
+
 #[inline]
 fn binary_search_cumsum(cumsum: &[u32; ALPHABET + 1], target: u32) -> usize {
     let mut lo = 0usize;
@@ -618,6 +657,16 @@ impl PlaneCodec for Order1ScaleAC {
         }
         let state = deserialize_state(state_bytes)?;
         let row_len = resolve_row_len_decode(decoded_len, layout)?;
+        let max_len = max_decodable_len(&state, payload.len());
+        if decoded_len > max_len {
+            return Err(PtwmCoreError::CodecDecode {
+                codec: "Order1ScaleAC",
+                msg: format!(
+                    "declared length {decoded_len} exceeds the {max_len} symbols a {}-byte payload can encode",
+                    payload.len()
+                ),
+            });
+        }
 
         let mut dec = crate::range_coder::RangeDecoder::new(payload);
         // `decoded_len` comes from the file, so it does not size one up-front
@@ -831,6 +880,57 @@ mod codec_roundtrip_tests {
             if let Ok(out) = result {
                 assert_eq!(out.len(), plane.len(), "cut={cut}");
             }
+        }
+    }
+
+    #[test]
+    fn decode_rejects_length_beyond_payload_capacity() {
+        // A few payload bytes that declare a multi-GiB plane must fail
+        // before the decoder allocates or loops.
+        let plane = synth_markov_plane(4, 128, 0x8888);
+        let codec = Order1ScaleAC;
+        let layout = PlaneLayout::Flat;
+        let enc = codec.encode(&plane, None, &layout).unwrap();
+        let payload = [0u8; 8];
+        let declared = 4usize << 30;
+        let start = std::time::Instant::now();
+        let err = codec
+            .decode(
+                enc.state_format_version,
+                &enc.state_bytes,
+                &payload,
+                &layout,
+                declared,
+            )
+            .unwrap_err();
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(
+            err.to_string().contains("exceeds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn capacity_bound_admits_maximally_skewed_stream() {
+        // Worst case for the bound: every symbol has the largest
+        // probability the model allows (T - 255).
+        let mut marginal = [1u16; ALPHABET];
+        marginal[0] = (ORDER1_QUANT_TOTAL - 255) as u16;
+        let state = StateV0::from_parts([0u8; 32], marginal, Vec::new()).unwrap();
+        let state_bytes = serialize_state(&state);
+        let codec = Order1ScaleAC;
+        let layout = PlaneLayout::Flat;
+        for n in [0usize, 1, 2, 100, 10_000, 1_000_000] {
+            let mut enc = crate::range_coder::RangeEncoder::new();
+            for _ in 0..n {
+                enc.encode_symbol(0, marginal[0] as u32, ORDER1_QUANT_TOTAL);
+            }
+            let payload = enc.finish();
+            assert!(n <= max_decodable_len(&state, payload.len()), "n={n}");
+            let out = codec
+                .decode(STATE_FORMAT_VERSION, &state_bytes, &payload, &layout, n)
+                .unwrap();
+            assert_eq!(out, vec![0u8; n]);
         }
     }
 

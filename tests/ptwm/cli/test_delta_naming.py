@@ -206,6 +206,22 @@ def test_matching_suffix_of_renamed_reference_is_refused(tmp_path: Path) -> None
     assert not src.exists()
 
 
+def test_bin_input_with_empty_stem_round_trips(tmp_path: Path) -> None:
+    """The input ``.bin`` compresses to ``_delta_<ref>.ptwm``: one separator,
+    at the start. Restore refused it with a wrong "more than one" message."""
+    assert delta_restored_name(delta_compressed_name(".bin", REF)) == ".bin"
+    src, ref, data = _pair(tmp_path, ".bin")
+    _compress(src, ref, "--force")
+    src.unlink()
+    _decompress(tmp_path / "_delta_base.bin.ptwm", ref)
+    assert src.read_bytes() == data
+
+
+def test_name_without_input_part_is_refused() -> None:
+    with pytest.raises(ValueError, match="no input name before"):
+        delta_restored_name(".delta.base.bin.ptwm")
+
+
 def test_output_without_delta_is_refused(tmp_path: Path) -> None:
     blob = tmp_path / "w.bin.ptwm"
     blob.write_bytes(b"")

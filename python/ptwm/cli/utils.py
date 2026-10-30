@@ -41,7 +41,8 @@ def delta_restored_name(compressed_name: str) -> str:
     the part before it is the input name (plus ``.bin`` for ``_delta_``).
     A name with neither separator loses only its ``.ptwm`` suffix.
 
-    Raises ``ValueError`` when the name holds more than one separator. The
+    Raises ``ValueError`` when the name holds more than one separator, or
+    starts with ``.delta.`` (no input name). The
     input name and the reference name can both contain ``.delta.`` or
     ``_delta_``, so the file name alone does not fix the split, and the
     reference name given at decompression does not fix it either: it can
@@ -52,18 +53,27 @@ def delta_restored_name(compressed_name: str) -> str:
     seps = [m.start() for m in _DELTA_SEP_RE.finditer(compressed_name)]
     if not seps:
         return compressed_name.removesuffix(".ptwm")
+    if len(seps) > 1:
+        msg = (
+            f"cannot tell the original file name of {compressed_name!r}: the "
+            "name holds more than one '.delta.' or '_delta_', so the split "
+            "between input name and reference name is not known. Give the "
+            "output file name with --output."
+        )
+        raise ValueError(msg)
     sep = seps[0]
-    if len(seps) == 1 and sep > 0:
-        if compressed_name.startswith(_DELTA_SEP, sep):
-            return compressed_name[:sep]
-        return compressed_name[:sep] + ".bin"
-    msg = (
-        f"cannot tell the original file name of {compressed_name!r}: the name "
-        "holds more than one '.delta.' or '_delta_', so the split between "
-        "input name and reference name is not known. Give the output file "
-        "name with --output."
-    )
-    raise ValueError(msg)
+    if compressed_name.startswith(_DELTA_SEP, sep):
+        if sep == 0:
+            # `<X>.delta.<R>.ptwm` with an empty X: no input has that name.
+            msg = (
+                f"cannot tell the original file name of {compressed_name!r}: "
+                "the name holds no input name before '.delta.'. Give the "
+                "output file name with --output."
+            )
+            raise ValueError(msg)
+        return compressed_name[:sep]
+    # The `.bin` input `.bin` has an empty stem.
+    return compressed_name[:sep] + ".bin"
 
 
 def delta_name_is_ambiguous(compressed_name: str) -> bool:

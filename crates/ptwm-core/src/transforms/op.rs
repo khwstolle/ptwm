@@ -211,7 +211,10 @@ pub trait Op {
     /// can compute them (`inverse_chain` derives them symbolically from the
     /// chain), else `None`. Ops whose outputs do not fix the input size,
     /// such as `IndexBitwidthPack` with its padded last byte, use them to
-    /// restore the exact input length. The default ignores them.
+    /// restore the exact input length. The descriptors come from the
+    /// Source params, which legacy files may misstate, so an op must treat
+    /// a descriptor that disagrees with `outputs` as absent rather than as
+    /// an error. The default ignores them.
     fn inverse_with_input_descs(
         &self,
         outputs: &[Plane],

@@ -456,8 +456,13 @@ pub fn chain_terminal_descriptors(chain: &Chain) -> Result<Vec<PlaneDescriptor>,
 /// upstream node has no descriptor, when the node is a cross-tensor delta
 /// op (its descriptors need dependency planes), or when its
 /// `propagate_descriptors` rejects the inputs. An op that receives `None`
-/// in [`Op::inverse_with_input_descs`] falls back to its plain inverse, so
-/// the walk never makes a decodable chain fail.
+/// in [`Op::inverse_with_input_descs`] falls back to its plain inverse.
+///
+/// A `Some` descriptor can still disagree with the real planes: legacy
+/// files carry a Source that overstates or understates the raw size, and
+/// the non-strict decoder accepts them. An op that uses the descriptors
+/// must fall back to its plain inverse on such a mismatch, so the walk
+/// never makes a decodable chain fail.
 ///
 /// [`Op::inverse_with_input_descs`]: crate::transforms::op::Op::inverse_with_input_descs
 fn symbolic_node_inputs(chain: &Chain, topo: &[usize]) -> Vec<Option<Vec<PlaneDescriptor>>> {
@@ -1044,7 +1049,7 @@ mod tests {
         for bits in 1u8..=8 {
             let modulus = 1u16 << bits;
             for n in 1u32..=40 {
-                if n as u64 * bits as u64 % 8 != 0 {
+                if !(n as u64 * bits as u64).is_multiple_of(8) {
                     padded += 1;
                 }
                 let chain = index_pack_chain(n, bits);
@@ -1109,6 +1114,30 @@ mod tests {
         let recovered = inverse_chain(&chain, &inv_ctx).unwrap();
         assert_eq!(recovered.bytes.len(), 8);
         assert_eq!(&recovered.bytes[..6], source_bytes.as_slice());
+    }
+
+    #[test]
+    fn inverse_index_pack_tolerates_overstated_source() {
+        // Legacy files may carry a Source that overstates the raw size by up
+        // to 8×, and the non-strict decoder accepts them. With bits = 8 the
+        // plain inverse recovers the real size, so the exact-count path must
+        // not turn the mismatch into an error.
+        let n = 5u32;
+        let chain = index_pack_chain(8 * n, 8);
+        let source_bytes: Vec<u8> = (0..n as u8).collect();
+        let ctx = ForwardContext {
+            source_bytes: &source_bytes,
+            source_descriptor: raw_descriptor(n as u64),
+            deps: &[],
+        };
+        let fwd = forward_chain(&chain, &ctx).unwrap();
+        let terminal_planes: Vec<Plane> = fwd.terminal_planes.into_iter().map(|(p, _)| p).collect();
+        let inv_ctx = InverseContext {
+            terminal_planes: &terminal_planes,
+            deps: &[],
+        };
+        let recovered = inverse_chain(&chain, &inv_ctx).unwrap();
+        assert_eq!(recovered.bytes.as_ref(), source_bytes.as_slice());
     }
 
     #[test]

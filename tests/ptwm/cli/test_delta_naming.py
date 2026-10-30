@@ -169,6 +169,11 @@ def test_decompress_asks_before_overwriting_the_restored_file(
         # A `.bin` input whose reference name contains `_delta_`; the first
         # `_delta_` gives the right name here only by chance.
         ("w.bin", "base_delta_v1.bin"),
+        # The same name from two inputs: a `.bin` input whose reference
+        # name contains `.delta.`, and another input whose name contains
+        # `_delta_`. The last `.delta.` used to give `a_delta_b` for both.
+        ("a.bin", "b.delta.c"),
+        ("a_delta_b", "c"),
     ],
 )
 def test_ambiguous_name_after_reference_rename_is_refused(

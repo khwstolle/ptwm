@@ -741,7 +741,13 @@ The readers treat every file as untrusted input. In both layouts:
   plane length does not size an allocation by itself. The Zstd decoders
   reserve at most what the payload can decode to (32 KiB per compressed
   byte) and grow the buffer as data arrives; reservations use
-  `try_reserve`, so a failed allocation is an error, not an abort;
+  `try_reserve`, so a failed allocation is an error, not an abort.
+  The `Order1ScaleAC` decoder rejects a declared length above the
+  number of symbols its payload can encode. Each symbol costs at least
+  `log2(T / p_max)` bits, where `p_max` is the largest entry of the
+  state's PMFs and `T = 4096`, and an N-byte payload carries at most
+  `8 × (N − 5)` bits of range, so the limit is about 86 symbols per
+  payload byte at worst;
 - a decoded plane must have exactly its derived length in PTWC and
   PTWS. In the legacy layout it may differ (older files carry Sources
   that overstate or understate the raw size) but stays under the plane

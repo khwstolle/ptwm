@@ -499,10 +499,14 @@ fn symbolic_node_inputs(chain: &Chain, topo: &[usize]) -> Vec<Option<Vec<PlaneDe
         let Some(inputs) = inputs else {
             continue;
         };
-        outs[node_idx] = op_from_id(node.op, &node.params)
-            .and_then(|op| op.propagate_descriptors(&inputs))
-            .ok();
-        ins[node_idx] = Some(inputs);
+        // A node whose `propagate_descriptors` rejects its inputs gets no
+        // input descriptors either, so its op takes the plain inverse.
+        if let Ok(produced) =
+            op_from_id(node.op, &node.params).and_then(|op| op.propagate_descriptors(&inputs))
+        {
+            outs[node_idx] = Some(produced);
+            ins[node_idx] = Some(inputs);
+        }
     }
     ins
 }
@@ -1074,6 +1078,37 @@ mod tests {
             }
         }
         assert!(padded > 0);
+    }
+
+    #[test]
+    fn inverse_index_pack_without_input_descs_uses_floor_count() {
+        // A Word2 Source makes `IndexBitwidthPack::propagate_descriptors`
+        // reject the node, so the symbolic walk gives it no input
+        // descriptors. `forward` does not check the element width, so the
+        // chain still encodes. Decoding must still succeed, with the
+        // floor-based count: 6 bytes × 3 bits = 18 bits → 3 packed bytes
+        // → floor(24 / 3) = 8 indices.
+        let mut chain = index_pack_chain(3, 3);
+        chain.nodes[0].params = source_params_for(3, 0x0002); // fp16 → 6 bytes
+        let topo = topo_sort(&chain).unwrap();
+        assert!(symbolic_node_inputs(&chain, &topo)[1].is_none());
+
+        let source_bytes: Vec<u8> = vec![1, 2, 3, 4, 5, 6];
+        let ctx = ForwardContext {
+            source_bytes: &source_bytes,
+            source_descriptor: word2_descriptor(6),
+            deps: &[],
+        };
+        let fwd = forward_chain(&chain, &ctx).unwrap();
+        let terminal_planes: Vec<Plane> = fwd.terminal_planes.into_iter().map(|(p, _)| p).collect();
+        assert_eq!(terminal_planes[0].bytes.len(), 3);
+        let inv_ctx = InverseContext {
+            terminal_planes: &terminal_planes,
+            deps: &[],
+        };
+        let recovered = inverse_chain(&chain, &inv_ctx).unwrap();
+        assert_eq!(recovered.bytes.len(), 8);
+        assert_eq!(&recovered.bytes[..6], source_bytes.as_slice());
     }
 
     #[test]

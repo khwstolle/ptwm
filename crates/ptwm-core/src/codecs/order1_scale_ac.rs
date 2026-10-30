@@ -892,7 +892,8 @@ mod codec_roundtrip_tests {
         let layout = PlaneLayout::Flat;
         let enc = codec.encode(&plane, None, &layout).unwrap();
         let payload = [0u8; 8];
-        let declared = 4usize << 30;
+        // 4 GiB, or the largest length a 32-bit target can declare.
+        let declared = usize::try_from(4u64 << 30).unwrap_or(usize::MAX);
         let start = std::time::Instant::now();
         let err = codec
             .decode(

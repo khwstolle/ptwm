@@ -15,8 +15,10 @@ use ptwm_core::compressor::{
 };
 use ptwm_core::{PtwmCoreError, codec_tagged, delta, entropy};
 
+use buffer::ReadBuffer;
 use handle::ContainerHandle;
 
+mod buffer;
 mod delta_scheme;
 mod device_buffer;
 mod ext;
@@ -69,6 +71,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     ext::register(m)?;
     inspect::register(m)?;
     handle::register(m)?;
+    buffer::register(m)?;
     delta_scheme::register(m)?;
     hardware::register(m)?;
     plane_codec_cuda::register(m)?;
@@ -91,6 +94,9 @@ fn codec_id_registry() -> Vec<(String, u16)> {
 // ---------------------------------------------------------------------------
 
 /// Get a contiguous `&[u8]` from a `PyBuffer`, or error.
+///
+/// Only for reads with the GIL held: the owner may be mutable. Code that
+/// releases the GIL reads through [`ReadBuffer`] instead.
 fn contiguous_slice<'a>(buf: &'a PyBuffer<u8>, name: &str) -> PyResult<&'a [u8]> {
     if !buf.is_c_contiguous() {
         return Err(pyo3::exceptions::PyBufferError::new_err(format!(
@@ -136,9 +142,10 @@ fn py_shannon(data: PyBuffer<u8>) -> PyResult<f64> {
 #[pyo3(name = "identity_encode")]
 fn py_identity_encode<'py>(
     py: Python<'py>,
-    data: PyBuffer<u8>,
+    data: &Bound<'_, PyAny>,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let bytes = contiguous_slice(&data, "data")?;
+    let data_buf = ReadBuffer::contiguous(data, "data")?;
+    let bytes = data_buf.as_slice();
     let out = py.allow_threads(|| codec_tagged::identity_encode(bytes));
     Ok(pyo3::types::PyBytes::new(py, &out))
 }
@@ -147,10 +154,11 @@ fn py_identity_encode<'py>(
 #[pyo3(name = "identity_decode")]
 fn py_identity_decode<'py>(
     py: Python<'py>,
-    blob: PyBuffer<u8>,
+    blob: &Bound<'_, PyAny>,
     expected_len: usize,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let bytes = contiguous_slice(&blob, "blob")?;
+    let blob_buf = ReadBuffer::contiguous(blob, "blob")?;
+    let bytes = blob_buf.as_slice();
     let out = py.allow_threads(|| codec_tagged::identity_decode(bytes, expected_len))?;
     Ok(pyo3::types::PyBytes::new(py, &out))
 }
@@ -159,9 +167,10 @@ fn py_identity_decode<'py>(
 #[pyo3(name = "huffman_encode")]
 fn py_huffman_encode<'py>(
     py: Python<'py>,
-    data: PyBuffer<u8>,
+    data: &Bound<'_, PyAny>,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let bytes = contiguous_slice(&data, "data")?;
+    let data_buf = ReadBuffer::contiguous(data, "data")?;
+    let bytes = data_buf.as_slice();
     let out = py.allow_threads(|| codec_tagged::huffman_encode(bytes))?;
     Ok(pyo3::types::PyBytes::new(py, &out))
 }
@@ -170,10 +179,11 @@ fn py_huffman_encode<'py>(
 #[pyo3(name = "huffman_decode")]
 fn py_huffman_decode<'py>(
     py: Python<'py>,
-    blob: PyBuffer<u8>,
+    blob: &Bound<'_, PyAny>,
     expected_len: usize,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let bytes = contiguous_slice(&blob, "blob")?;
+    let blob_buf = ReadBuffer::contiguous(blob, "blob")?;
+    let bytes = blob_buf.as_slice();
     let out = py.allow_threads(|| codec_tagged::huffman_decode(bytes, expected_len))?;
     Ok(pyo3::types::PyBytes::new(py, &out))
 }
@@ -182,9 +192,10 @@ fn py_huffman_decode<'py>(
 #[pyo3(name = "rans_encode")]
 fn py_rans_encode<'py>(
     py: Python<'py>,
-    data: PyBuffer<u8>,
+    data: &Bound<'_, PyAny>,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let bytes = contiguous_slice(&data, "data")?;
+    let data_buf = ReadBuffer::contiguous(data, "data")?;
+    let bytes = data_buf.as_slice();
     let out = py.allow_threads(|| codec_tagged::rans_encode(bytes))?;
     Ok(pyo3::types::PyBytes::new(py, &out))
 }
@@ -193,10 +204,11 @@ fn py_rans_encode<'py>(
 #[pyo3(name = "rans_decode")]
 fn py_rans_decode<'py>(
     py: Python<'py>,
-    blob: PyBuffer<u8>,
+    blob: &Bound<'_, PyAny>,
     expected_len: usize,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let bytes = contiguous_slice(&blob, "blob")?;
+    let blob_buf = ReadBuffer::contiguous(blob, "blob")?;
+    let bytes = blob_buf.as_slice();
     let out = py.allow_threads(|| codec_tagged::rans_decode(bytes, expected_len))?;
     Ok(pyo3::types::PyBytes::new(py, &out))
 }
@@ -206,10 +218,11 @@ fn py_rans_decode<'py>(
 #[pyo3(signature = (data, level=3))]
 fn py_zstd_encode<'py>(
     py: Python<'py>,
-    data: PyBuffer<u8>,
+    data: &Bound<'_, PyAny>,
     level: i32,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let bytes = contiguous_slice(&data, "data")?;
+    let data_buf = ReadBuffer::contiguous(data, "data")?;
+    let bytes = data_buf.as_slice();
     let out = py.allow_threads(|| codec_tagged::zstd_encode(bytes, level))?;
     Ok(pyo3::types::PyBytes::new(py, &out))
 }
@@ -218,9 +231,10 @@ fn py_zstd_encode<'py>(
 #[pyo3(name = "zstd_decode")]
 fn py_zstd_decode<'py>(
     py: Python<'py>,
-    blob: PyBuffer<u8>,
+    blob: &Bound<'_, PyAny>,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let bytes = contiguous_slice(&blob, "blob")?;
+    let blob_buf = ReadBuffer::contiguous(blob, "blob")?;
+    let bytes = blob_buf.as_slice();
     let out = py.allow_threads(|| codec_tagged::zstd_decode(bytes))?;
     Ok(pyo3::types::PyBytes::new(py, &out))
 }
@@ -233,11 +247,13 @@ fn py_zstd_decode<'py>(
 #[pyo3(name = "delta_xor_encode")]
 fn py_delta_xor_encode<'py>(
     py: Python<'py>,
-    raw: PyBuffer<u8>,
-    reference: PyBuffer<u8>,
+    raw: &Bound<'_, PyAny>,
+    reference: &Bound<'_, PyAny>,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let raw_bytes = contiguous_slice(&raw, "raw")?;
-    let ref_bytes = contiguous_slice(&reference, "reference")?;
+    let raw_buf = ReadBuffer::contiguous(raw, "raw")?;
+    let raw_bytes = raw_buf.as_slice();
+    let reference_buf = ReadBuffer::contiguous(reference, "reference")?;
+    let ref_bytes = reference_buf.as_slice();
     let out = py.allow_threads(|| delta::xor_encode(raw_bytes, ref_bytes))?;
     Ok(pyo3::types::PyBytes::new(py, &out))
 }
@@ -246,11 +262,13 @@ fn py_delta_xor_encode<'py>(
 #[pyo3(name = "delta_xor_decode")]
 fn py_delta_xor_decode<'py>(
     py: Python<'py>,
-    residual: PyBuffer<u8>,
-    reference: PyBuffer<u8>,
+    residual: &Bound<'_, PyAny>,
+    reference: &Bound<'_, PyAny>,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let residual_bytes = contiguous_slice(&residual, "residual")?;
-    let ref_bytes = contiguous_slice(&reference, "reference")?;
+    let residual_buf = ReadBuffer::contiguous(residual, "residual")?;
+    let residual_bytes = residual_buf.as_slice();
+    let reference_buf = ReadBuffer::contiguous(reference, "reference")?;
+    let ref_bytes = reference_buf.as_slice();
     let out = py.allow_threads(|| delta::xor_decode(residual_bytes, ref_bytes))?;
     Ok(pyo3::types::PyBytes::new(py, &out))
 }
@@ -259,11 +277,13 @@ fn py_delta_xor_decode<'py>(
 #[pyo3(name = "delta_float_sub_encode")]
 fn py_delta_float_sub_encode<'py>(
     py: Python<'py>,
-    raw: PyBuffer<u8>,
-    reference: PyBuffer<u8>,
+    raw: &Bound<'_, PyAny>,
+    reference: &Bound<'_, PyAny>,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let raw_bytes = contiguous_slice(&raw, "raw")?;
-    let ref_bytes = contiguous_slice(&reference, "reference")?;
+    let raw_buf = ReadBuffer::contiguous(raw, "raw")?;
+    let raw_bytes = raw_buf.as_slice();
+    let reference_buf = ReadBuffer::contiguous(reference, "reference")?;
+    let ref_bytes = reference_buf.as_slice();
     let out = py.allow_threads(|| delta::float_sub_encode(raw_bytes, ref_bytes))?;
     Ok(pyo3::types::PyBytes::new(py, &out))
 }
@@ -272,11 +292,13 @@ fn py_delta_float_sub_encode<'py>(
 #[pyo3(name = "delta_float_sub_decode")]
 fn py_delta_float_sub_decode<'py>(
     py: Python<'py>,
-    residual: PyBuffer<u8>,
-    reference: PyBuffer<u8>,
+    residual: &Bound<'_, PyAny>,
+    reference: &Bound<'_, PyAny>,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let residual_bytes = contiguous_slice(&residual, "residual")?;
-    let ref_bytes = contiguous_slice(&reference, "reference")?;
+    let residual_buf = ReadBuffer::contiguous(residual, "residual")?;
+    let residual_bytes = residual_buf.as_slice();
+    let reference_buf = ReadBuffer::contiguous(reference, "reference")?;
+    let ref_bytes = reference_buf.as_slice();
     let out = py.allow_threads(|| delta::float_sub_decode(residual_bytes, ref_bytes))?;
     Ok(pyo3::types::PyBytes::new(py, &out))
 }
@@ -285,9 +307,10 @@ fn py_delta_float_sub_decode<'py>(
 #[pyo3(name = "blake3_hash")]
 fn py_blake3_hash<'py>(
     py: Python<'py>,
-    data: PyBuffer<u8>,
+    data: &Bound<'_, PyAny>,
 ) -> PyResult<Bound<'py, pyo3::types::PyBytes>> {
-    let bytes = contiguous_slice(&data, "data")?;
+    let data_buf = ReadBuffer::contiguous(data, "data")?;
+    let bytes = data_buf.as_slice();
     let digest = py.allow_threads(|| delta::blake3_hash(bytes));
     Ok(pyo3::types::PyBytes::new(py, &digest))
 }
@@ -327,13 +350,13 @@ fn py_dtype_element_size(dtype_code: u8) -> PyResult<u32> {
 fn compress_model<'py>(
     py: Python<'py>,
     records: Vec<(
-        String,           // name
-        u16,              // dtype_code
-        u8,               // input_format
-        PyBuffer<u8>,     // raw_bytes (buffer-protocol; zero-copy)
-        Option<Vec<u64>>, // shape
-        Option<String>,   // dtype_name
-        Option<Vec<u8>>,  // delta_reference_blake3 (32 bytes)
+        String,            // name
+        u16,               // dtype_code
+        u8,                // input_format
+        Bound<'py, PyAny>, // raw_bytes (buffer protocol; see `buffer.rs`)
+        Option<Vec<u64>>,  // shape
+        Option<String>,    // dtype_name
+        Option<Vec<u8>>,   // delta_reference_blake3 (32 bytes)
     )>,
     chains_per_tensor: Vec<Vec<Vec<u8>>>, // [tensor][candidate] = wire bytes
     emit_payload_hash: bool,
@@ -373,14 +396,34 @@ fn compress_model<'py>(
         }
     }
 
-    // Materialise borrowed slices over each PyBuffer while the GIL is held.
-    // The buffers stay pinned for the lifetime of `records`, which outlives
-    // the `allow_threads` closure below.
-    let raw_slices: Vec<&[u8]> = records
-        .iter()
+    // Export each buffer while the GIL is held: `bytes` is borrowed, any
+    // buffer whose memory could change is copied (see `buffer.rs`). The
+    // exports outlive the `allow_threads` closure below. The Python objects
+    // themselves stay out of the closure.
+    let (records, raw_buffers): (Vec<_>, Vec<ReadBuffer>) = records
+        .into_iter()
         .enumerate()
-        .map(|(i, r)| contiguous_slice(&r.3, &format!("records[{i}].raw_bytes")))
-        .collect::<PyResult<_>>()?;
+        .map(
+            |(i, (name, dtype_code, input_format, raw, shape, dtype_name, delta_hash))| {
+                let buf = ReadBuffer::contiguous(&raw, &format!("records[{i}].raw_bytes"))?;
+                Ok((
+                    (
+                        name,
+                        dtype_code,
+                        input_format,
+                        (),
+                        shape,
+                        dtype_name,
+                        delta_hash,
+                    ),
+                    buf,
+                ))
+            },
+        )
+        .collect::<PyResult<Vec<_>>>()?
+        .into_iter()
+        .unzip();
+    let raw_slices: Vec<&[u8]> = raw_buffers.iter().map(ReadBuffer::as_slice).collect();
 
     // Deserialize all chains before releasing GIL.
     let mut chains_per_tensor_parsed: Vec<Vec<Chain>> = Vec::with_capacity(chains_per_tensor.len());
@@ -477,7 +520,7 @@ fn compress_compact<'py>(
     py: Python<'py>,
     dtype_code: u16,
     input_format: u8,
-    raw_bytes: PyBuffer<u8>,
+    raw_bytes: &Bound<'_, PyAny>,
     shape: Option<Vec<u64>>,
     dtype_name: Option<String>,
     delta_reference_blake3: Option<Vec<u8>>,
@@ -508,7 +551,8 @@ fn compress_compact<'py>(
         })?;
         candidate_chains.push(chain);
     }
-    let raw = contiguous_slice(&raw_bytes, "raw_bytes")?;
+    let raw_buf = ReadBuffer::contiguous(raw_bytes, "raw_bytes")?;
+    let raw = raw_buf.as_slice();
     let forced_codec = match method_hint {
         2 => Some(ptwm_core::codec::CodecId::Zstd),
         4 => Some(ptwm_core::codec::CodecId::Rans),

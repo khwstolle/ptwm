@@ -88,7 +88,9 @@ use crate::chain::wire_compact::{
     op_from_wire_ref, op_wire_ref, read_chain_compact, write_chain_compact,
 };
 use crate::codec::{CodecId, StateSource, codec_for};
-use crate::compressor::{CompressorOptions, InputTensor, legacy_plane_layout, plan_model};
+use crate::compressor::{
+    CompressorOptions, InputTensor, PlaneLayoutSource, legacy_plane_layout, plan_model,
+};
 use crate::dtype::{Dtype, canonical_dtype_name};
 use crate::error::PtwmCoreError;
 use crate::transforms::op::Plane;
@@ -261,7 +263,9 @@ fn encode_body(
     bound_source: Option<&[u8]>,
     plane_crc: bool,
 ) -> Result<Option<Vec<u8>>, PtwmCoreError> {
-    let plan = plan_model(std::slice::from_ref(input), opts)?;
+    // The frame stores no plane layout: the reader derives it from the
+    // chain, so encode with the chain's layout too.
+    let plan = plan_model(std::slice::from_ref(input), opts, PlaneLayoutSource::Chain)?;
     if !plan.prelude_entries.is_empty() {
         return Ok(None);
     }
@@ -1153,5 +1157,93 @@ mod tests {
         b[FLAGS_AT] |= FLAG_PAYLOAD_HASH;
         let err = decode_compact(&b).unwrap_err().to_string();
         assert!(err.contains("plane CRC flag with payload hash"), "{err}");
+    }
+
+    /// Markov rows of E8M0-like scale bytes, the data Order1ScaleAC models.
+    fn markov_scale_rows(rows: usize, cols: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut out = Vec::with_capacity(rows * cols);
+        for _ in 0..rows {
+            let mut v: i32 = 120;
+            for _ in 0..cols {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                v = (v + (state >> 62) as i32 - 1).clamp(110, 130);
+                out.push(v as u8);
+            }
+        }
+        out
+    }
+
+    /// Source(uint8, `shape`) → BytePassthrough → Scale{E8M0}.
+    fn u8_scale_chain(shape: &[u32]) -> Chain {
+        let role = Role::Scale {
+            format: crate::types::role::ScaleFormat::E8M0,
+        };
+        let mut params = vec![shape.len() as u8];
+        for d in shape {
+            params.extend_from_slice(&d.to_le_bytes());
+        }
+        params.extend_from_slice(&0x0006u16.to_le_bytes());
+        Chain {
+            nodes: vec![
+                ChainNode {
+                    op: OpId::Source,
+                    params,
+                },
+                ChainNode {
+                    op: OpId::BytePassthrough,
+                    params: Vec::new(),
+                },
+            ],
+            edges: vec![ChainEdge {
+                src_node: 0,
+                src_output_idx: 0,
+                dst_node: 1,
+                dst_input_idx: 0,
+                role_override: Some(role.clone()),
+                vendor_bytes: Vec::new(),
+            }],
+            terminals: vec![TerminalRef {
+                node_idx: 1,
+                output_idx: 0,
+                role,
+            }],
+        }
+    }
+
+    /// The decoder takes every plane layout from the chain's Source shape.
+    /// A chain whose Source shape differs from the record shape (same byte
+    /// count, other row length) must therefore be encoded with the chain's
+    /// row length too, or a row-aware codec decodes different bytes.
+    #[test]
+    fn row_aware_codec_uses_the_chain_source_layout() {
+        let raw = markov_scale_rows(64, 256);
+        let input = InputTensor {
+            name: "_".into(),
+            candidate_chains: vec![u8_scale_chain(&[128, 128])],
+            dtype_code: 13,
+            input_format: 1,
+            raw_bytes: &raw,
+            shape: Some(vec![64, 256]),
+            dtype_name: Some("uint8".into()),
+            delta_reference_blake3: None,
+        };
+        // Without any integrity field a layout mismatch decodes to wrong
+        // bytes silently, so the first case checks the decoded bytes
+        // themselves. With plane CRCs the same mismatch fails the CRC check.
+        for (hash, crc) in [(false, false), (false, true)] {
+            let o = CompressorOptions {
+                forced_codec: Some(CodecId::Order1ScaleAC),
+                ..opts(hash, crc)
+            };
+            let blob = compress_compact(&input, &o).unwrap().unwrap();
+            assert_eq!(blob[FLAGS_AT] & FLAG_STORED, 0, "frame must be coded");
+            let decoded = decode_compact(&blob)
+                .unwrap_or_else(|e| panic!("hash={hash} crc={crc}: {e}"))
+                .raw;
+            assert!(decoded == raw, "hash={hash} crc={crc}: wrong bytes");
+        }
     }
 }

@@ -38,7 +38,9 @@ ptwm compress model.safetensors
 # Compress every safetensors file in a directory
 ptwm compress ./my_model_dir
 
-# Delta compression
+# Delta compression (writes model_delta_base_model.bin.ptwm; an input
+# without the .bin extension, such as model.pt, writes
+# model.pt.delta.base_model.bin.ptwm)
 ptwm compress model.bin --delta base_model.bin
 
 # Hugging Face cache compression
@@ -60,7 +62,11 @@ ptwm decompress model.ptwm.safetensors
 ptwm decompress ./my_model_dir
 
 # Delta decompression
-ptwm decompress model_delta_base.ptwm --delta base_model.bin
+ptwm decompress model_delta_base_model.bin.ptwm --delta base_model.bin
+
+# Delta decompression of a name with more than one `.delta.` or `_delta_`
+# (the input or reference name holds one): give the output file
+ptwm decompress x_delta_y.pt.delta.base.bin.ptwm --delta base.bin --output x_delta_y.pt
 ```
 
 ## Advanced options
@@ -85,3 +91,8 @@ containers use the compact layout (magic `\x89PTWC`) by default; ptwm
 v1.2 and later read it, including the random-access, store and inspect
 tools. `--container-layout legacy` writes `\x89PTWM` containers that
 v1.1 and later read.
+
+`decompress --delta` also takes `--output <file>`: the file to write,
+relative to the current directory. It is needed when the compressed name
+holds more than one `.delta.` or `_delta_`; `compress` then prints the
+path to give.

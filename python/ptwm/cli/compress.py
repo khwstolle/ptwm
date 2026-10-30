@@ -1,4 +1,5 @@
 import multiprocessing
+import shlex
 import shutil
 import sys
 from collections import deque
@@ -8,7 +9,10 @@ from pathlib import Path
 from ptwm.cli.utils import (
     RED,
     RESET,
+    YELLOW,
     check_and_install_ptwm,
+    delta_compressed_name,
+    delta_name_is_ambiguous,
     parse_streaming_chunk_size,
     replace_in_file,
 )
@@ -306,11 +310,8 @@ def compress_file_delta(
         msg = f"{RED}Delete not supported yet for delta compression.{RESET}"
         raise ValueError(msg)
 
-    folder_path = full_path.parent
-    input_filename = full_path.name
-    delta_filename = delta_path.name
-    output_file = folder_path / (
-        input_filename[:-4] + "_delta_" + delta_filename + ".ptwm"
+    output_file = full_path.parent / delta_compressed_name(
+        full_path.name, delta_path.name
     )
 
     if not test and not force and output_file.exists():
@@ -358,6 +359,14 @@ def compress_file_delta(
     if not test:
         with output_file.open("wb") as f_out:
             f_out.write(compressed_data)
+        if delta_name_is_ambiguous(output_file.name):
+            print(  # noqa: T201
+                f"{YELLOW}{output_file.name} does not show where the input "
+                "name stops; to restore it, pass "
+                f"--output {shlex.quote(str(full_path))} to ptwm decompress."
+                f"{RESET}",
+                file=sys.stderr,
+            )
 
     if hf_cache:
         try:

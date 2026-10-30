@@ -8,6 +8,7 @@ from ptwm.cli.utils import (
     RED,
     RESET,
     check_and_install_ptwm,
+    delta_restored_name,
     replace_in_file,
 )
 
@@ -76,8 +77,13 @@ def decompress_file_delta(
     hf_cache: bool = False,
     threads: int | None = None,
     device: int | None = None,
+    output: str | None = None,
 ) -> None:
-    """Decompress a file using delta compression."""
+    """Decompress a file using delta compression.
+
+    ``output`` is the path to write. Without it, the input name is read
+    from the compressed file name.
+    """
     from ptwm import DecompressionConfig, Decompressor  # noqa: PLC0415
 
     full_path = Path(input_file)
@@ -89,27 +95,45 @@ def decompress_file_delta(
         )
         return
 
+    missing = [str(p) for p in (full_path, delta_path) if not p.exists()]
+    if missing:
+        print(  # noqa: T201
+            f"{RED}Error: missing input file(s): {', '.join(missing)}{RESET}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if full_path.exists() and delta_path.exists():
         if delete and not hf_cache:
             msg = f"{RED}Delete not supported yet for delta decompression.{RESET}"
             raise ValueError(msg)
 
-        decompressed_path = full_path.with_suffix("")
-        if not force and decompressed_path.exists():
+        if output is not None:
+            output_file = Path(output)
+            # Check before decompressing, which can take long.
+            problem = None
+            if not output or output_file.is_dir():
+                problem = f"--output {output!r} is a directory, not a file"
+            elif not output_file.parent.is_dir():
+                problem = f"the directory of --output {output!r} does not exist"
+            if problem is not None:
+                print(f"{RED}Error: {problem}.{RESET}", file=sys.stderr)  # noqa: T201
+                sys.exit(1)
+        else:
+            try:
+                restored_name = delta_restored_name(full_path.name)
+            except ValueError as e:
+                print(f"{RED}{e}{RESET}", file=sys.stderr)  # noqa: T201
+                sys.exit(1)
+            output_file = full_path.parent / restored_name
+        if not force and output_file.exists():
             user_input = (
-                input(f"{decompressed_path} already exists; overwrite (y/n)? ")
+                input(f"{output_file} already exists; overwrite (y/n)? ")
                 .strip()
                 .lower()
             )
             if user_input not in ("yes", "y"):
                 return
-
-        if "_delta_" in full_path.name:
-            output_file = full_path.parent / (
-                full_path.name.split("_delta_")[0] + ".bin"
-            )
-        else:
-            output_file = decompressed_path
 
         decompressor = Decompressor(
             DecompressionConfig(
@@ -364,6 +388,14 @@ def add_decompress_parser(subparsers):
     )
     parser.add_argument("--delta", type=str, help="Path to delta file")
     parser.add_argument(
+        "--output",
+        type=str,
+        help=(
+            "File to write with --delta. Default: the input name read from "
+            "the compressed file name."
+        ),
+    )
+    parser.add_argument(
         "--delete",
         action="store_true",
         help="Delete compressed file after decompression",
@@ -437,6 +469,13 @@ def handle_decompress(args):
     path_str = args.path or "."
     path = Path(path_str)
 
+    if args.output is not None and not (args.delta and path.is_file()):
+        print(  # noqa: T201
+            f"{RED}Error: --output needs --delta and a single input file.{RESET}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if path.exists():
         from ptwm.stores import detect_format  # noqa: PLC0415
 
@@ -467,6 +506,7 @@ def handle_decompress(args):
                 hf_cache=args.hf_cache,
                 threads=args.threads,
                 device=args.device,
+                output=args.output,
             )
         elif path.name.endswith(".ptwm.safetensors"):
             decompress_safetensors_file(

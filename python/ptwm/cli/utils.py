@@ -1,3 +1,4 @@
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -10,6 +11,78 @@ RED = "\033[91m"
 YELLOW = "\033[93m"
 GREEN = "\033[92m"
 RESET = "\033[0m"
+
+
+# `ptwm compress X --delta R` writes its output next to X. A `.bin` input
+# keeps the name used before v1.2, `<X without .bin>_delta_<R>.ptwm`; any
+# other input is named `<X>.delta.<R>.ptwm`. The character before `<R>`
+# (`_` or `.`) tells the two forms apart, so both decode to X when the name
+# holds no other separator.
+_DELTA_LEGACY_SEP = "_delta_"
+_DELTA_SEP = ".delta."
+# Every start position of either separator; the lookahead also finds
+# overlapping occurrences, such as the two in `a_delta_delta_b`.
+_DELTA_SEP_RE = re.compile(r"(?=\.delta\.|_delta_)")
+
+
+def delta_compressed_name(input_name: str, reference_name: str) -> str:
+    """Return the file name of the delta-compressed form of ``input_name``."""
+    if input_name.endswith(".bin"):
+        stem = input_name.removesuffix(".bin")
+        return f"{stem}{_DELTA_LEGACY_SEP}{reference_name}.ptwm"
+    return f"{input_name}{_DELTA_SEP}{reference_name}.ptwm"
+
+
+def delta_restored_name(compressed_name: str) -> str:
+    """Return the input file name that ``compressed_name`` was made from.
+
+    Inverse of :func:`delta_compressed_name` for a name that holds exactly
+    one ``.delta.`` or ``_delta_``: that occurrence is the separator, and
+    the part before it is the input name (plus ``.bin`` for ``_delta_``).
+    A name with neither separator loses only its ``.ptwm`` suffix.
+
+    Raises ``ValueError`` when the name holds more than one separator, or
+    starts with ``.delta.`` (no input name). The
+    input name and the reference name can both contain ``.delta.`` or
+    ``_delta_``, so the file name alone does not fix the split, and the
+    reference name given at decompression does not fix it either: it can
+    be a renamed file whose name equals the end of the original one. A
+    wrong split could restore to, and overwrite, another file. Pass the
+    output name explicitly (``ptwm decompress --output``) for such names.
+    """
+    seps = [m.start() for m in _DELTA_SEP_RE.finditer(compressed_name)]
+    if not seps:
+        return compressed_name.removesuffix(".ptwm")
+    if len(seps) > 1:
+        msg = (
+            f"cannot tell the original file name of {compressed_name!r}: the "
+            "name holds more than one '.delta.' or '_delta_', so the split "
+            "between input name and reference name is not known. Give the "
+            "output file name with --output."
+        )
+        raise ValueError(msg)
+    sep = seps[0]
+    if compressed_name.startswith(_DELTA_SEP, sep):
+        if sep == 0:
+            # `<X>.delta.<R>.ptwm` with an empty X: no input has that name.
+            msg = (
+                f"cannot tell the original file name of {compressed_name!r}: "
+                "the name holds no input name before '.delta.'. Give the "
+                "output file name with --output."
+            )
+            raise ValueError(msg)
+        return compressed_name[:sep]
+    # The `.bin` input `.bin` has an empty stem.
+    return compressed_name[:sep] + ".bin"
+
+
+def delta_name_is_ambiguous(compressed_name: str) -> bool:
+    """Return whether :func:`delta_restored_name` refuses ``compressed_name``."""
+    try:
+        delta_restored_name(compressed_name)
+    except ValueError:
+        return True
+    return False
 
 
 def check_and_install_ptwm() -> None:

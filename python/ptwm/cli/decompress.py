@@ -95,6 +95,14 @@ def decompress_file_delta(
         )
         return
 
+    missing = [str(p) for p in (full_path, delta_path) if not p.exists()]
+    if missing:
+        print(  # noqa: T201
+            f"{RED}Error: missing input file(s): {', '.join(missing)}{RESET}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if full_path.exists() and delta_path.exists():
         if delete and not hf_cache:
             msg = f"{RED}Delete not supported yet for delta decompression.{RESET}"
@@ -102,6 +110,15 @@ def decompress_file_delta(
 
         if output is not None:
             output_file = Path(output)
+            # Check before decompressing, which can take long.
+            problem = None
+            if not output or output_file.is_dir():
+                problem = f"--output {output!r} is a directory, not a file"
+            elif not output_file.parent.is_dir():
+                problem = f"the directory of --output {output!r} does not exist"
+            if problem is not None:
+                print(f"{RED}Error: {problem}.{RESET}", file=sys.stderr)  # noqa: T201
+                sys.exit(1)
         else:
             try:
                 restored_name = delta_restored_name(full_path.name)
@@ -452,8 +469,11 @@ def handle_decompress(args):
     path_str = args.path or "."
     path = Path(path_str)
 
-    if args.output is not None and not args.delta:
-        print(f"{RED}Error: --output needs --delta.{RESET}", file=sys.stderr)  # noqa: T201
+    if args.output is not None and not (args.delta and path.is_file()):
+        print(  # noqa: T201
+            f"{RED}Error: --output needs --delta and a single input file.{RESET}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     if path.exists():

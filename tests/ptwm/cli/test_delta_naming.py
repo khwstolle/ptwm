@@ -11,6 +11,7 @@ decompression needs ``--output`` for it.
 from __future__ import annotations
 
 import argparse
+import shlex
 from pathlib import Path
 
 import numpy as np
@@ -184,7 +185,7 @@ def test_ambiguous_name_round_trips_with_output(
     """Compress names the flag to use, and ``--output`` restores the file."""
     src, ref, data = _pair(tmp_path, input_name, reference)
     _compress(src, ref, "--force")
-    assert f"--output {input_name}" in capsys.readouterr().err
+    assert f"--output {shlex.quote(str(src))} " in capsys.readouterr().err
     blob = tmp_path / delta_compressed_name(input_name, reference)
     src.unlink()
     _decompress(blob, ref, "--output", str(src))
@@ -229,6 +230,77 @@ def test_output_without_delta_is_refused(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as exc:
         handle_decompress(_parse(add_decompress_parser, "decompress", argv))
     assert exc.value.code == 1
+
+
+def test_note_names_the_input_path_from_another_directory(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The note used to print the bare input name. Run from the parent
+    directory, ``--output x_delta_y.pt`` wrote outside ``sub/``."""
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    src, ref, data = _pair(sub, "x_delta_y.pt")
+    monkeypatch.chdir(tmp_path)
+    rel_src, rel_ref = Path("sub/x_delta_y.pt"), Path("sub") / REF
+    _compress(rel_src, rel_ref, "--force")
+    assert "--output sub/x_delta_y.pt " in capsys.readouterr().err
+    src.unlink()
+    blob = Path("sub/x_delta_y.pt.delta.base.bin.ptwm")
+    _decompress(blob, rel_ref, "--output", "sub/x_delta_y.pt")
+    assert src.read_bytes() == data
+    assert not (tmp_path / "x_delta_y.pt").exists()
+
+
+@pytest.mark.parametrize("bad", ["", "dir", "missing/w.pt"])
+def test_bad_output_is_refused_before_decompressing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    """A directory, an empty path or a missing parent directory used to
+    raise only after the full decompression."""
+    src, ref, _ = _pair(tmp_path, "x_delta_y.pt")
+    _compress(src, ref, "--force")
+    (tmp_path / "dir").mkdir()
+    monkeypatch.chdir(tmp_path)
+    calls: list[bytes] = []
+    monkeypatch.setattr(
+        "ptwm.Decompressor.decompress", lambda _self, data: calls.append(data)
+    )
+    with pytest.raises(SystemExit) as exc:
+        _decompress(
+            tmp_path / "x_delta_y.pt.delta.base.bin.ptwm",
+            ref,
+            "--output",
+            bad,
+            "--force",
+        )
+    assert exc.value.code == 1
+    assert calls == []
+
+
+def test_output_with_directory_input_is_refused(tmp_path: Path) -> None:
+    """A directory input took the directory branch and dropped --delta and
+    --output without a message."""
+    src, ref, _ = _pair(tmp_path, "w.pt")
+    _compress(src, ref, "--force")
+    argv = [str(tmp_path), "--delta", str(ref), "--output", str(src)]
+    with pytest.raises(SystemExit) as exc:
+        handle_decompress(_parse(add_decompress_parser, "decompress", argv))
+    assert exc.value.code == 1
+
+
+def test_missing_reference_exits_with_status_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A missing reference file made delta decompression exit 0 without a
+    message."""
+    src, ref, _ = _pair(tmp_path, "w.pt")
+    _compress(src, ref, "--force")
+    with pytest.raises(SystemExit) as exc:
+        _decompress(tmp_path / "w.pt.delta.base.bin.ptwm", tmp_path / "missing.bin")
+    assert exc.value.code == 1
+    assert "missing.bin" in capsys.readouterr().err
 
 
 def test_unambiguous_name_prints_no_output_hint(

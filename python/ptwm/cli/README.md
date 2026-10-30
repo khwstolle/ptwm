@@ -92,6 +92,7 @@ v1.2 and later read it, including the random-access, store and inspect
 tools. `--container-layout legacy` writes `\x89PTWM` containers that
 v1.1 and later read.
 
-`decompress --delta` also takes `--output <file>`: the file to write. It
-is needed when the compressed name holds more than one `.delta.` or
-`_delta_`.
+`decompress --delta` also takes `--output <file>`: the file to write,
+relative to the current directory. It is needed when the compressed name
+holds more than one `.delta.` or `_delta_`; `compress` then prints the
+path to give.

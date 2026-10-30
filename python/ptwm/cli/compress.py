@@ -1,4 +1,5 @@
 import multiprocessing
+import shlex
 import shutil
 import sys
 from collections import deque
@@ -360,9 +361,10 @@ def compress_file_delta(
             f_out.write(compressed_data)
         if delta_name_is_ambiguous(output_file.name):
             print(  # noqa: T201
-                f"{YELLOW}{output_file.name} holds more than one '.delta.' or "
-                f"'_delta_'; to restore it, pass --output {full_path.name} "
-                f"to ptwm decompress.{RESET}",
+                f"{YELLOW}{output_file.name} does not show where the input "
+                "name stops; to restore it, pass "
+                f"--output {shlex.quote(str(full_path))} to ptwm decompress."
+                f"{RESET}",
                 file=sys.stderr,
             )
 

@@ -16,7 +16,8 @@ RESET = "\033[0m"
 # `ptwm compress X --delta R` writes its output next to X. A `.bin` input
 # keeps the name used before v1.2, `<X without .bin>_delta_<R>.ptwm`; any
 # other input is named `<X>.delta.<R>.ptwm`. The character before `<R>`
-# (`_` or `.`) tells the two forms apart, so both decode to X.
+# (`_` or `.`) tells the two forms apart, so both decode to X when the name
+# holds no other separator.
 _DELTA_LEGACY_SEP = "_delta_"
 _DELTA_SEP = ".delta."
 # Every start position of either separator; the lookahead also finds
@@ -32,30 +33,22 @@ def delta_compressed_name(input_name: str, reference_name: str) -> str:
     return f"{input_name}{_DELTA_SEP}{reference_name}.ptwm"
 
 
-def delta_restored_name(compressed_name: str, reference_name: str) -> str:
+def delta_restored_name(compressed_name: str) -> str:
     """Return the input file name that ``compressed_name`` was made from.
 
-    Inverse of :func:`delta_compressed_name`. A name that does not end in
-    either delta form for ``reference_name`` (for example, the reference
-    was renamed) is split at its separator instead, but only when the name
-    holds exactly one ``.delta.`` or ``_delta_``: then that occurrence is
-    the separator. A name with neither separator loses only its ``.ptwm``
-    suffix.
+    Inverse of :func:`delta_compressed_name` for a name that holds exactly
+    one ``.delta.`` or ``_delta_``: that occurrence is the separator, and
+    the part before it is the input name (plus ``.bin`` for ``_delta_``).
+    A name with neither separator loses only its ``.ptwm`` suffix.
 
-    Raises ``ValueError`` when the name holds more than one separator and
-    does not end in a delta form for ``reference_name``. The input name
-    and the original reference name can both contain ``.delta.`` or
-    ``_delta_``, so any split is a guess, and a wrong guess could restore
-    to, and overwrite, another file.
+    Raises ``ValueError`` when the name holds more than one separator. The
+    input name and the reference name can both contain ``.delta.`` or
+    ``_delta_``, so the file name alone does not fix the split, and the
+    reference name given at decompression does not fix it either: it can
+    be a renamed file whose name equals the end of the original one. A
+    wrong split could restore to, and overwrite, another file. Pass the
+    output name explicitly (``ptwm decompress --output``) for such names.
     """
-    tail = f"{_DELTA_SEP}{reference_name}.ptwm"
-    if compressed_name.endswith(tail) and len(compressed_name) > len(tail):
-        return compressed_name.removesuffix(tail)
-    legacy_tail = f"{_DELTA_LEGACY_SEP}{reference_name}.ptwm"
-    if compressed_name.endswith(legacy_tail) and len(compressed_name) > len(
-        legacy_tail
-    ):
-        return compressed_name.removesuffix(legacy_tail) + ".bin"
     seps = [m.start() for m in _DELTA_SEP_RE.finditer(compressed_name)]
     if not seps:
         return compressed_name.removesuffix(".ptwm")
@@ -65,13 +58,21 @@ def delta_restored_name(compressed_name: str, reference_name: str) -> str:
             return compressed_name[:sep]
         return compressed_name[:sep] + ".bin"
     msg = (
-        f"cannot tell the original file name of {compressed_name!r}: the "
-        f"reference {reference_name!r} is not the one it was compressed "
-        "with, and the name holds more than one '.delta.' or '_delta_', so "
-        "the split between input name and reference name is not known. "
-        "Give the reference file its original name and run again."
+        f"cannot tell the original file name of {compressed_name!r}: the name "
+        "holds more than one '.delta.' or '_delta_', so the split between "
+        "input name and reference name is not known. Give the output file "
+        "name with --output."
     )
     raise ValueError(msg)
+
+
+def delta_name_is_ambiguous(compressed_name: str) -> bool:
+    """Return whether :func:`delta_restored_name` refuses ``compressed_name``."""
+    try:
+        delta_restored_name(compressed_name)
+    except ValueError:
+        return True
+    return False
 
 
 def check_and_install_ptwm() -> None:

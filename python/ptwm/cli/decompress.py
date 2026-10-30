@@ -77,8 +77,13 @@ def decompress_file_delta(
     hf_cache: bool = False,
     threads: int | None = None,
     device: int | None = None,
+    output: str | None = None,
 ) -> None:
-    """Decompress a file using delta compression."""
+    """Decompress a file using delta compression.
+
+    ``output`` is the path to write. Without it, the input name is read
+    from the compressed file name.
+    """
     from ptwm import DecompressionConfig, Decompressor  # noqa: PLC0415
 
     full_path = Path(input_file)
@@ -95,12 +100,15 @@ def decompress_file_delta(
             msg = f"{RED}Delete not supported yet for delta decompression.{RESET}"
             raise ValueError(msg)
 
-        try:
-            restored_name = delta_restored_name(full_path.name, delta_path.name)
-        except ValueError as e:
-            print(f"{RED}{e}{RESET}", file=sys.stderr)  # noqa: T201
-            sys.exit(1)
-        output_file = full_path.parent / restored_name
+        if output is not None:
+            output_file = Path(output)
+        else:
+            try:
+                restored_name = delta_restored_name(full_path.name)
+            except ValueError as e:
+                print(f"{RED}{e}{RESET}", file=sys.stderr)  # noqa: T201
+                sys.exit(1)
+            output_file = full_path.parent / restored_name
         if not force and output_file.exists():
             user_input = (
                 input(f"{output_file} already exists; overwrite (y/n)? ")
@@ -363,6 +371,14 @@ def add_decompress_parser(subparsers):
     )
     parser.add_argument("--delta", type=str, help="Path to delta file")
     parser.add_argument(
+        "--output",
+        type=str,
+        help=(
+            "File to write with --delta. Default: the input name read from "
+            "the compressed file name."
+        ),
+    )
+    parser.add_argument(
         "--delete",
         action="store_true",
         help="Delete compressed file after decompression",
@@ -436,6 +452,10 @@ def handle_decompress(args):
     path_str = args.path or "."
     path = Path(path_str)
 
+    if args.output is not None and not args.delta:
+        print(f"{RED}Error: --output needs --delta.{RESET}", file=sys.stderr)  # noqa: T201
+        sys.exit(1)
+
     if path.exists():
         from ptwm.stores import detect_format  # noqa: PLC0415
 
@@ -466,6 +486,7 @@ def handle_decompress(args):
                 hf_cache=args.hf_cache,
                 threads=args.threads,
                 device=args.device,
+                output=args.output,
             )
         elif path.name.endswith(".ptwm.safetensors"):
             decompress_safetensors_file(

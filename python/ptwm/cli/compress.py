@@ -8,8 +8,10 @@ from pathlib import Path
 from ptwm.cli.utils import (
     RED,
     RESET,
+    YELLOW,
     check_and_install_ptwm,
     delta_compressed_name,
+    delta_name_is_ambiguous,
     parse_streaming_chunk_size,
     replace_in_file,
 )
@@ -356,6 +358,13 @@ def compress_file_delta(
     if not test:
         with output_file.open("wb") as f_out:
             f_out.write(compressed_data)
+        if delta_name_is_ambiguous(output_file.name):
+            print(  # noqa: T201
+                f"{YELLOW}{output_file.name} holds more than one '.delta.' or "
+                f"'_delta_'; to restore it, pass --output {full_path.name} "
+                f"to ptwm decompress.{RESET}",
+                file=sys.stderr,
+            )
 
     if hf_cache:
         try:

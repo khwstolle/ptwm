@@ -205,6 +205,25 @@ pub trait Op {
     /// invert `forward` exactly.
     fn inverse(&self, outputs: &[Plane]) -> Result<Vec<Plane>, PtwmCoreError>;
 
+    /// Decode-side with the descriptors of the planes `forward` consumed.
+    ///
+    /// `input_descs` holds the forward input descriptors when the caller
+    /// can compute them (`inverse_chain` derives them symbolically from the
+    /// chain), else `None`. Ops whose outputs do not fix the input size,
+    /// such as `IndexBitwidthPack` with its padded last byte, use them to
+    /// restore the exact input length. The descriptors come from the
+    /// Source params, which legacy files may misstate, so an op must treat
+    /// a descriptor that disagrees with `outputs` as absent rather than as
+    /// an error. The default ignores them.
+    fn inverse_with_input_descs(
+        &self,
+        outputs: &[Plane],
+        input_descs: Option<&[PlaneDescriptor]>,
+    ) -> Result<Vec<Plane>, PtwmCoreError> {
+        let _ = input_descs;
+        self.inverse(outputs)
+    }
+
     /// This op's wire identifier.
     fn id(&self) -> OpId;
 

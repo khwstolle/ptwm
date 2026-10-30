@@ -145,7 +145,18 @@ impl Op for IndexBitwidthPack {
         }])
     }
 
+    /// Without the input descriptor, the index count is
+    /// `floor(packed_bits / bits)`. That is too large when the last byte
+    /// holds padding; [`Op::inverse_with_input_descs`] gives the exact count.
     fn inverse(&self, outputs: &[Plane]) -> Result<Vec<Plane>, PtwmCoreError> {
+        self.inverse_with_input_descs(outputs, None)
+    }
+
+    fn inverse_with_input_descs(
+        &self,
+        outputs: &[Plane],
+        input_descs: Option<&[PlaneDescriptor]>,
+    ) -> Result<Vec<Plane>, PtwmCoreError> {
         self.validate()?;
         if outputs.len() != 1 {
             return Err(PtwmCoreError::InvalidContainer(format!(
@@ -154,14 +165,37 @@ impl Op for IndexBitwidthPack {
             )));
         }
         let packed = &outputs[0];
-        // Derive the number of original indices: total bits / bits_per_index.
-        // Since packing may have padded to a byte boundary, the caller must
-        // ensure the packed plane's length is consistent. We trust the
-        // descriptor's length_bytes for the packed data and recompute n_indices
-        // as floor(packed_bits / bits).  Any padding bits in the last byte are
-        // zero and ignored.
-        let packed_bits = packed.bytes.len() as u64 * 8;
-        let n_indices = packed_bits / self.bits as u64;
+        let packed_bytes = packed.bytes.len() as u64;
+        let floor_count = packed_bytes * 8 / self.bits as u64;
+        let n_indices = match input_descs {
+            // The exact count, when the descriptor agrees with the packed
+            // length. Legacy files may carry a Source that overstates or
+            // understates the raw size, and the non-strict decoder accepts
+            // them; on a mismatch, keep the floor-based count so those files
+            // decode as they did before.
+            Some([input])
+                if checked_packed_len(input.length_bytes, self.bits) == Some(packed_bytes) =>
+            {
+                input.length_bytes
+            }
+            Some([input]) => {
+                tracing::warn!(
+                    packed_bytes,
+                    expected_indices = input.length_bytes,
+                    bits = self.bits,
+                    "IndexBitwidthPack.inverse: packed length does not match the input \
+                     descriptor; using the floor-based index count"
+                );
+                floor_count
+            }
+            Some(descs) => {
+                return Err(PtwmCoreError::InvalidContainer(format!(
+                    "IndexBitwidthPack.inverse: expected 1 input descriptor, got {}",
+                    descs.len()
+                )));
+            }
+            None => floor_count,
+        };
         let mut out_bytes = vec![0u8; n_indices as usize];
         unpack_bits(&packed.bytes, &mut out_bytes, self.bits);
 
@@ -246,6 +280,37 @@ mod tests {
                 "bits={bits}: round-trip mismatch"
             );
         }
+    }
+
+    #[test]
+    fn inverse_with_input_descs_returns_exact_count() {
+        // 3 indices × 3 bits = 9 bits → 2 bytes. Without the input
+        // descriptor the count is floor(16 / 3) = 5.
+        let op = IndexBitwidthPack { bits: 3 };
+        let input = make_plane(vec![5, 2, 7]);
+        let input_desc = input.descriptor.clone();
+        let packed = op.forward(&[input]).unwrap();
+        assert_eq!(packed[0].bytes.len(), 2);
+        assert_eq!(op.inverse(&packed).unwrap()[0].bytes.len(), 5);
+        let exact = op
+            .inverse_with_input_descs(&packed, Some(std::slice::from_ref(&input_desc)))
+            .unwrap();
+        assert_eq!(exact[0].bytes.as_ref(), [5, 2, 7]);
+    }
+
+    #[test]
+    fn inverse_with_input_descs_falls_back_on_inconsistent_length() {
+        // A legacy Source may overstate the raw size: 2 packed bytes cannot
+        // hold 6 indices of 3 bits (18 bits). The inverse keeps the
+        // floor-based count, floor(16 / 3) = 5, as before the exact count.
+        let op = IndexBitwidthPack { bits: 3 };
+        let packed = make_plane(vec![0, 0]);
+        let mut desc = packed.descriptor.clone();
+        desc.length_bytes = 6;
+        let out = op
+            .inverse_with_input_descs(&[packed], Some(std::slice::from_ref(&desc)))
+            .unwrap();
+        assert_eq!(out[0].bytes.len(), 5);
     }
 
     #[test]

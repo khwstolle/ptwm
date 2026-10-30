@@ -99,7 +99,7 @@ def decompress_file_delta(
             restored_name = delta_restored_name(full_path.name, delta_path.name)
         except ValueError as e:
             print(f"{RED}{e}{RESET}", file=sys.stderr)  # noqa: T201
-            return
+            sys.exit(1)
         output_file = full_path.parent / restored_name
         if not force and output_file.exists():
             user_input = (

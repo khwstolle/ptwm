@@ -101,28 +101,34 @@ def test_legacy_name_without_matching_reference_name(tmp_path: Path) -> None:
     assert src.read_bytes() == data
 
 
-@pytest.mark.parametrize(
-    "name", [n for n in NAMES if not n.endswith(".bin")] + ["a.delta.b.pt"]
-)
-def test_new_name_without_matching_reference_name(name: str) -> None:
-    """A ``.delta.`` file restores its input name when the reference was
-    renamed since compression. The fallback used to split at ``_delta_``
-    or keep the whole ``.delta.<ref>`` part."""
+# Inputs whose compressed name holds exactly one separator, so the
+# separator stays known when the reference is renamed.
+UNIQUE = [n for n in NAMES if "_delta_" not in n]
+
+
+@pytest.mark.parametrize("name", UNIQUE)
+def test_unique_separator_without_matching_reference_name(name: str) -> None:
+    """A name with one ``.delta.`` or ``_delta_`` restores its input name
+    when the reference was renamed since compression. The fallback used to
+    split at ``_delta_`` or keep the whole ``.delta.<ref>`` part."""
     compressed = delta_compressed_name(name, REF)
     assert delta_restored_name(compressed, "renamed.bin") == name
 
 
-def test_new_name_with_delta_in_input_and_renamed_reference(tmp_path: Path) -> None:
+def test_input_with_delta_and_renamed_reference_is_refused(tmp_path: Path) -> None:
     """``my_delta_x.pt`` restored to ``my.bin`` (and with ``--force``
-    overwrote that file) when the reference was renamed."""
-    src, ref, data = _pair(tmp_path, "my_delta_x.pt")
+    overwrote that file) when the reference was renamed. The name now holds
+    two separators, so the CLI refuses, exits non-zero and writes nothing."""
+    src, ref, _ = _pair(tmp_path, "my_delta_x.pt")
     _compress(src, ref, "--force")
     renamed = ref.rename(tmp_path / "renamed.bin")
     other = tmp_path / "my.bin"
     other.write_bytes(b"keep me")
     src.unlink()
-    _decompress(tmp_path / "my_delta_x.pt.delta.base.bin.ptwm", renamed, "--force")
-    assert src.read_bytes() == data
+    with pytest.raises(SystemExit) as exc:
+        _decompress(tmp_path / "my_delta_x.pt.delta.base.bin.ptwm", renamed, "--force")
+    assert exc.value.code == 1
+    assert not src.exists()
     assert other.read_bytes() == b"keep me"
 
 
@@ -151,15 +157,25 @@ def test_decompress_asks_before_overwriting_the_restored_file(
     [
         # Another input whose reference name contains `_delta_`.
         ("model.pt", "base_delta_v1.bin"),
-        # A `.bin` input whose stem contains `.delta.`.
+        # Another input whose reference name contains `.delta.`; the last
+        # `.delta.` used to give `model.pt.delta.base`.
+        ("model.pt", "base.delta.v1.bin"),
+        # Another input whose name contains `.delta.` or `_delta_`.
+        ("a.delta.b.pt", "ref.bin"),
+        ("x_delta_y.pt", "ref.bin"),
+        # A `.bin` input whose stem contains `.delta.` or `_delta_`.
         ("a.delta.b.bin", "ref.bin"),
+        ("x_delta_y.bin", "ref.bin"),
+        # A `.bin` input whose reference name contains `_delta_`; the first
+        # `_delta_` gives the right name here only by chance.
+        ("w.bin", "base_delta_v1.bin"),
     ],
 )
 def test_ambiguous_name_after_reference_rename_is_refused(
     input_name: str, reference: str
 ) -> None:
-    """With the reference renamed, a `_delta_` after the last `.delta.` reads
-    two ways; the helper refuses instead of guessing."""
+    """With the reference renamed, a name with more than one separator reads
+    more than one way; the helper refuses instead of guessing."""
     compressed = delta_compressed_name(input_name, reference)
     # With the original reference name the name still decodes exactly.
     assert delta_restored_name(compressed, reference) == input_name
@@ -170,8 +186,8 @@ def test_ambiguous_name_after_reference_rename_is_refused(
 def test_cli_refuses_ambiguous_restore_and_writes_nothing(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The CLI reports the ambiguity and leaves both candidate files alone,
-    even with --force."""
+    """The CLI reports the ambiguity, exits with status 1 and leaves both
+    candidate files alone, even with --force. It used to exit 0."""
     src = tmp_path / "model.pt"
     rng = np.random.default_rng(5)
     ref_arr = rng.standard_normal(512).astype(np.float32)
@@ -186,8 +202,10 @@ def test_cli_refuses_ambiguous_restore_and_writes_nothing(
     bystander = tmp_path / "model.pt.delta.base.bin"
     bystander.write_bytes(b"keep")
     renamed = ref.rename(tmp_path / "renamed.bin")
-    _decompress(blob, renamed, "--force")
+    with pytest.raises(SystemExit) as exc:
+        _decompress(blob, renamed, "--force")
 
+    assert exc.value.code == 1
     assert "cannot tell the original file name" in capsys.readouterr().err
     assert bystander.read_bytes() == b"keep"
     assert not src.exists()

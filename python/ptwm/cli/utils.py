@@ -1,3 +1,4 @@
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -18,6 +19,9 @@ RESET = "\033[0m"
 # (`_` or `.`) tells the two forms apart, so both decode to X.
 _DELTA_LEGACY_SEP = "_delta_"
 _DELTA_SEP = ".delta."
+# Every start position of either separator; the lookahead also finds
+# overlapping occurrences, such as the two in `a_delta_delta_b`.
+_DELTA_SEP_RE = re.compile(r"(?=\.delta\.|_delta_)")
 
 
 def delta_compressed_name(input_name: str, reference_name: str) -> str:
@@ -33,39 +37,41 @@ def delta_restored_name(compressed_name: str, reference_name: str) -> str:
 
     Inverse of :func:`delta_compressed_name`. A name that does not end in
     either delta form for ``reference_name`` (for example, the reference
-    was renamed) is split at its separator instead: the last ``.delta.``,
-    or, when the name has only ``_delta_``, the pre-v1.2 rule (the part
-    before the first ``_delta_`` plus ``.bin``). A name with neither
-    separator loses only its ``.ptwm`` suffix.
+    was renamed) is split at its separator instead, but only when the name
+    holds exactly one ``.delta.`` or ``_delta_``: then that occurrence is
+    the separator. A name with neither separator loses only its ``.ptwm``
+    suffix.
 
-    Raises ``ValueError`` when a ``_delta_`` follows the last ``.delta.``:
-    without the original reference name, such a name reads both as a
-    ``.bin`` input whose stem contains ``.delta.`` and as another input
-    whose reference name contains ``_delta_``. Guessing could restore to,
-    and overwrite, the wrong file.
+    Raises ``ValueError`` when the name holds more than one separator and
+    does not end in a delta form for ``reference_name``. The input name
+    and the original reference name can both contain ``.delta.`` or
+    ``_delta_``, so any split is a guess, and a wrong guess could restore
+    to, and overwrite, another file.
     """
     tail = f"{_DELTA_SEP}{reference_name}.ptwm"
     if compressed_name.endswith(tail) and len(compressed_name) > len(tail):
         return compressed_name.removesuffix(tail)
     legacy_tail = f"{_DELTA_LEGACY_SEP}{reference_name}.ptwm"
-    if compressed_name.endswith(legacy_tail):
+    if compressed_name.endswith(legacy_tail) and len(compressed_name) > len(
+        legacy_tail
+    ):
         return compressed_name.removesuffix(legacy_tail) + ".bin"
-    sep = compressed_name.rfind(_DELTA_SEP)
-    if sep > 0:
-        if _DELTA_LEGACY_SEP not in compressed_name[sep:]:
+    seps = [m.start() for m in _DELTA_SEP_RE.finditer(compressed_name)]
+    if not seps:
+        return compressed_name.removesuffix(".ptwm")
+    sep = seps[0]
+    if len(seps) == 1 and sep > 0:
+        if compressed_name.startswith(_DELTA_SEP, sep):
             return compressed_name[:sep]
-        new_reading = compressed_name[:sep]
-        legacy_reading = compressed_name.split(_DELTA_LEGACY_SEP, 1)[0] + ".bin"
-        msg = (
-            f"cannot tell the original file name of {compressed_name!r}: the "
-            f"reference {reference_name!r} is not the one it was compressed "
-            f"with, and the name reads as {new_reading!r} or {legacy_reading!r}. "
-            "Give the reference file its original name and run again."
-        )
-        raise ValueError(msg)
-    if _DELTA_LEGACY_SEP in compressed_name:
-        return compressed_name.split(_DELTA_LEGACY_SEP, 1)[0] + ".bin"
-    return compressed_name.removesuffix(".ptwm")
+        return compressed_name[:sep] + ".bin"
+    msg = (
+        f"cannot tell the original file name of {compressed_name!r}: the "
+        f"reference {reference_name!r} is not the one it was compressed "
+        "with, and the name holds more than one '.delta.' or '_delta_', so "
+        "the split between input name and reference name is not known. "
+        "Give the reference file its original name and run again."
+    )
+    raise ValueError(msg)
 
 
 def check_and_install_ptwm() -> None:
